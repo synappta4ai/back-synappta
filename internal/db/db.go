@@ -1,0 +1,70 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// PoolConfig holds tuning applied to every connection pool.
+type PoolConfig struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+}
+
+// Open opens a database connection with the given URL and applies pool limits.
+func Open(databaseURL string, pool PoolConfig) (*sql.DB, error) {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db connection: %w", err)
+	}
+
+	db.SetMaxOpenConns(pool.MaxOpenConns)
+	db.SetMaxIdleConns(pool.MaxIdleConns)
+	db.SetConnMaxLifetime(pool.ConnMaxLifetime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping db: %w", err)
+	}
+
+	return db, nil
+}
+
+// Ping checks database liveness (used by /readyz).
+func Ping(db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return db.PingContext(ctx)
+}
+
+// QuoteIdent validates and quotes a PostgreSQL identifier (schema or table name).
+// Used when building dynamic schema-qualified SQL from tenant slugs.
+func QuoteIdent(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("empty identifier")
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_') {
+			return "", fmt.Errorf("invalid identifier %q: only [a-z0-9_] allowed", name)
+		}
+	}
+	if len(name) > 63 {
+		return "", fmt.Errorf("identifier %q too long (max 63)", name)
+	}
+	return `"` + name + `"`, nil
+}
+
+// LogClose closes a pool logging any error (for deferred cleanup).
+func LogClose(db *sql.DB, name string) {
+	if err := db.Close(); err != nil {
+		log.Printf("[db] error closing pool %s: %v", name, err)
+	}
+}

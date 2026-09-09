@@ -1,0 +1,1532 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Synapta API",
+    "description": "Event-oriented AI generation backend. Manages events, programs, pieces, AI content generation, files, ingredients, presets, skills, and agency orchestration.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:{port}",
+      "variables": {
+        "port": { "default": "9099" }
+      }
+    }
+  ],
+  "tags": [
+    { "name": "Health", "description": "Service health checks" },
+    { "name": "Auth", "description": "Authentication and user registration" },
+    { "name": "Admin", "description": "Platform admin (admin+ role)" },
+    { "name": "Tenants", "description": "Tenant management (superadmin)" },
+    { "name": "Models", "description": "AI model catalog" },
+    { "name": "Events", "description": "Event management" },
+    { "name": "Programs", "description": "Run-of-show programs" },
+    { "name": "Pieces", "description": "Deliverable pieces" },
+    { "name": "Generations", "description": "Piece generation attempts" },
+    { "name": "Files", "description": "File upload and management" },
+    { "name": "Ingredients", "description": "Characters, locations, and props" },
+    { "name": "Assignments", "description": "Resource-to-target bindings" },
+    { "name": "Presets", "description": "Preset groups and presets" },
+    { "name": "Skills", "description": "AI skills / prompt templates" },
+    { "name": "Credentials", "description": "Provider credential management" },
+    { "name": "Push", "description": "Web push subscriptions" },
+    { "name": "Agency Core", "description": "Agency orchestration and asset sync" },
+    { "name": "Agency Video", "description": "Video generation" },
+    { "name": "Agency Image", "description": "Image generation" },
+    { "name": "Agency Text", "description": "Text generation" }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Liveness probe",
+        "operationId": "healthz",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is alive",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string" }, "env": { "type": "string" } } } } }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Readiness probe (DB ping)",
+        "operationId": "readyz",
+        "security": [],
+        "responses": {
+          "200": { "description": "Ready", "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string" } } } } } },
+          "503": { "description": "Degraded", "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string" }, "error": { "type": "string" } } } } } }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Service info",
+        "operationId": "rootInfo",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "service": { "type": "string" }, "status": { "type": "string" } } } } } }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Login and get JWT",
+        "operationId": "login",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Login successful", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" }, "example": { "success": true, "message": "success", "data": { "token": "eyJ...", "user": {}, "tenant_id": 1, "tenant_slug": "synapta" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/auth/register": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Register new user",
+        "operationId": "register",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegisterRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "User created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseUser" } } } },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/v1/auth/profile": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "Get current user profile",
+        "operationId": "getProfile",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseUser" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/admin/users": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List all platform users",
+        "operationId": "listUsers",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseUsers" } } } }
+        }
+      }
+    },
+    "/api/v1/tenants": {
+      "get": {
+        "tags": ["Tenants"],
+        "summary": "List all tenants",
+        "operationId": "listTenants",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+        }
+      },
+      "post": {
+        "tags": ["Tenants"],
+        "summary": "Create tenant",
+        "operationId": "createTenant",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTenantRequest" } } }
+        },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/tenants/{id}/deactivate": {
+      "patch": {
+        "tags": ["Tenants"],
+        "summary": "Deactivate tenant",
+        "operationId": "deactivateTenant",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/models": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List all models",
+        "operationId": "listModels",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/models/{modality}": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List models by modality",
+        "operationId": "listModelsByModality",
+        "security": [],
+        "parameters": [{ "name": "modality", "in": "path", "required": true, "schema": { "type": "string", "enum": ["video", "image", "text"] } }],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "post": {
+        "tags": ["Events"],
+        "summary": "Create event",
+        "operationId": "createEvent",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateEventRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseEvent" } } } } }
+      },
+      "get": {
+        "tags": ["Events"],
+        "summary": "List events (active only unless ?all=true)",
+        "operationId": "listEvents",
+        "parameters": [{ "name": "all", "in": "query", "schema": { "type": "string", "enum": ["true", "false"] }, "description": "Include inactive events" }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseEvents" } } } } }
+      }
+    },
+    "/api/v1/events/{id}": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "Get event with full program/piece tree",
+        "operationId": "getEvent",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseEventWithPrograms" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["Events"],
+        "summary": "Update event",
+        "operationId": "updateEvent",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateEventRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseEvent" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Events"],
+        "summary": "Soft delete event",
+        "operationId": "deleteEvent",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/events/{id}/programs": {
+      "post": {
+        "tags": ["Programs"],
+        "summary": "Create program in event",
+        "operationId": "createProgram",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Event ID" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateProgramRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseProgram" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "get": {
+        "tags": ["Programs"],
+        "summary": "List programs in event",
+        "operationId": "listProgramsByEvent",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Event ID" }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePrograms" } } } } }
+      }
+    },
+    "/api/v1/programs/{id}": {
+      "get": {
+        "tags": ["Programs"],
+        "summary": "Get program",
+        "operationId": "getProgram",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseProgram" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["Programs"],
+        "summary": "Update program",
+        "operationId": "updateProgram",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateProgramRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseProgram" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Programs"],
+        "summary": "Soft delete program",
+        "operationId": "deleteProgram",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/pieces": {
+      "get": {
+        "tags": ["Pieces"],
+        "summary": "List pieces (filter by event_id / program_id)",
+        "operationId": "listPieces",
+        "parameters": [
+          { "name": "event_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+          { "name": "program_id", "in": "query", "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePieces" } } } } }
+      }
+    },
+    "/api/v1/pieces/{id}": {
+      "get": {
+        "tags": ["Pieces"],
+        "summary": "Get piece",
+        "operationId": "getPiece",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePiece" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["Pieces"],
+        "summary": "Update piece",
+        "operationId": "updatePiece",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdatePieceRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePiece" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Pieces"],
+        "summary": "Soft delete piece",
+        "operationId": "deletePiece",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/pieces/{id}/generations": {
+      "post": {
+        "tags": ["Generations"],
+        "summary": "Create generation slot on piece",
+        "operationId": "createGeneration",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Piece ID" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateGenerationRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseGeneration" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "get": {
+        "tags": ["Generations"],
+        "summary": "List generations for piece",
+        "operationId": "listGenerations",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" }, "description": "Piece ID" }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseGenerations" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/generations/{id}": {
+      "get": {
+        "tags": ["Generations"],
+        "summary": "Get generation",
+        "operationId": "getGeneration",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseGeneration" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["Generations"],
+        "summary": "Update generation",
+        "operationId": "updateGeneration",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateGenerationRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseGeneration" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Generations"],
+        "summary": "Soft delete generation",
+        "operationId": "deleteGeneration",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/files/upload": {
+      "post": {
+        "tags": ["Files"],
+        "summary": "Upload file (multipart)",
+        "operationId": "uploadFile",
+        "requestBody": {
+          "required": true,
+          "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "file": { "type": "string", "format": "binary" }, "category": { "type": "string", "description": "File category" }, "storage": { "type": "string", "enum": ["disk"], "description": "Storage backend" } }, "required": ["file"] } } }
+        },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseFile" } } } } }
+      }
+    },
+    "/api/v1/files/page": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "List files (paginated)",
+        "operationId": "listFilesPaginated",
+        "parameters": [
+          { "name": "page", "in": "query", "schema": { "type": "integer", "default": 1 } },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer", "default": 20 } },
+          { "name": "category", "in": "query", "schema": { "type": "string" } },
+          { "name": "storage", "in": "query", "schema": { "type": "string" } },
+          { "name": "q", "in": "query", "schema": { "type": "string", "description": "Search by filename" } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePaginatedFiles" } } } } }
+      }
+    },
+    "/api/v1/files": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "List files (all)",
+        "operationId": "listFiles",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/files/{id}": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "Get file metadata",
+        "operationId": "getFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseFile" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Files"],
+        "summary": "Soft delete file",
+        "operationId": "deleteFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/files/{id}/serve": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "Serve file content (binary)",
+        "operationId": "serveFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "File content", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "404": { "$ref": "#/components/responses/NotFound" }, "410": { "$ref": "#/components/responses/Gone" } }
+      }
+    },
+    "/api/v1/files/{id}/thumbnail": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "Serve file thumbnail",
+        "operationId": "serveThumbnail",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Thumbnail image", "content": { "image/*": { "schema": { "type": "string", "format": "binary" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/files/{id}/restore": {
+      "post": {
+        "tags": ["Files"],
+        "summary": "Restore soft-deleted file",
+        "operationId": "restoreFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Restored", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseFile" } } } } }
+      }
+    },
+    "/api/v1/files/{id}/hard": {
+      "delete": {
+        "tags": ["Files"],
+        "summary": "Hard delete file (permanent)",
+        "operationId": "hardDeleteFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/ingredients": {
+      "post": {
+        "tags": ["Ingredients"],
+        "summary": "Create ingredient",
+        "operationId": "createIngredient",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateIngredientRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseIngredient" } } } } }
+      },
+      "get": {
+        "tags": ["Ingredients"],
+        "summary": "List ingredients (all)",
+        "operationId": "listIngredients",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/ingredients/page": {
+      "get": {
+        "tags": ["Ingredients"],
+        "summary": "List ingredients (paginated)",
+        "operationId": "listIngredientsPaginated",
+        "parameters": [
+          { "name": "page", "in": "query", "schema": { "type": "integer", "default": 1 } },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer", "default": 20 } },
+          { "name": "type", "in": "query", "schema": { "type": "string", "enum": ["character", "location", "prop"] } },
+          { "name": "q", "in": "query", "schema": { "type": "string", "description": "Search by name" } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponsePaginatedIngredients" } } } } }
+      }
+    },
+    "/api/v1/ingredients/{id}": {
+      "get": {
+        "tags": ["Ingredients"],
+        "summary": "Get ingredient",
+        "operationId": "getIngredient",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseIngredient" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "patch": {
+        "tags": ["Ingredients"],
+        "summary": "Update ingredient",
+        "operationId": "updateIngredient",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateIngredientRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseIngredient" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["Ingredients"],
+        "summary": "Soft delete ingredient",
+        "operationId": "deleteIngredient",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/v1/ingredients/{id}/files": {
+      "post": {
+        "tags": ["Ingredients"],
+        "summary": "Add file to ingredient",
+        "operationId": "addIngredientFile",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddIngredientFileRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseIngredientFile" } } } } }
+      },
+      "get": {
+        "tags": ["Ingredients"],
+        "summary": "List ingredient files",
+        "operationId": "listIngredientFiles",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseIngredientFiles" } } } } }
+      }
+    },
+    "/api/v1/ingredients/{id}/files/{fileId}": {
+      "delete": {
+        "tags": ["Ingredients"],
+        "summary": "Remove file from ingredient",
+        "operationId": "removeIngredientFile",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "fileId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "Removed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/assignments/{targetType}/{targetId}": {
+      "get": {
+        "tags": ["Assignments"],
+        "summary": "List assignments by target",
+        "operationId": "listAssignmentsByTarget",
+        "parameters": [
+          { "name": "targetType", "in": "path", "required": true, "schema": { "type": "string", "enum": ["event", "program", "piece", "ingredient", "file", "preset", "skill", "model"] } },
+          { "name": "targetId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "post": {
+        "tags": ["Assignments"],
+        "summary": "Assign resource to target",
+        "operationId": "assignResource",
+        "parameters": [
+          { "name": "targetType", "in": "path", "required": true, "schema": { "type": "string", "enum": ["event", "program", "piece", "ingredient", "file", "preset", "skill", "model"] } },
+          { "name": "targetId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AssignRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/assignments/resource/{resourceType}/{resourceId}": {
+      "get": {
+        "tags": ["Assignments"],
+        "summary": "List assignments by resource",
+        "operationId": "listAssignmentsByResource",
+        "parameters": [
+          { "name": "resourceType", "in": "path", "required": true, "schema": { "type": "string", "enum": ["event", "program", "piece", "ingredient", "file", "preset", "skill", "model"] } },
+          { "name": "resourceId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/assignments/{targetType}/{targetId}/{resourceType}/{resourceId}": {
+      "delete": {
+        "tags": ["Assignments"],
+        "summary": "Unassign resource from target",
+        "operationId": "unassignResource",
+        "parameters": [
+          { "name": "targetType", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "targetId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "resourceType", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "resourceId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": { "200": { "description": "Removed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/assignments/by-id/{id}": {
+      "delete": {
+        "tags": ["Assignments"],
+        "summary": "Remove assignment by ID",
+        "operationId": "deleteAssignment",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Removed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/presets/groups": {
+      "get": {
+        "tags": ["Presets"],
+        "summary": "List preset groups",
+        "operationId": "listPresetGroups",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "post": {
+        "tags": ["Presets"],
+        "summary": "Create preset group (director+)",
+        "operationId": "createPresetGroup",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreatePresetGroupRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/presets/groups/{id}": {
+      "patch": {
+        "tags": ["Presets"],
+        "summary": "Update preset group (director+)",
+        "operationId": "updatePresetGroup",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdatePresetGroupRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/presets": {
+      "get": {
+        "tags": ["Presets"],
+        "summary": "List presets",
+        "operationId": "listPresets",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "post": {
+        "tags": ["Presets"],
+        "summary": "Create preset (director+)",
+        "operationId": "createPreset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreatePresetRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/presets/{id}": {
+      "get": {
+        "tags": ["Presets"],
+        "summary": "Get preset",
+        "operationId": "getPreset",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "patch": {
+        "tags": ["Presets"],
+        "summary": "Update preset (director+)",
+        "operationId": "updatePreset",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdatePresetRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "delete": {
+        "tags": ["Presets"],
+        "summary": "Soft delete preset (director+)",
+        "operationId": "deletePreset",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/skills": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "List skills",
+        "operationId": "listSkills",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "post": {
+        "tags": ["Skills"],
+        "summary": "Create skill",
+        "operationId": "createSkill",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateSkillRequest" } } } },
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/skills/{id}": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "Get skill",
+        "operationId": "getSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "patch": {
+        "tags": ["Skills"],
+        "summary": "Update skill",
+        "operationId": "updateSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateSkillRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "delete": {
+        "tags": ["Skills"],
+        "summary": "Delete skill",
+        "operationId": "deleteSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/credentials": {
+      "get": {
+        "tags": ["Credentials"],
+        "summary": "List credentials (masked)",
+        "operationId": "listCredentials",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      },
+      "put": {
+        "tags": ["Credentials"],
+        "summary": "Upsert credential (admin+)",
+        "operationId": "upsertCredential",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpsertCredentialRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/credentials/{provider}": {
+      "delete": {
+        "tags": ["Credentials"],
+        "summary": "Delete credential (admin+)",
+        "operationId": "deleteCredential",
+        "parameters": [{ "name": "provider", "in": "path", "required": true, "schema": { "type": "string", "enum": ["byteplus", "gemini", "anthropic"] } }],
+        "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/push/subscriptions": {
+      "post": {
+        "tags": ["Push"],
+        "summary": "Register push subscription",
+        "operationId": "registerPushSubscription",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushSubscriptionRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      },
+      "delete": {
+        "tags": ["Push"],
+        "summary": "Unregister push subscription",
+        "operationId": "unregisterPushSubscription",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushSubscriptionRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/push/test": {
+      "post": {
+        "tags": ["Push"],
+        "summary": "Send test push notification",
+        "operationId": "testPush",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/agency/sync-asset": {
+      "post": {
+        "tags": ["Agency Core"],
+        "summary": "Sync an external asset to a model",
+        "operationId": "syncAsset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SyncAssetRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/synced-assets": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "List synced assets",
+        "operationId": "listSyncedAssets",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/logs/generation/cost-summary": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "Generation cost summary",
+        "operationId": "generationCostSummary",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/logs/generation": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "List generation logs",
+        "operationId": "listGenerationLogs",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/logs/generation/{id}": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "Get generation log",
+        "operationId": "getGenerationLog",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/logs/server-communications": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "List server communication logs",
+        "operationId": "listServerComms",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/logs/server-communications/{id}": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "Get server communication log",
+        "operationId": "getServerComm",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/assets": {
+      "get": {
+        "tags": ["Agency Core"],
+        "summary": "List generated assets",
+        "operationId": "listAgencyAssets",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/video/generate": {
+      "post": {
+        "tags": ["Agency Video"],
+        "summary": "Generate video",
+        "operationId": "generateVideo",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateVideoRequest" } } } },
+        "responses": { "202": { "description": "Accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/video/status/{taskId}": {
+      "get": {
+        "tags": ["Agency Video"],
+        "summary": "Get video task status",
+        "operationId": "getVideoStatus",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseTaskStatus" } } } } }
+      }
+    },
+    "/api/v1/agency/video/task/{taskId}": {
+      "delete": {
+        "tags": ["Agency Video"],
+        "summary": "Cancel video task",
+        "operationId": "cancelVideoTask",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/agency/video/preview": {
+      "post": {
+        "tags": ["Agency Video"],
+        "summary": "Preview video payload",
+        "operationId": "previewVideo",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateVideoRequest" } } } },
+        "responses": { "200": { "description": "Preview payload", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/image/generate": {
+      "post": {
+        "tags": ["Agency Image"],
+        "summary": "Generate image",
+        "operationId": "generateImage",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateImageRequest" } } } },
+        "responses": { "202": { "description": "Accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/image/status/{taskId}": {
+      "get": {
+        "tags": ["Agency Image"],
+        "summary": "Get image task status",
+        "operationId": "getImageStatus",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseTaskStatus" } } } } }
+      }
+    },
+    "/api/v1/agency/image/task/{taskId}": {
+      "delete": {
+        "tags": ["Agency Image"],
+        "summary": "Cancel image task",
+        "operationId": "cancelImageTask",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/agency/image/preview": {
+      "post": {
+        "tags": ["Agency Image"],
+        "summary": "Preview image payload",
+        "operationId": "previewImage",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateImageRequest" } } } },
+        "responses": { "200": { "description": "Preview payload", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/text/generate": {
+      "post": {
+        "tags": ["Agency Text"],
+        "summary": "Generate text",
+        "operationId": "generateText",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateTextRequest" } } } },
+        "responses": { "202": { "description": "Accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    },
+    "/api/v1/agency/text/status/{taskId}": {
+      "get": {
+        "tags": ["Agency Text"],
+        "summary": "Get text task status",
+        "operationId": "getTextStatus",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseTaskStatus" } } } } }
+      }
+    },
+    "/api/v1/agency/text/task/{taskId}": {
+      "delete": {
+        "tags": ["Agency Text"],
+        "summary": "Cancel text task",
+        "operationId": "cancelTextTask",
+        "parameters": [{ "name": "taskId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } } }
+      }
+    },
+    "/api/v1/agency/text/preview": {
+      "post": {
+        "tags": ["Agency Text"],
+        "summary": "Preview text payload",
+        "operationId": "previewText",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateTextRequest" } } } },
+        "responses": { "200": { "description": "Preview payload", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT token from POST /auth/login. Carries sub (user id), tenant_id, role_level, username."
+      }
+    },
+    "schemas": {
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string" }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string" },
+          "name": { "type": "string" },
+          "surname": { "type": "string" },
+          "user_name": { "type": "string" },
+          "email": { "type": "string" }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "username": { "type": "string" },
+          "name": { "type": "string" },
+          "surname": { "type": "string" },
+          "user_name": { "type": "string" },
+          "email": { "type": "string" },
+          "role_level": { "type": "integer", "description": "0=SUPER_ADMIN, 1=ADMIN, 2=DIRECTOR, 3=USER" },
+          "role_name": { "type": "string", "enum": ["SUPER_ADMIN", "ADMIN", "DIRECTOR", "USER"] },
+          "active": { "type": "boolean" }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string", "description": "JWT Bearer token (24h expiry)" },
+          "user": { "$ref": "#/components/schemas/User" },
+          "tenant_id": { "type": "integer", "format": "int64" },
+          "tenant_slug": { "type": "string" }
+        }
+      },
+      "CreateEventRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" },
+          "venue": { "type": "string" },
+          "starts_at": { "type": "string", "format": "date-time" },
+          "ends_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "UpdateEventRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" },
+          "venue": { "type": "string" },
+          "starts_at": { "type": "string", "format": "date-time" },
+          "ends_at": { "type": "string", "format": "date-time" },
+          "status": { "type": "string" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" },
+          "venue": { "type": "string" },
+          "starts_at": { "type": "string", "format": "date-time", "nullable": true },
+          "ends_at": { "type": "string", "format": "date-time", "nullable": true },
+          "status": { "type": "string" },
+          "active": { "type": "boolean" },
+          "program_count": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateProgramRequest": {
+        "type": "object",
+        "required": ["number"],
+        "properties": {
+          "number": { "type": "integer" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "scheduled_at": { "type": "string", "format": "date-time" },
+          "sort_order": { "type": "integer" }
+        }
+      },
+      "UpdateProgramRequest": {
+        "type": "object",
+        "properties": {
+          "number": { "type": "integer" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "scheduled_at": { "type": "string", "format": "date-time" },
+          "sort_order": { "type": "integer" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "Program": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "event_id": { "type": "string", "format": "uuid" },
+          "number": { "type": "integer" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "scheduled_at": { "type": "string", "format": "date-time", "nullable": true },
+          "sort_order": { "type": "integer" },
+          "active": { "type": "boolean" },
+          "piece_count": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreatePieceRequest": {
+        "type": "object",
+        "required": ["number"],
+        "properties": {
+          "program_id": { "type": "string", "format": "uuid" },
+          "number": { "type": "integer" },
+          "piece_code": { "type": "string" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "type": { "type": "string" },
+          "output_format": { "type": "string" },
+          "duration": { "type": "integer" },
+          "aspect_ratio": { "type": "string" }
+        }
+      },
+      "UpdatePieceRequest": {
+        "type": "object",
+        "properties": {
+          "program_id": { "type": "string", "format": "uuid" },
+          "number": { "type": "integer" },
+          "piece_code": { "type": "string" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "type": { "type": "string" },
+          "output_format": { "type": "string" },
+          "duration": { "type": "integer" },
+          "aspect_ratio": { "type": "string" },
+          "active": { "type": "boolean" }
+        }
+      },
+      "Piece": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "event_id": { "type": "string", "format": "uuid" },
+          "program_id": { "type": "string", "format": "uuid" },
+          "number": { "type": "integer" },
+          "piece_code": { "type": "string" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "type": { "type": "string" },
+          "output_format": { "type": "string" },
+          "duration": { "type": "integer" },
+          "aspect_ratio": { "type": "string" },
+          "active": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateGenerationRequest": {
+        "type": "object",
+        "required": ["number"],
+        "properties": {
+          "number": { "type": "integer" },
+          "status": { "type": "string", "default": "pending" }
+        }
+      },
+      "UpdateGenerationRequest": {
+        "type": "object",
+        "properties": {
+          "video_url": { "type": "string" },
+          "video_local_url": { "type": "string" },
+          "status": { "type": "string" },
+          "active": { "type": "boolean" },
+          "final": { "type": "boolean", "description": "Mark as final (sets finalized_at automatically)" },
+          "task_id": { "type": "string" },
+          "rating": { "type": "integer" }
+        }
+      },
+      "PieceGeneration": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "piece_id": { "type": "string", "format": "uuid" },
+          "number": { "type": "integer" },
+          "video_url": { "type": "string" },
+          "video_local_url": { "type": "string" },
+          "status": { "type": "string" },
+          "active": { "type": "boolean" },
+          "final": { "type": "boolean" },
+          "finalized_at": { "type": "string", "format": "date-time", "nullable": true },
+          "task_id": { "type": "string" },
+          "rating": { "type": "integer" },
+          "request_payload": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "EventWithPrograms": {
+        "type": "object",
+        "properties": {
+          "event": { "$ref": "#/components/schemas/Event" },
+          "programs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "program": { "$ref": "#/components/schemas/Program" },
+                "pieces": { "type": "array", "items": { "$ref": "#/components/schemas/Piece" } }
+              }
+            }
+          }
+        }
+      },
+      "CreateTenantRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "slug": { "type": "string" }
+        }
+      },
+      "CreateIngredientRequest": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["character", "location", "prop"], "default": "character" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" }
+        }
+      },
+      "UpdateIngredientRequest": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["character", "location", "prop"] },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" }
+        }
+      },
+      "Ingredient": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "type": { "type": "string", "enum": ["character", "location", "prop"] },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "metadata": { "type": "string" },
+          "active": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AddIngredientFileRequest": {
+        "type": "object",
+        "properties": {
+          "file_id": { "type": "string", "format": "uuid" },
+          "role": { "type": "string", "description": "e.g. main, reference" }
+        }
+      },
+      "IngredientFile": {
+        "type": "object",
+        "properties": {
+          "file_id": { "type": "string", "format": "uuid" },
+          "role": { "type": "string" },
+          "filename": { "type": "string" },
+          "url": { "type": "string" },
+          "thumbnail_url": { "type": "string" },
+          "mime_type": { "type": "string" },
+          "category": { "type": "string" },
+          "format": { "type": "string" }
+        }
+      },
+      "File": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "filename": { "type": "string" },
+          "url": { "type": "string" },
+          "thumbnail_url": { "type": "string" },
+          "mime_type": { "type": "string" },
+          "size": { "type": "integer", "format": "int64" },
+          "sha256": { "type": "string" },
+          "category": { "type": "string" },
+          "format": { "type": "string" },
+          "storage": { "type": "string" },
+          "trashed": { "type": "boolean" },
+          "duplicate": { "type": "boolean", "description": "True if a file with same sha256 already existed" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PaginatedFiles": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/File" } },
+          "total": { "type": "integer" },
+          "page": { "type": "integer" },
+          "page_size": { "type": "integer" }
+        }
+      },
+      "AssignRequest": {
+        "type": "object",
+        "properties": {
+          "resource_type": { "type": "string", "enum": ["event", "program", "piece", "ingredient", "file", "preset", "skill", "model"] },
+          "resource_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "CreatePresetGroupRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "UpdatePresetGroupRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "CreatePresetRequest": {
+        "type": "object",
+        "properties": {
+          "group_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "content": { "type": "object", "description": "Preset content (JSON)" }
+        }
+      },
+      "UpdatePresetRequest": {
+        "type": "object",
+        "properties": {
+          "group_id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "content": { "type": "object" }
+        }
+      },
+      "CreateSkillRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "prompt": { "type": "string" }
+        }
+      },
+      "UpdateSkillRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "prompt": { "type": "string" }
+        }
+      },
+      "UpsertCredentialRequest": {
+        "type": "object",
+        "properties": {
+          "provider": { "type": "string", "enum": ["byteplus", "gemini", "anthropic"] },
+          "api_key": { "type": "string" },
+          "metadata": { "type": "object", "description": "Provider-specific config (base URL, model, etc.)" }
+        }
+      },
+      "PushSubscriptionRequest": {
+        "type": "object",
+        "properties": {
+          "endpoint": { "type": "string", "format": "uri" },
+          "keys": {
+            "type": "object",
+            "properties": {
+              "p256dh": { "type": "string" },
+              "auth": { "type": "string" }
+            }
+          }
+        }
+      },
+      "SyncAssetRequest": {
+        "type": "object",
+        "properties": {
+          "model_id": { "type": "string", "format": "uuid" },
+          "file_id": { "type": "string", "format": "uuid" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "GenerateVideoRequest": {
+        "type": "object",
+        "properties": {
+          "model_id": { "type": "string", "format": "uuid" },
+          "piece_id": { "type": "string", "format": "uuid" },
+          "generation_number": { "type": "integer" },
+          "prompt": { "type": "string" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "GenerateImageRequest": {
+        "type": "object",
+        "properties": {
+          "model_id": { "type": "string", "format": "uuid" },
+          "prompt": { "type": "string" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "GenerateTextRequest": {
+        "type": "object",
+        "properties": {
+          "model_id": { "type": "string", "format": "uuid" },
+          "prompt": { "type": "string" },
+          "metadata": { "type": "object" }
+        }
+      },
+      "TaskStatus": {
+        "type": "object",
+        "properties": {
+          "task_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["pending", "processing", "completed", "failed", "cancelled"] },
+          "progress": { "type": "number", "format": "float" },
+          "result_url": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      },
+      "ApiResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "nullable": true }
+        }
+      },
+      "ApiResponseMessage": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "null" }
+        }
+      },
+      "ApiResponseUser": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/User" }
+        }
+      },
+      "ApiResponseUsers": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/User" } }
+        }
+      },
+      "ApiResponseEvent": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/Event" }
+        }
+      },
+      "ApiResponseEvents": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Event" } }
+        }
+      },
+      "ApiResponseEventWithPrograms": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/EventWithPrograms" }
+        }
+      },
+      "ApiResponseProgram": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/Program" }
+        }
+      },
+      "ApiResponsePrograms": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Program" } }
+        }
+      },
+      "ApiResponsePiece": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/Piece" }
+        }
+      },
+      "ApiResponsePieces": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Piece" } }
+        }
+      },
+      "ApiResponseGeneration": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/PieceGeneration" }
+        }
+      },
+      "ApiResponseGenerations": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/PieceGeneration" } }
+        }
+      },
+      "ApiResponseFile": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/File" }
+        }
+      },
+      "ApiResponsePaginatedFiles": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/PaginatedFiles" }
+        }
+      },
+      "ApiResponseIngredient": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/Ingredient" }
+        }
+      },
+      "ApiResponsePaginatedIngredients": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": {
+            "type": "object",
+            "properties": {
+              "items": { "type": "array", "items": { "$ref": "#/components/schemas/Ingredient" } },
+              "total": { "type": "integer" },
+              "page": { "type": "integer" },
+              "page_size": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "ApiResponseIngredientFile": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/IngredientFile" }
+        }
+      },
+      "ApiResponseIngredientFiles": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/IngredientFile" } }
+        }
+      },
+      "ApiResponseTaskStatus": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/TaskStatus" }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid JWT",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+      },
+      "Forbidden": {
+        "description": "Insufficient role level",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "success": { "type": "boolean" }, "message": { "type": "string" }, "data": { "type": "null" } } } } }
+      },
+      "Conflict": {
+        "description": "Resource already exists",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "success": { "type": "boolean" }, "message": { "type": "string" }, "data": { "type": "null" } } } } }
+      },
+      "Gone": {
+        "description": "Resource permanently deleted",
+        "content": { "application/json": { "schema": { "type": "object", "properties": { "success": { "type": "boolean" }, "message": { "type": "string" }, "data": { "type": "null" } } } } }
+      }
+    }
+  }
+}

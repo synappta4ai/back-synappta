@@ -1,0 +1,17 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Binaries
+*.exe
+*.test
+bin/
+synapta
+
+# Runtime data
+uploads/
+outputs/
+
+# Go
+vendor/

@@ -1,0 +1,24 @@
+# Never bake secrets or local artifacts into the image.
+.env
+.env.*
+!.env.example
+
+# VCS / CI
+.git
+.github
+
+# Build artifacts
+*.exe
+*.test
+synapta
+bin/
+build/
+
+# Runtime data (mounted as volumes instead)
+uploads/
+outputs/
+
+# Tooling
+Makefile
+docker-compose.yml
+*.md
