@@ -1,4 +1,4 @@
-.PHONY: help run build test vet fmt tidy docker-build docker-up docker-down migrate-seed
+.PHONY: help run build test vet fmt tidy docker-build docker-up docker-down migrate-seed generate-keys
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -29,3 +29,6 @@ docker-up: ## Start the dev stack (Postgres + API)
 
 docker-down: ## Stop the dev stack
 	docker compose down
+
+generate-keys: ## Generate VAPID + security keys for .env
+	go run ./cmd/generate-keys

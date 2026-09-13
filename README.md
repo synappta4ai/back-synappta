@@ -38,6 +38,7 @@ synapta/
 
 ```bash
 cp .env.example .env
+go run ./cmd/generate-keys     # genera JWT_SECRET, ENCRYPTION_KEY y claves VAPID
 docker compose up -d --build   # Postgres + API en :9099
 # o local:
 go run .
