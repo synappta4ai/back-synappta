@@ -7,7 +7,8 @@ import (
 	"log"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // PoolConfig holds tuning applied to every connection pool.
@@ -20,6 +21,43 @@ type PoolConfig struct {
 // Open opens a database connection with the given URL and applies pool limits.
 func Open(databaseURL string, pool PoolConfig) (*sql.DB, error) {
 	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open db connection: %w", err)
+	}
+
+	db.SetMaxOpenConns(pool.MaxOpenConns)
+	db.SetMaxIdleConns(pool.MaxIdleConns)
+	db.SetConnMaxLifetime(pool.ConnMaxLifetime)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping db: %w", err)
+	}
+
+	return db, nil
+}
+
+// OpenWithSearchPath opens a database connection that sets search_path on every
+// new connection via RuntimeParams. This is essential for
+// schema-per-tenant multi-tenancy because the pgx driver ignores the
+// options=-csearch_path connection parameter.
+func OpenWithSearchPath(databaseURL string, schema string, pool PoolConfig) (*sql.DB, error) {
+	config, err := pgx.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse pgx config: %w", err)
+	}
+
+	// Set search_path as a runtime parameter — applied on every new connection
+	if config.RuntimeParams == nil {
+		config.RuntimeParams = make(map[string]string)
+	}
+	config.RuntimeParams["search_path"] = fmt.Sprintf("%s, public", schema)
+
+	connStr := stdlib.RegisterConnConfig(config)
+
+	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db connection: %w", err)
 	}

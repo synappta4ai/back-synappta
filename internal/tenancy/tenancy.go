@@ -115,14 +115,13 @@ func (r *Registry) Pool(slug string) (*sql.DB, error) {
 		return nil, fmt.Errorf("tenant schema for %q does not exist", slug)
 	}
 
-	// Connect with search_path pinned to the tenant schema — pgx honors the
-	// `options` connection parameter.
+	// Connect with search_path pinned to the tenant schema using AfterConnect hook
+	// because pgx ignores the options=-csearch_path parameter.
 	sysURL, err := r.SystemDSN()
 	if err != nil {
 		return nil, err
 	}
-	tenantURL := fmt.Sprintf("%s&options=-csearch_path%%3D%s,public", sysURL, SchemaName(slug))
-	p, err = db.Open(tenantURL, r.poolCfg)
+	p, err = db.OpenWithSearchPath(sysURL, SchemaName(slug), r.poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open tenant pool for %q: %w", slug, err)
 	}
