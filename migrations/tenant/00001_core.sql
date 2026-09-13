@@ -20,6 +20,10 @@ CREATE TABLE files (
     storage     VARCHAR(15) NOT NULL DEFAULT 'persistent',
     duration    DOUBLE PRECISION NOT NULL DEFAULT 0,
     trashed     BOOLEAN NOT NULL DEFAULT FALSE,
+    -- SHA-256 content hash for deduplication: re-uploading the same image
+    -- returns the existing file instead of creating a duplicate. '' = rows
+    -- uploaded before hashing; they never match.
+    sha256      VARCHAR(64) NOT NULL DEFAULT '',
     created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     deleted_at  TIMESTAMP WITH TIME ZONE DEFAULT NULL
@@ -29,12 +33,16 @@ CREATE INDEX idx_files_category ON files (category);
 CREATE INDEX idx_files_storage ON files (storage);
 CREATE INDEX idx_files_deleted_at ON files (deleted_at);
 CREATE INDEX idx_files_trashed ON files (trashed);
+CREATE INDEX idx_files_sha256 ON files (sha256)
+    WHERE sha256 <> '' AND deleted_at IS NULL AND trashed = FALSE;
 
 -- ─── Ingredients (replaces characters: talent, props, brands) ─
 CREATE TABLE ingredients (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        VARCHAR(255) NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    -- Ingredient kind: character (talent), location or prop.
+    type        VARCHAR(31) NOT NULL DEFAULT 'character',
     metadata    JSONB DEFAULT '{}',
     created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -42,6 +50,7 @@ CREATE TABLE ingredients (
 );
 
 CREATE INDEX idx_ingredients_name ON ingredients (name);
+CREATE INDEX idx_ingredients_type ON ingredients (type);
 CREATE INDEX idx_ingredients_deleted_at ON ingredients (deleted_at);
 
 CREATE TABLE ingredient_files (
@@ -202,6 +211,8 @@ CREATE TABLE skills (
 );
 
 -- ─── Generation logs (event context) ──────────────────────────
+-- Metadata columns (usage tokens, video shape, progress estimate) extracted
+-- from provider responses are part of the base schema.
 CREATE TABLE generation_logs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id         VARCHAR(255) NOT NULL,
@@ -220,6 +231,17 @@ CREATE TABLE generation_logs (
     content_types   VARCHAR(127) NOT NULL DEFAULT '',
     estimated_cost  DOUBLE PRECISION NOT NULL DEFAULT 0,
     cost_source     VARCHAR(31) NOT NULL DEFAULT '',
+    -- Provider usage tokens (video/text generation accounting).
+    usage_tokens          BIGINT NOT NULL DEFAULT 0,
+    usage_completion_tokens BIGINT NOT NULL DEFAULT 0,
+    -- Video metadata from the provider response.
+    video_duration  INT NOT NULL DEFAULT 0,
+    video_resolution VARCHAR(15) NOT NULL DEFAULT '',
+    video_ratio     VARCHAR(15) NOT NULL DEFAULT '',
+    video_seed      BIGINT NOT NULL DEFAULT 0,
+    video_fps       INT NOT NULL DEFAULT 0,
+    -- Estimated progress percent (0-100); 100 once the task succeeds.
+    progress        INT NOT NULL DEFAULT 0,
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     deleted_at      TIMESTAMP WITH TIME ZONE DEFAULT NULL
@@ -232,21 +254,62 @@ CREATE INDEX idx_generation_logs_status ON generation_logs(status);
 CREATE INDEX idx_generation_logs_deleted_at ON generation_logs(deleted_at);
 
 -- ─── Server communications (external API traces) ──────────────
+-- One logical record per task: the generation submit (phase 'generate') and
+-- the latest status poll (phase 'poll', one row per task accumulated via
+-- upsert). Audit fields record who triggered the call and which credentials
+-- were used (always stored masked, never the raw secrets). started_at /
+-- finished_at / total_duration_ms span submit → final result so progress can
+-- be estimated while polling.
 CREATE TABLE server_communications (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id       VARCHAR(255) NOT NULL DEFAULT '',
     model_name    VARCHAR(255) NOT NULL,
     endpoint      TEXT NOT NULL DEFAULT '',
     method        VARCHAR(15) NOT NULL DEFAULT 'POST',
+    -- Phase of this trace: 'generate' (submit) or 'poll' (status check).
+    phase         VARCHAR(15) NOT NULL DEFAULT '',
+    -- Polling aggregates: how many polls happened and the submit→finish span.
+    poll_count    INT NOT NULL DEFAULT 0,
+    started_at    TIMESTAMP WITH TIME ZONE,
+    finished_at   TIMESTAMP WITH TIME ZONE,
+    total_duration_ms BIGINT NOT NULL DEFAULT 0,
     request_body  TEXT,
     response_body TEXT,
     status_code   INT NOT NULL DEFAULT 0,
     duration_ms   BIGINT NOT NULL DEFAULT 0,
     error_message TEXT,
+    -- Audit: who triggered the call.
+    user_id       BIGINT NOT NULL DEFAULT 0,
+    username      VARCHAR(255) NOT NULL DEFAULT '',
+    tenant_slug   VARCHAR(64) NOT NULL DEFAULT '',
+    -- Audit: which credentials were used (masked).
+    credential_provider VARCHAR(64) NOT NULL DEFAULT '',
+    api_key_mask  VARCHAR(64) NOT NULL DEFAULT '',
+    access_key_mask VARCHAR(64) NOT NULL DEFAULT '',
+    secret_key_mask VARCHAR(64) NOT NULL DEFAULT '',
+    auth_type     VARCHAR(32) NOT NULL DEFAULT '',
     created_at    TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_server_comms_task ON server_communications(task_id);
+CREATE INDEX idx_server_comms_user ON server_communications(user_id);
+CREATE INDEX idx_server_comms_created ON server_communications(created_at);
+CREATE INDEX idx_server_comms_phase ON server_communications(phase);
+
+-- ─── Credentials (per-tenant provider API keys, encrypted at rest) ──
+CREATE TABLE credentials (
+    id                VARCHAR(64) PRIMARY KEY,
+    provider          VARCHAR(64) NOT NULL UNIQUE,
+    display_name      VARCHAR(255) NOT NULL DEFAULT '',
+    access_key_id     TEXT NOT NULL DEFAULT '',     -- AES-256 encrypted
+    secret_access_key TEXT NOT NULL DEFAULT '',     -- AES-256 encrypted
+    api_key           TEXT NOT NULL DEFAULT '',     -- AES-256 encrypted
+    endpoint          TEXT NOT NULL DEFAULT '',
+    base_url          TEXT NOT NULL DEFAULT '',
+    extra             TEXT NOT NULL DEFAULT '',     -- JSON blob, provider-specific
+    created_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
 
 -- ─── Generated assets ──────────────────────────────────────────
 CREATE TABLE generated_assets (
@@ -314,6 +377,7 @@ CREATE INDEX idx_push_subscriptions_user ON push_subscriptions(user_id);
 DROP TABLE IF EXISTS push_subscriptions CASCADE;
 DROP TABLE IF EXISTS model_assets CASCADE;
 DROP TABLE IF EXISTS generated_assets CASCADE;
+DROP TABLE IF EXISTS credentials CASCADE;
 DROP TABLE IF EXISTS server_communications CASCADE;
 DROP TABLE IF EXISTS generation_logs CASCADE;
 DROP TABLE IF EXISTS skills CASCADE;

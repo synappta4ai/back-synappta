@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS users (
     active        BOOLEAN NOT NULL DEFAULT TRUE,
     created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    deleted_at    TIMESTAMP WITH TIME ZONE DEFAULT NULL
+    deleted_at    TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+    preferences   JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_platform_role ON users(platform_role);
