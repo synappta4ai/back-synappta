@@ -85,7 +85,7 @@ var catalog = []Model{
 		},
 	},
 	{
-		Name: "dreamina-seedance-2-5", Modality: ModalityVideo,
+		Name: "dreamina-seedance-2-5-260628", Modality: ModalityVideo,
 		Generator: "seedance25", CredentialProvider: ProviderBytePlus,
 		BaseURL:     "https://ark.ap-southeast.bytepluses.com/api/v3",
 		Endpoint:    "/contents/generations/tasks",
@@ -93,17 +93,17 @@ var catalog = []Model{
 		Defaults: Defaults{
 			Ratios:      []string{"adaptive", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"},
 			Resolutions: []string{"480p", "720p", "1080p"},
-			Durations:   []int{5, 10},
+			Durations:   []int{5, 30},
 		},
 	},
 
 	// ─── Image ────────────────────────────────────────────────
 	{
-		Name: "dreamina-seedream-4-pro-251224", Modality: ModalityImage,
+		Name: "dola-seedream-5-0-pro-260628", Modality: ModalityImage,
 		Generator: "seedream", CredentialProvider: ProviderBytePlus,
 		BaseURL:     "https://ark.ap-southeast.bytepluses.com/api/v3",
-		Endpoint:    "/contents/generations/tasks",
-		DisplayName: "Seedream 4 Pro",
+		Endpoint:    "/images/generations",
+		DisplayName: "Dola Seedream 5.0 Pro",
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p", "2K"},

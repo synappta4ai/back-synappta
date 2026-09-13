@@ -1,7 +1,7 @@
 // Seedance 2.5 generator. Wires the PS2.5 model into the agency pipeline.
 //
 // Differences vs Seedance 2.0 (internal/modules/agency/video/video.go):
-//   - Model id "dreamina-seedance-2-5".
+//   - Model id "dreamina-seedance-2-5-260628".
 //   - duration: only [4,30] seconds or -1 (auto). No default of 5s:
 //     an unset duration is omitted so the API uses its -1 default.
 //   - Supports the "adaptive" ratio (mandatory for image-to-video, edit
@@ -27,7 +27,7 @@ import (
 )
 
 // ModelDreaminaSeedance25 is the real BytePlus model id used in payloads.
-const ModelDreaminaSeedance25 = "dreamina-seedance-2-5"
+const ModelDreaminaSeedance25 = "dreamina-seedance-2-5-260628"
 
 // Seedance25Generator runs async video generation through BytePlus Ark.
 type Seedance25Generator struct {
@@ -51,7 +51,7 @@ func (g *Seedance25Generator) ContentType() string { return "video" }
 
 // Match reports whether this generator handles the model name.
 func (g *Seedance25Generator) Match(modelName string) bool {
-	return strings.Contains(strings.ToLower(modelName), "dreamina-seedance-2-5")
+	return strings.Contains(strings.ToLower(modelName), "dreamina-seedance-2-5-260628")
 }
 
 // Validate checks the request against Seedance 2.5 constraints.

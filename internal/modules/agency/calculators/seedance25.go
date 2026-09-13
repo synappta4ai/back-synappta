@@ -36,7 +36,7 @@ func (c *Seedance25Calculator) Name() string { return "seedance25" }
 
 // Match reports whether this calculator handles the model.
 func (c *Seedance25Calculator) Match(modelName string) bool {
-	return strings.Contains(strings.ToLower(modelName), "dreamina-seedance-2-5")
+	return strings.Contains(strings.ToLower(modelName), "dreamina-seedance-2-5-260628")
 }
 
 // CalculateFromResponse never extracts cost from the API response.
