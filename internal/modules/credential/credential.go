@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,23 @@ const (
 
 var validProviders = map[string]bool{
 	ProviderBytePlus: true, ProviderGemini: true, ProviderAnthropic: true,
+}
+
+// IsValidProvider reports whether the provider name is one of the supported ones.
+func IsValidProvider(p string) bool { return validProviders[p] }
+
+// MaskPublic returns an obfuscated representation of a secret safe for logs
+// and API responses: first 4 + last 4 chars, e.g. "AIza••••cQ9x". Short or
+// empty secrets produce a fixed placeholder without leaking content.
+func MaskPublic(secret string) string {
+	s := strings.TrimSpace(secret)
+	if s == "" {
+		return ""
+	}
+	if len(s) <= 8 {
+		return "••••••"
+	}
+	return s[:4] + "••••" + s[len(s)-4:]
 }
 
 // Credential is one tenant's credentials for one provider.
@@ -105,10 +123,71 @@ func (s *Store) open(sealed string) string {
 	return string(plain)
 }
 
+// validateKeyFormat rejects keys that clearly belong to another provider
+// (paste-the-wrong-key protection). Empty keys pass — validation of presence
+// is done at generation time. Only confident signatures are rejected; anything
+// ambiguous is allowed (Ark keys have no documented fixed prefix).
+func validateKeyFormat(provider, apiKey string) error {
+	k := strings.TrimSpace(apiKey)
+	if k == "" {
+		return nil
+	}
+	isAnthropicKey := strings.HasPrefix(k, "sk-ant-")
+	isGeminiKey := strings.HasPrefix(k, "AIza")
+	isGenericOpenAIStyle := strings.HasPrefix(k, "sk-") && !isAnthropicKey
+
+	// Which provider's signature does the key carry?
+	var keyLooksLike string
+	switch {
+	case isAnthropicKey:
+		keyLooksLike = "an Anthropic key (sk-ant-...)"
+	case isGeminiKey:
+		keyLooksLike = "a Google Gemini key (AIza...)"
+	case isGenericOpenAIStyle:
+		keyLooksLike = "an OpenAI-style key (sk-...)"
+	default:
+		keyLooksLike = ""
+	}
+
+	conflict := func(where string) error {
+		return fmt.Errorf(
+			"the pasted key is %s and cannot be saved for %s — get the correct key in: %s",
+			keyLooksLike, provider, where)
+	}
+
+	switch provider {
+	case ProviderGemini:
+		if isAnthropicKey || isGenericOpenAIStyle {
+			return conflict("Google AI Studio (aistudio.google.com → Get API key)")
+		}
+	case ProviderAnthropic:
+		if isGeminiKey || isGenericOpenAIStyle {
+			return conflict("the Anthropic Console (console.anthropic.com → API Keys)")
+		}
+	case ProviderBytePlus:
+		if isAnthropicKey || isGeminiKey {
+			return conflict("BytePlus Console → ModelArk → API Key Management (console.byteplus.com/ark)")
+		}
+	}
+	return nil
+}
+
 // Upsert creates or updates the tenant's credential for a provider.
 func (s *Store) Upsert(req *UpsertRequest) (*Credential, error) {
 	if !validProviders[req.Provider] {
 		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic)", req.Provider)
+	}
+
+	// Trim pasted values — stray whitespace/newlines break Authorization headers.
+	req.AccessKeyID = strings.TrimSpace(req.AccessKeyID)
+	req.SecretAccessKey = strings.TrimSpace(req.SecretAccessKey)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.Endpoint = strings.TrimSpace(req.Endpoint)
+	req.BaseURL = strings.TrimSpace(req.BaseURL)
+	req.DisplayName = strings.TrimSpace(req.DisplayName)
+
+	if err := validateKeyFormat(req.Provider, req.APIKey); err != nil {
+		return nil, err
 	}
 
 	akSealed, err := s.seal(req.AccessKeyID)
@@ -202,6 +281,47 @@ func (s *Store) List() ([]Masked, error) {
 		m.AccessKeyID = mask(s.open(akSealed))
 		m.APIKeyMask = mask(s.open(apiSealed))
 		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ExportedCredential is one credential with DECRYPTED secrets, used only by
+// the tenant export/import flow (platform superadmin backup/migration).
+type ExportedCredential struct {
+	Provider        string `json:"provider"`
+	DisplayName     string `json:"display_name,omitempty"`
+	AccessKeyID     string `json:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	APIKey          string `json:"api_key,omitempty"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	BaseURL         string `json:"base_url,omitempty"`
+	Extra           string `json:"extra,omitempty"`
+}
+
+// ExportAll returns every credential with decrypted secrets. NEVER expose
+// this through an unauthenticated or non-superadmin route.
+func (s *Store) ExportAll() ([]ExportedCredential, error) {
+	rows, err := s.db.Query(
+		`SELECT provider, COALESCE(display_name,''), COALESCE(access_key_id,''), COALESCE(secret_access_key,''),
+		        COALESCE(api_key,''), COALESCE(endpoint,''), COALESCE(base_url,''), COALESCE(extra,'')
+		 FROM credentials ORDER BY provider`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ExportedCredential
+	for rows.Next() {
+		var e ExportedCredential
+		var akSealed, skSealed, apiSealed string
+		if err := rows.Scan(&e.Provider, &e.DisplayName, &akSealed, &skSealed, &apiSealed,
+			&e.Endpoint, &e.BaseURL, &e.Extra); err != nil {
+			return nil, err
+		}
+		e.AccessKeyID = s.open(akSealed)
+		e.SecretAccessKey = s.open(skSealed)
+		e.APIKey = s.open(apiSealed)
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }
