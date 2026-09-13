@@ -7,6 +7,8 @@ package auth
 
 import (
 	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -25,22 +27,59 @@ var (
 
 // User is a platform user row.
 type User struct {
-	ID           int64      `json:"id"`
-	Username     string     `json:"username"`
-	Name         string     `json:"name"`
-	Surname      string     `json:"surname"`
-	UserName     string     `json:"user_name"`
-	Email        string     `json:"email"`
-	PlatformRole int        `json:"platform_role"`
-	Active       bool       `json:"active"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
-	DeletedAt    *time.Time `json:"deleted_at,omitempty"`
-	PasswordHash string     `json:"-"`
+	ID           int64          `json:"id"`
+	Username     string         `json:"username"`
+	Name         string         `json:"name"`
+	Surname      string         `json:"surname"`
+	UserName     string         `json:"user_name"`
+	Email        string         `json:"email"`
+	PlatformRole int            `json:"platform_role"`
+	Active       bool           `json:"active"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	DeletedAt    *time.Time     `json:"deleted_at,omitempty"`
+	PasswordHash string         `json:"-"`
+	Preferences  Preferences  `json:"preferences,omitempty"`
+}
+
+// Preferences is a JSONB value type for user preferences.
+type Preferences map[string]any
+
+func (p Preferences) Value() (driver.Value, error) {
+	return json.Marshal(p)
+}
+
+func (p *Preferences) Scan(src any) error {
+	if src == nil {
+		*p = make(Preferences)
+		return nil
+	}
+	switch v := src.(type) {
+	case []byte:
+		if len(v) == 0 {
+			*p = make(Preferences)
+			return nil
+		}
+		return json.Unmarshal(v, p)
+	case string:
+		if len(v) == 0 {
+			*p = make(Preferences)
+			return nil
+		}
+		return json.Unmarshal([]byte(v), p)
+	default:
+		return fmt.Errorf("preferences: expected []byte or string, got %T", src)
+	}
+}
+
+// ThemePreferences represents the theme sub-object.
+type ThemePreferences struct {
+	Palette string `json:"palette"`
+	Mode    string `json:"mode"`
 }
 
 const userCols = `id, username, name, surname, COALESCE(user_name,'') AS user_name,
-	COALESCE(email,'') AS email, platform_role, active, created_at, updated_at, deleted_at`
+	COALESCE(email,'') AS email, platform_role, active, created_at, updated_at, deleted_at, COALESCE(preferences, '{}') AS preferences`
 
 // Store persists users and memberships in the system schema.
 type Store struct {
@@ -55,7 +94,7 @@ func (s *Store) CreateUser(username, passwordHash, name, surname, userName, emai
 		RETURNING ` + userCols
 	u := &User{Username: username, PasswordHash: passwordHash, Name: name, Surname: surname, UserName: userName, Email: email, PlatformRole: platformRole}
 	err := s.db.QueryRow(query, username, passwordHash, name, surname, userName, email, platformRole).
-		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
+		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.Preferences)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +105,7 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 	query := `SELECT ` + userCols + `, password_hash FROM users WHERE username = $1 AND active = true AND deleted_at IS NULL`
 	u := &User{}
 	err := s.db.QueryRow(query, username).
-		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.PasswordHash)
+		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.Preferences, &u.PasswordHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -80,7 +119,7 @@ func (s *Store) GetUserByID(id int64) (*User, error) {
 	query := `SELECT ` + userCols + ` FROM users WHERE id = $1 AND deleted_at IS NULL`
 	u := &User{}
 	err := s.db.QueryRow(query, id).
-		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt)
+		Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.Preferences)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -88,6 +127,28 @@ func (s *Store) GetUserByID(id int64) (*User, error) {
 		return nil, err
 	}
 	return u, nil
+}
+
+// ListTenantUsers returns the users who are members of a tenant (JOIN memberships).
+func (s *Store) ListTenantUsers(tenantID int64) ([]User, error) {
+	rows, err := s.db.Query(`SELECT u.id, u.username, u.name, u.surname, COALESCE(u.user_name,'') AS user_name,
+		COALESCE(u.email,'') AS email, u.platform_role, u.active, u.created_at, u.updated_at, u.deleted_at, COALESCE(u.preferences, '{}') AS preferences
+		FROM users u
+		JOIN tenant_memberships m ON m.user_id = u.id
+		WHERE m.tenant_id = $1 AND u.deleted_at IS NULL ORDER BY u.id`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.Preferences); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // ListUsers returns every active platform user.
@@ -100,7 +161,7 @@ func (s *Store) ListUsers() ([]User, error) {
 	var out []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Name, &u.Surname, &u.UserName, &u.Email, &u.PlatformRole, &u.Active, &u.CreatedAt, &u.UpdatedAt, &u.DeletedAt, &u.Preferences); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -126,6 +187,49 @@ func (s *Store) FirstTenantForUser(userID int64) (int64, string, error) {
 // UpdateUserActive toggles a user's active flag.
 func (s *Store) UpdateUserActive(id int64, active bool) error {
 	result, err := s.db.Exec(`UPDATE users SET active = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`, active, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("user not found")
+	}
+	return nil
+}
+
+// GetUserPreferences returns the user's preferences JSON.
+func (s *Store) GetUserPreferences(userID int64) (Preferences, error) {
+	var prefs Preferences
+	err := s.db.QueryRow(`SELECT COALESCE(preferences, '{}') FROM users WHERE id = $1 AND deleted_at IS NULL`, userID).Scan(&prefs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("user not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if prefs == nil {
+		prefs = make(Preferences)
+	}
+	return prefs, nil
+}
+
+// UpdateUserPreferences overwrites the user's preferences JSON.
+func (s *Store) UpdateUserPreferences(userID int64, prefs Preferences) error {
+	result, err := s.db.Exec(`UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`, prefs, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("user not found")
+	}
+	return nil
+}
+
+// UpdateThemePreferences updates only the theme sub-key in preferences.
+func (s *Store) UpdateThemePreferences(userID int64, theme ThemePreferences) error {
+	result, err := s.db.Exec(
+		`UPDATE users SET preferences = jsonb_set(COALESCE(preferences, '{}'), '{theme}', $1::jsonb, true),
+		updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`,
+		theme, userID)
 	if err != nil {
 		return err
 	}
@@ -278,6 +382,19 @@ func (s *Service) ListUsers() ([]UserResponse, error) {
 	return out, nil
 }
 
+// ListTenantUsers returns the users who are members of a tenant.
+func (s *Service) ListTenantUsers(tenantID int64) ([]UserResponse, error) {
+	users, err := s.store.ListTenantUsers(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UserResponse, 0, len(users))
+	for i := range users {
+		out = append(out, *toResponse(&users[i]))
+	}
+	return out, nil
+}
+
 // GetUserProfile returns a user by id.
 func (s *Service) GetUserProfile(id int64) (*UserResponse, error) {
 	u, err := s.store.GetUserByID(id)
@@ -288,6 +405,32 @@ func (s *Service) GetUserProfile(id int64) (*UserResponse, error) {
 		return nil, errors.New("user not found")
 	}
 	return toResponse(u), nil
+}
+
+// GetThemePreferences returns the user's theme preferences.
+func (s *Service) GetThemePreferences(userID int64) (ThemePreferences, error) {
+	prefs, err := s.store.GetUserPreferences(userID)
+	if err != nil {
+		return ThemePreferences{}, err
+	}
+	themeRaw, ok := prefs["theme"]
+	if !ok {
+		return ThemePreferences{Palette: "violet", Mode: "light"}, nil
+	}
+	themeBytes, err := json.Marshal(themeRaw)
+	if err != nil {
+		return ThemePreferences{}, err
+	}
+	var theme ThemePreferences
+	if err := json.Unmarshal(themeBytes, &theme); err != nil {
+		return ThemePreferences{}, err
+	}
+	return theme, nil
+}
+
+// UpdateThemePreferences saves the user's theme preferences.
+func (s *Service) UpdateThemePreferences(userID int64, theme ThemePreferences) error {
+	return s.store.UpdateThemePreferences(userID, theme)
 }
 
 func roleName(level int) string {
@@ -414,9 +557,61 @@ func (h *Handler) GetProfile(c *gin.Context) {
 	utils.Success(c, user)
 }
 
+// GetTheme handles GET /user/preferences/theme
+func (h *Handler) GetTheme(c *gin.Context) {
+	id := utils.UserIDFromContext(c)
+	if id <= 0 {
+		utils.Unauthorized(c, "invalid token")
+		return
+	}
+	theme, err := h.svc.GetThemePreferences(id)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, theme)
+}
+
+// UpdateTheme handles POST /user/preferences/theme
+func (h *Handler) UpdateTheme(c *gin.Context) {
+	id := utils.UserIDFromContext(c)
+	if id <= 0 {
+		utils.Unauthorized(c, "invalid token")
+		return
+	}
+	var req struct {
+		Theme ThemePreferences `json:"theme" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	if err := h.svc.UpdateThemePreferences(id, req.Theme); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, req.Theme)
+}
+
 // ListUsers handles GET /admin/users
 func (h *Handler) ListUsers(c *gin.Context) {
 	users, err := h.svc.ListUsers()
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, users)
+}
+
+// ListTenantUsers handles GET /admin/tenants/:id/users (platform admins).
+// Returns the users who belong to a tenant, for admin consoles.
+func (h *Handler) ListTenantUsers(c *gin.Context) {
+	var id int64
+	if _, err := fmt.Sscanf(c.Param("id"), "%d", &id); err != nil || id <= 0 {
+		utils.BadRequest(c, "invalid tenant id")
+		return
+	}
+	users, err := h.svc.ListTenantUsers(id)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
@@ -446,9 +641,17 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, adminMw gin.HandlerFun
 		priv.GET("/profile", m.hdl.GetProfile)
 	}
 
+	user := rg.Group("/user")
+	user.Use(authMw)
+	{
+		user.GET("/preferences/theme", m.hdl.GetTheme)
+		user.POST("/preferences/theme", m.hdl.UpdateTheme)
+	}
+
 	adm := rg.Group("/admin")
 	adm.Use(authMw, adminMw)
 	{
 		adm.GET("/users", m.hdl.ListUsers)
+		adm.GET("/tenants/:id/users", m.hdl.ListTenantUsers)
 	}
 }
