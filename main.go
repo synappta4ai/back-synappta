@@ -87,6 +87,21 @@ func main() {
 		log.Fatalf("[main] seed superadmin: %v", err)
 	}
 
+	// ─── Default tenant + superadmin membership ───────────────
+	// Guarantees at least one tenant exists so the superadmin can issue
+	// tenant-scoped requests (credentials, models, generation) out of the box.
+	superadmin, err := authStore.GetUserByUsername(cfg.SuperAdminUsername)
+	if err != nil {
+		log.Fatalf("[main] lookup superadmin: %v", err)
+	}
+	var superadminID int64
+	if superadmin != nil {
+		superadminID = superadmin.ID
+	}
+	if err := provisioner.EnsureDefaultTenant(cfg.DefaultTenantSlug, cfg.DefaultTenantName, superadminID); err != nil {
+		log.Fatalf("[main] default tenant: %v", err)
+	}
+
 	// ─── Per-tenant service graph ─────────────────────────────
 	manager := runtime.NewManager(cfg, reg)
 
@@ -125,7 +140,7 @@ func main() {
 	// ─── Modules ──────────────────────────────────────────────
 	registry := modules.NewRegistry()
 	registry.Register(auth.NewModule(auth.NewHandler(authSvc)))
-	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner))))
+	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner, reg, cfg.EncryptionKey))))
 	registry.Register(model.NewModule())
 
 	// Tenant-scoped modules resolve their handler per request.
@@ -169,6 +184,11 @@ func main() {
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"service": "synapta", "status": "ok"})
 	})
+
+	// ─── Generated outputs (own server URL) ───────────────────
+	// Locally stored generation outputs are served here; the front plays them
+	// from our domain instead of the expiring signed provider URLs.
+	router.Static(config.OutPutUrl(), cfg.OutputsDir)
 
 	// ─── Swagger UI (docs) ────────────────────────────────────
 	router.StaticFile("/openapi.json", "docs/openapi.json")

@@ -32,6 +32,11 @@ type Config struct {
 	EncryptionKey       string // 32-byte key for credential encryption at rest
 	OutputsDir          string
 
+	// Default tenant: created at startup if missing; the platform superadmin
+	// gets a membership in it so tenant-scoped requests work out of the box.
+	DefaultTenantSlug string
+	DefaultTenantName string
+
 	// Super admin seed (platform-level, lives in the system schema)
 	SuperAdminUsername string
 	SuperAdminPassword string
@@ -174,6 +179,9 @@ func Load() *Config {
 		JWTSecret:     jwtSecret,
 		EncryptionKey: encryptionKey,
 		OutputsDir:    outputsDir,
+
+		DefaultTenantSlug: getEnv("DEFAULT_TENANT_SLUG", "synapta"),
+		DefaultTenantName: getEnv("DEFAULT_TENANT_NAME", "Synapta"),
 
 		SuperAdminUsername: getEnv("SUPER_ADMIN_USERNAME", "superadmin"),
 		SuperAdminPassword: superAdminPassword,

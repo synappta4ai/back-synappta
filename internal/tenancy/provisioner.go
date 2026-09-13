@@ -3,8 +3,11 @@ package tenancy
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+
+	"synapta/internal/db"
 
 	"github.com/google/uuid"
 	"github.com/pressly/goose/v3"
@@ -68,19 +71,33 @@ func (p *Provisioner) ProvisionSchema(slug string) error {
 	}
 
 	// Open a short-lived connection pinned to the schema and run goose there.
+	// Using OpenWithSearchPath to set search_path via pgx AfterConnect hook
+	// because pgx ignores the options=-csearch_path parameter.
 	sysURL, err := p.reg.SystemDSN()
 	if err != nil {
 		return err
 	}
-	tenantURL := fmt.Sprintf("%s&options=-csearch_path%%3D%s,public", sysURL, schema)
-	pool, err := sql.Open("pgx", tenantURL)
+	pool, err := db.OpenWithSearchPath(sysURL, schema, db.PoolConfig{
+		MaxOpenConns: 1,
+		MaxIdleConns: 1,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to open migration connection for %s: %w", schema, err)
 	}
 	defer pool.Close()
 
-	if err := pool.Ping(); err != nil {
-		return fmt.Errorf("failed to ping migration connection for %s: %w", schema, err)
+	// Explicitly set search_path so goose migrations resolve unqualified
+	// table names (e.g. preset_groups) inside the tenant schema. The
+	// RuntimeParams set via OpenWithSearchPath are applied by pgx on new
+	// connections, but goose's internal connection handling may not inherit
+	// them reliably.
+	//
+	// NOTE: We intentionally omit "public" from the search path. The
+	// system migration creates goose_db_version in public; including
+	// public would let goose find that version=1 record and skip
+	// 00001_core.sql entirely for every tenant.
+	if _, err := pool.Exec(fmt.Sprintf("SET search_path TO %s", schema)); err != nil {
+		return fmt.Errorf("failed to set search_path for %s: %w", schema, err)
 	}
 
 	if err := goose.Up(pool, p.tenantMigrations); err != nil {
@@ -177,6 +194,35 @@ func seedTenantRoles(dbh *sql.DB) error {
 
 // ProvisionToken generates an idempotency token for provision API responses.
 func ProvisionToken() string { return uuid.New().String() }
+
+// EnsureDefaultTenant guarantees the default tenant (slug) exists with its
+// schema provisioned and grants the superadmin a membership in it. Safe to
+// call on every boot: it is fully idempotent.
+func (p *Provisioner) EnsureDefaultTenant(slug, name string, superadminID int64) error {
+	if !ValidSlug(slug) {
+		return fmt.Errorf("invalid default tenant slug %q", slug)
+	}
+
+	var id int64
+	err := p.reg.System().QueryRow(`SELECT id FROM tenants WHERE slug = $1`, slug).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		t, err := p.CreateTenant(name, slug)
+		if err != nil {
+			return fmt.Errorf("failed to create default tenant %q: %w", slug, err)
+		}
+		id = t.ID
+		log.Printf("[provisioner] default tenant %q created (id=%d)", slug, id)
+	} else if err != nil {
+		return err
+	}
+
+	if superadminID > 0 {
+		if err := p.EnsureMembership(id, superadminID, 0); err != nil {
+			return fmt.Errorf("failed to add superadmin to default tenant: %w", err)
+		}
+	}
+	return nil
+}
 
 // MigrateSystem runs the system (public schema) migrations. Exposed so main
 // only depends on the provisioner for all migration concerns.
