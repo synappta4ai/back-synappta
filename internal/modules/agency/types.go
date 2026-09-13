@@ -77,6 +77,9 @@ type StatusResponse struct {
 	Error    string           `json:"error,omitempty"`
 	Raw      interface{}      `json:"raw,omitempty"`
 	Progress interface{}      `json:"progress,omitempty"`
+	// Estimated progress percent (0-100) computed server-side while the task
+	// runs; 100 once it reaches a terminal state. Never decreases.
+	ProgressPercent int `json:"progress_percent"`
 }
 
 // StatusResult is the internal status shape.
@@ -95,6 +98,19 @@ type PreviewPayloadResponse struct {
 	Endpoint    string                 `json:"endpoint"`
 	Payload     map[string]interface{} `json:"payload"`
 	ContentType string                 `json:"content_type"`
+}
+
+// VideoMetadata carries the important provider-side facts about a generated
+// video, persisted into generation_logs and returned in the status response.
+type VideoMetadata struct {
+	UsageTokens           int64
+	UsageCompletionTokens int64
+	Duration              int
+	Resolution            string
+	Ratio                 string
+	Seed                  int64
+	FPS                   int
+	Progress              int
 }
 
 // ─── Generator pipeline types (shared across all domain generators) ─

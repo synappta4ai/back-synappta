@@ -9,9 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"synapta/config"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
+	"synapta/internal/utils"
 )
 
 // TaskRecord is the in-memory task tracking entry.
@@ -138,7 +141,10 @@ func (s *Core) resolveProvider(m *modelRef) (*credential.Resolve, error) {
 		return nil, fmt.Errorf("failed to resolve credentials for %s: %w", m.CredentialProvider, err)
 	}
 	if res == nil {
-		return nil, fmt.Errorf("no credentials configured for provider %q — add them under /credentials", m.CredentialProvider)
+		return nil, fmt.Errorf("no credentials configured for provider %q — add them in admin → tenants → gestionar", m.CredentialProvider)
+	}
+	if res.APIKey == "" {
+		return nil, fmt.Errorf("provider %q has no API key configured — generation needs an API key (AK/SK is only used for gallery sync); add it in admin → tenants → gestionar", m.CredentialProvider)
 	}
 	return res, nil
 }
@@ -164,6 +170,38 @@ func resolveRoute(m *modelRef, creds *credential.Resolve) (baseURL, endpoint str
 		endpoint = defaultEndpointFor(string(m.CredentialProvider))
 	}
 	return baseURL, endpoint
+}
+
+// AttachCaller stamps the authenticated user (from the JWT auth middleware)
+// onto a generation request. Modality handlers call this before GenerateUnified
+// so server_communications can record who triggered each external API call.
+func AttachCaller(req *GenerateRequest, c *gin.Context) {
+	req.UserID = int(utils.UserIDFromContext(c))
+	if u, ok := c.Get("username"); ok {
+		if s, ok := u.(string); ok && req.UserName == "" {
+			req.UserName = s
+		}
+	}
+}
+
+// attachAudit fills the audit fields of a ServerCommunication: who triggered
+// the call (user) and which credentials were used, ALWAYS masked.
+func (s *Core) attachAudit(comm *ServerCommunication, m *modelRef, creds *credential.Resolve, req *GenerateRequest) {
+	comm.UserID = int64(req.UserID)
+	comm.Username = req.UserName
+	comm.TenantSlug = s.slug
+	comm.CredentialProvider = string(m.CredentialProvider)
+	comm.APIKeyMask = credential.MaskPublic(creds.APIKey)
+	comm.AccessKeyMask = credential.MaskPublic(creds.AccessKeyID)
+	comm.SecretKeyMask = credential.MaskPublic(creds.SecretAccessKey)
+	switch {
+	case creds.APIKey != "":
+		comm.AuthType = "bearer"
+	case creds.AccessKeyID != "" && creds.SecretAccessKey != "":
+		comm.AuthType = "ak_sk"
+	default:
+		comm.AuthType = "none"
+	}
 }
 
 // GenerateUnified validates the request, dispatches to the right generator
@@ -322,16 +360,24 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		if err != nil {
 			errMsg = err.Error()
 		}
-		_ = s.commStore.Create(&ServerCommunication{
-			ModelName:    m.Name,
-			Endpoint:     genReq.BaseURL + genReq.Endpoint,
-			Method:       "POST",
-			RequestBody:  string(apiPayloadBytes),
-			ResponseBody: respBody,
-			StatusCode:   genStatus,
-			DurationMs:   genDur,
-			ErrorMessage: errMsg,
-		})
+		comm := &ServerCommunication{
+			TaskID:    taskID,
+			ModelName: m.Name,
+			Endpoint:  genReq.BaseURL + genReq.Endpoint,
+			Method:    "POST",
+			// Generation submit row: phase "generate", spans just the submit call.
+			Phase:           "generate",
+			StartedAt:       genStart,
+			FinishedAt:      time.Now(),
+			TotalDurationMs: genDur,
+			RequestBody:     string(apiPayloadBytes),
+			ResponseBody:    respBody,
+			StatusCode:      genStatus,
+			DurationMs:      genDur,
+			ErrorMessage:    errMsg,
+		}
+		s.attachAudit(comm, m, creds, req)
+		_ = s.commStore.Create(comm)
 	}
 	log.Printf("[generate-unified] model=%q dur=%dms err=%v", m.Name, genDur, err != nil)
 
@@ -340,6 +386,11 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		status = result.Status
 		if len(result.Outputs) > 0 {
 			outputs = result.Outputs
+		}
+		// Backfill the submit trace with the task ID so the generate (POST)
+		// and poll (GET) rows of the same task group into one record.
+		if s.commStore != nil && taskID != "" {
+			_ = s.commStore.AttachTaskIDByPhase("generate", taskID, m.Name)
 		}
 	}
 	if err != nil {
@@ -368,17 +419,19 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	terminal := result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED
 	s.mu.Lock()
 	s.tasks[result.TaskID] = &TaskRecord{
-		TaskID:       result.TaskID,
-		ModelID:      string(m.CredentialProvider),
-		ModelName:    m.Name,
-		Status:       result.Status,
-		EventName:    req.EventName,
-		PieceCode:    req.PieceCode,
-		GenerationN:  req.GenerationNumber,
-		UserHandle:   userName,
-		UserID:       req.UserID,
-		PushNotified: terminal,
-		ResourceType: req.ResourceType,
+		TaskID: result.TaskID,
+		// Anchor for submit→result durations and progress estimation.
+		CreatedAt:       time.Now(),
+		ModelID:         string(m.CredentialProvider),
+		ModelName:       m.Name,
+		Status:          result.Status,
+		EventName:       req.EventName,
+		PieceCode:       req.PieceCode,
+		GenerationN:     req.GenerationNumber,
+		UserHandle:      userName,
+		UserID:          req.UserID,
+		PushNotified:    terminal,
+		ResourceType:    req.ResourceType,
 		Result: &StatusResult{
 			Status: result.Status,
 			Raw:    result.Raw,
@@ -431,6 +484,19 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		return resp, nil
 	}
 
+	// Terminal tasks are answered from the stored result: no provider re-poll,
+	// no duplicate local download, no extra server_communications rows.
+	// Success requires stored outputs; terminal-at-submit records (sync
+	// generators) keep falling through to the provider until outputs exist.
+	if record.Result != nil {
+		terminal := record.Status == config.STATUS_FAILED || record.Status == config.STATUS_CANCELLED
+		completedWithOutputs := record.Status == config.STATUS_SUCCESS &&
+			(record.Result.VideoURL != "" || record.Result.LocalURL != "" || record.Result.ImageURL != "")
+		if terminal || completedWithOutputs {
+			return record.Result, nil
+		}
+	}
+
 	m := LookupModel(record.ModelName)
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
@@ -446,10 +512,16 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 
 	baseURL, endpoint := resolveRoute(m, creds)
 
+	pollStart := time.Now()
 	result, err := gen.GetStatus(taskID, creds.APIKey, baseURL, endpoint)
+	pollDur := time.Since(pollStart).Milliseconds()
 
-	// Log server communication
-	if s.commStore != nil {
+	// Log server communication — ONLY for meaningful polls: terminal states
+	// (video ready / failed) or transport errors. Intermediate "running"
+	// responses are not stored, so the log stays focused on one row per task
+	// event instead of one row per polling tick.
+	if s.commStore != nil && (err != nil || result == nil ||
+		result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED || result.Status == config.STATUS_CANCELLED) {
 		reqBytes, _ := json.Marshal(map[string]string{"task_id": taskID})
 		respBody := ""
 		genStatus := 200
@@ -464,16 +536,27 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		if err != nil {
 			errMsg = err.Error()
 		}
-		_ = s.commStore.Create(&ServerCommunication{
-			TaskID:       taskID,
-			ModelName:    m.Name,
-			Endpoint:     baseURL + endpoint,
-			Method:       "GET",
-			RequestBody:  string(reqBytes),
-			ResponseBody: respBody,
-			StatusCode:   genStatus,
-			ErrorMessage: errMsg,
-		})
+		comm := &ServerCommunication{
+			TaskID:    taskID,
+			ModelName: m.Name,
+			Endpoint:  baseURL + endpoint,
+			Method:    "GET",
+			// Poll row: phase "poll", anchored to the task's submit time so
+			// the store can compute total_duration_ms = submit → final poll.
+			Phase:           "poll",
+			StartedAt:       record.CreatedAt,
+			DurationMs:      pollDur,
+			RequestBody:     string(reqBytes),
+			ResponseBody:    respBody,
+			StatusCode:      genStatus,
+			ErrorMessage:    errMsg,
+		}
+		if err == nil && result != nil && isTerminalStatus(result.Status) {
+			comm.FinishedAt = time.Now()
+			comm.TotalDurationMs = time.Since(record.CreatedAt).Milliseconds()
+		}
+		s.attachAudit(comm, m, creds, &GenerateRequest{UserID: record.UserID, UserName: record.UserHandle})
+		_ = s.commStore.Create(comm)
 	}
 
 	if err != nil {
@@ -491,7 +574,21 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		statusResult.ImageURL = result.Outputs[0].URL
 	}
 
+	// Sample metadata + progress estimate on every poll (monotonic writes).
+	createdAt := record.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	s.trackVideoMetadata(taskID, createdAt, record.ResourceType, record.ModelName, result)
+
 	if result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED {
+		// Persist the video under the server's own outputs and serve it from
+		// our domain instead of the expiring signed provider URL.
+		s.ensureLocalVideo(taskID, result)
+		if len(result.Outputs) > 0 {
+			statusResult.VideoURL = result.Outputs[0].URL
+			statusResult.LocalURL = result.Outputs[0].LocalURL
+		}
 		s.mu.Lock()
 		notify := !record.PushNotified
 		record.PushNotified = true
@@ -532,6 +629,39 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		Outputs: []OutputResource{},
 	}
 
+	// Prefer the server-owned copy of the video over the expiring signed
+	// provider URL so playback survives provider URL expiry.
+	localURL := sr.LocalURL
+	providerURL := sr.VideoURL
+	if localURL == "" {
+		localURL = providerURL
+	}
+	if localURL != "" {
+		resp.Outputs = append(resp.Outputs, OutputResource{
+			URL:      s.absoluteOutputURL(localURL),
+			LocalURL: localURL,
+			Type:     "video",
+		})
+	}
+	if sr.ImageURL != "" && sr.ImageURL != sr.VideoURL && sr.ImageURL != localURL {
+		resp.Outputs = append(resp.Outputs, OutputResource{URL: sr.ImageURL, Type: "image"})
+	}
+
+	// Progress: provider field when present, otherwise our persisted estimate.
+	resp.ProgressPercent = providerProgressPct(sr.Raw)
+	if resp.ProgressPercent == 0 && s.logStore != nil {
+		if p, err := s.logStore.GetProgressByTaskID(taskID); err == nil {
+			resp.ProgressPercent = p
+		}
+	}
+	switch sr.Status {
+	case config.STATUS_SUCCESS:
+		resp.ProgressPercent = 100
+	case config.STATUS_FAILED, config.STATUS_CANCELLED:
+		if resp.ProgressPercent == 0 {
+			resp.ProgressPercent = 0
+		}
+	}
 	if rawMap, ok := sr.Raw.(map[string]interface{}); ok {
 		for _, key := range []string{"progress", "percentage", "task_progress"} {
 			if v, exists := rawMap[key]; exists {
@@ -539,12 +669,6 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 				break
 			}
 		}
-	}
-	if sr.VideoURL != "" {
-		resp.Outputs = append(resp.Outputs, OutputResource{URL: sr.VideoURL, LocalURL: sr.LocalURL, Type: "video"})
-	}
-	if sr.ImageURL != "" && sr.ImageURL != sr.VideoURL {
-		resp.Outputs = append(resp.Outputs, OutputResource{URL: sr.ImageURL, Type: "image"})
 	}
 	return resp, nil
 }
@@ -627,6 +751,15 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 
 // ─── Internal helpers ───────────────────────────────────────────
 
+// isTerminalStatus reports whether a generation status ends the task.
+func isTerminalStatus(status string) bool {
+	switch status {
+	case config.STATUS_SUCCESS, config.STATUS_FAILED, config.STATUS_CANCELLED:
+		return true
+	}
+	return false
+}
+
 // statusFromLog recovers a task's status from the log after a restart.
 func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 	if logEntry.Status == config.STATUS_SUCCESS || logEntry.Status == config.STATUS_FAILED {
@@ -672,7 +805,15 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		statusResult.ImageURL = result.Outputs[0].URL
 	}
 
+	// Sample metadata + progress estimate on every poll (monotonic writes).
+	s.trackVideoMetadata(logEntry.TaskID, logEntry.CreatedAt, logEntry.ResourceType, logEntry.ModelName, result)
+
 	if result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED {
+		s.ensureLocalVideo(logEntry.TaskID, result)
+		if len(result.Outputs) > 0 {
+			statusResult.VideoURL = result.Outputs[0].URL
+			statusResult.LocalURL = result.Outputs[0].LocalURL
+		}
 		s.updateLogWithFinalStatus(logEntry.TaskID, result)
 		if result.Status == config.STATUS_SUCCESS {
 			s.saveGeneratedAssets(logEntry.TaskID, result)
@@ -701,7 +842,15 @@ func (s *Core) updateLogWithFinalStatus(taskID string, result *GeneratorResult) 
 	if logErr != nil || logEntry == nil {
 		return
 	}
-	if saveErr := s.logStore.UpdateByTaskID(taskID, result.Outputs, result.Status, result.Error); saveErr != nil {
+	// Persist outputs pointing at the server-owned copy when available.
+	outputs := make([]OutputResource, len(result.Outputs))
+	copy(outputs, result.Outputs)
+	for i := range outputs {
+		if outputs[i].LocalURL != "" {
+			outputs[i].URL = s.absoluteOutputURL(outputs[i].LocalURL)
+		}
+	}
+	if saveErr := s.logStore.UpdateByTaskID(taskID, outputs, result.Status, result.Error); saveErr != nil {
 		fmt.Printf("failed to update generation log for task %s: %v\n", taskID, saveErr)
 	}
 }
@@ -756,7 +905,7 @@ func (s *Core) saveToGeneration(taskID, videoURL, localURL string) {
 		fmt.Printf("failed to save generation output for task %s: %v\n", taskID, err)
 		return
 	}
-	outputs := []OutputResource{{URL: videoURL, LocalURL: localURL, Type: "video"}}
+	outputs := []OutputResource{{URL: s.absoluteOutputURL(localURL), LocalURL: localURL, Type: "video"}}
 	if err := s.logStore.UpdateByTaskID(taskID, outputs, logEntry.Status, logEntry.ErrorMessage); err != nil {
 		fmt.Printf("failed to update generation log outputs for task %s: %v\n", taskID, err)
 	}
@@ -1125,4 +1274,29 @@ func (s *Core) ListAssets(pieceID string) ([]GeneratedAsset, error) {
 		assets = []GeneratedAsset{}
 	}
 	return assets, err
+}
+
+// ListGeneratedVideos returns completed generations that produced outputs
+// (videos today), enriched with project/piece/user context for the admin
+// gallery. Logs stay task-focused: one entry per task.
+func (s *Core) ListGeneratedVideos(page, limit int) (*ListLogsResponse, error) {
+	if s.logStore == nil {
+		return nil, fmt.Errorf("log store not available")
+	}
+	filter := ListLogsFilter{
+		Page:         page,
+		Limit:        limit,
+		Status:       config.STATUS_SUCCESS,
+		ResourceType: config.ModalityVideo,
+		HasOutputs:   true,
+	}
+	logs, total, err := s.logStore.ListByFilter(filter)
+	if err != nil {
+		return nil, err
+	}
+	totalPages := (total + filter.Limit - 1) / filter.Limit
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	return &ListLogsResponse{Logs: logs, Total: total, Page: filter.Page, Limit: filter.Limit, TotalPages: totalPages}, nil
 }

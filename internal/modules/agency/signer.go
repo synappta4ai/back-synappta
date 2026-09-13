@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"synapta/internal/modules/credential"
 )
 
 // ─── BytePlus AK/SK signing (asset library API) ─────────────────
@@ -269,14 +271,18 @@ func (a *AssetAPI) logComm(action, endpoint string, reqBody interface{}, resp ma
 		statusCode = 0
 	}
 	_ = a.commStore.Create(&ServerCommunication{
-		ID:           uuid.New().String(),
-		ModelName:    AssetsService,
-		Endpoint:     endpoint,
-		Method:       "POST",
-		RequestBody:  string(reqBytes),
-		ResponseBody: string(respBytes),
-		StatusCode:   statusCode,
-		ErrorMessage: errMsg,
+		ID:                 uuid.New().String(),
+		ModelName:          AssetsService,
+		Endpoint:           endpoint,
+		Method:             "POST",
+		RequestBody:        string(reqBytes),
+		ResponseBody:       string(respBytes),
+		StatusCode:         statusCode,
+		ErrorMessage:       errMsg,
+		CredentialProvider: "byteplus",
+		AccessKeyMask:      credential.MaskPublic(a.AccessKeyID),
+		SecretKeyMask:      credential.MaskPublic(a.SecretAccessKey),
+		AuthType:           "ak_sk",
 	})
 	log.Printf("[asset-api] %s status=%d err=%q", action, statusCode, errMsg)
 }

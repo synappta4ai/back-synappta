@@ -47,8 +47,12 @@ func findVideoURL(result map[string]interface{}, depth int) string {
 	if result == nil || depth > 4 {
 		return ""
 	}
-	if u, ok := result["url"].(string); ok && videoURLPattern.MatchString(u) {
-		return u
+	// Direct keys: "url" (generic) or "video_url" / "videoUrl" — BytePlus Ark
+	// nests the download under content.video_url even at the top level.
+	for _, key := range []string{"url", "video_url", "videoUrl"} {
+		if u, ok := result[key].(string); ok && videoURLPattern.MatchString(u) {
+			return u
+		}
 	}
 	for _, v := range result {
 		switch val := v.(type) {
@@ -90,6 +94,7 @@ func (s *Service) Generate(c *gin.Context) {
 		return
 	}
 	req.ResourceType = "video"
+	agency.AttachCaller(&req, c)
 
 	core, ok := s.resolve(c)
 	if !ok {

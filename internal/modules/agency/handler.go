@@ -158,6 +158,22 @@ func (h *Handler) ListGeneratedAssets(c *gin.Context) {
 		return
 	}
 	utils.Success(c, assets)
+}
+
+// ListGeneratedVideos handles GET /agency/videos — completed video
+// generations with project/piece/user context, for the admin gallery.
+func (h *Handler) ListGeneratedVideos(c *gin.Context) {
+	page := atoiDefault(c.Query("page"), 1)
+	limit := atoiDefault(c.Query("limit"), 20)
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	result, err := h.core.ListGeneratedVideos(page, limit)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, result)
 } // ─── Module ─────────────────────────────────────────────────────
 
 // CoreResolver supplies the tenant-scoped core for each request.
@@ -193,15 +209,23 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		g.POST("/sync-asset", m.priv("SyncAsset"))
 		g.GET("/synced-assets", m.priv("ListSyncedAssets"))
 
-		// Logs
-		g.GET("/logs/generation/cost-summary", m.priv("GetGenerationLogsCostSummary"))
-		g.GET("/logs/generation", m.priv("ListGenerationLogs"))
-		g.GET("/logs/generation/:id", m.priv("GetGenerationLog"))
-		g.GET("/logs/server-communications", m.priv("ListServerCommunications"))
-		g.GET("/logs/server-communications/:id", m.priv("GetServerCommunication"))
+		// Logs — admin-only (tenant admins manage their own resources;
+		// platform superadmin reaches them via tenant selection or X-Tenant-Slug).
+		logs := g.Group("/logs")
+		logs.Use(adminMw)
+		{
+			logs.GET("/generation/cost-summary", m.priv("GetGenerationLogsCostSummary"))
+			logs.GET("/generation", m.priv("ListGenerationLogs"))
+			logs.GET("/generation/:id", m.priv("GetGenerationLog"))
+			logs.GET("/server-communications", m.priv("ListServerCommunications"))
+			logs.GET("/server-communications/:id", m.priv("GetServerCommunication"))
+		}
 
-		// Generated assets
-		g.GET("/assets", m.priv("ListGeneratedAssets"))
+		// Generated assets + videos gallery (admin-only)
+		gallery := g.Group("")
+		gallery.Use(adminMw)
+		gallery.GET("/assets", m.priv("ListGeneratedAssets"))
+		gallery.GET("/videos", m.priv("ListGeneratedVideos"))
 
 		// Modality routes (video/image/audio/text).
 		for name, fn := range m.modalities {
@@ -236,6 +260,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.GetServerCommunication(c)
 		case "ListGeneratedAssets":
 			hdl.ListGeneratedAssets(c)
+		case "ListGeneratedVideos":
+			hdl.ListGeneratedVideos(c)
 		default:
 			utils.InternalError(c, "unknown handler method: "+method)
 		}

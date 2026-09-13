@@ -39,6 +39,17 @@ type GenerationLog struct {
 	EstimatedCost float64 `json:"estimated_cost"`
 	// Fuente del costo: "api_response", "calculator", "pending".
 	CostSource string `json:"cost_source"`
+	// Provider usage tokens (video/text generation accounting).
+	UsageTokens          int64 `json:"usage_tokens"`
+	UsageCompletionTokens int64 `json:"usage_completion_tokens"`
+	// Video metadata from the provider response.
+	VideoDuration    int    `json:"video_duration"`
+	VideoResolution  string `json:"video_resolution"`
+	VideoRatio       string `json:"video_ratio"`
+	VideoSeed        int64  `json:"video_seed"`
+	VideoFPS         int    `json:"video_fps"`
+	// Estimated progress percent 0-100 (100 on terminal states).
+	Progress int `json:"progress"`
 	// Enriched fields (LEFT JOIN, not stored in generation_logs)
 	EventName       string `json:"event_name"`
 	UserDisplayName string `json:"user_display_name"`
@@ -58,6 +69,8 @@ type ListLogsFilter struct {
 	DateFrom     string `form:"date_from"`
 	DateTo       string `form:"date_to"`
 	ResourceType string `form:"resource_type"`
+	// HasOutputs filters to generations with at least one stored output.
+	HasOutputs bool `form:"-"`
 }
 
 // ListLogsResponse holds the paginated response for listing logs.
@@ -98,6 +111,10 @@ const genLogListCols = `gl.id, gl.task_id, gl.model_name,
 		COALESCE(gl.outputs, '') AS outputs,
 		gl.resource_type, gl.content_types,
 		gl.estimated_cost, gl.cost_source,
+		gl.usage_tokens, gl.usage_completion_tokens,
+		gl.video_duration, COALESCE(gl.video_resolution, '') AS video_resolution,
+		COALESCE(gl.video_ratio, '') AS video_ratio,
+		gl.video_seed, gl.video_fps, gl.progress,
 		gl.created_at, gl.updated_at`
 
 const genLogFullCols = `gl.id, gl.task_id, gl.model_name,
@@ -113,6 +130,10 @@ const genLogFullCols = `gl.id, gl.task_id, gl.model_name,
 		COALESCE(gl.generation_number, 0) AS generation_number,
 		gl.resource_type, gl.content_types,
 		gl.estimated_cost, gl.cost_source,
+		gl.usage_tokens, gl.usage_completion_tokens,
+		gl.video_duration, COALESCE(gl.video_resolution, '') AS video_resolution,
+		COALESCE(gl.video_ratio, '') AS video_ratio,
+		gl.video_seed, gl.video_fps, gl.progress,
 		gl.created_at, gl.updated_at, gl.deleted_at`
 
 const genLogJoinCols = `COALESCE(ev.name, '') AS event_name,
@@ -120,9 +141,9 @@ const genLogJoinCols = `COALESCE(ev.name, '') AS event_name,
 		COALESCE(pc.name, '') AS piece_name`
 
 const genLogFromJoins = `FROM generation_logs gl
-		LEFT JOIN events ev ON ev.id::text = gl.event_id
-		LEFT JOIN pieces pc ON pc.id::text = gl.piece_id
-		LEFT JOIN tenant_system.users u ON u.id = gl.user_id`
+		LEFT JOIN events ev ON ev.id = gl.event_id
+		LEFT JOIN pieces pc ON pc.id = gl.piece_id
+		LEFT JOIN users u ON u.id = gl.user_id`
 
 // scanListRow scans a list query row (without request payload).
 func (s *GenerationLogStore) scanListRow(row *GenerationLog, scanner interface {
@@ -137,6 +158,9 @@ func (s *GenerationLogStore) scanListRow(row *GenerationLog, scanner interface {
 		&outputsStr,
 		&row.ResourceType, &row.ContentTypes,
 		&row.EstimatedCost, &row.CostSource,
+		&row.UsageTokens, &row.UsageCompletionTokens,
+		&row.VideoDuration, &row.VideoResolution, &row.VideoRatio,
+		&row.VideoSeed, &row.VideoFPS, &row.Progress,
 		&row.CreatedAt, &row.UpdatedAt,
 		&row.EventName, &row.UserDisplayName, &row.PieceName,
 	)
@@ -162,6 +186,9 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 		&row.GenerationNumber,
 		&row.ResourceType, &row.ContentTypes,
 		&row.EstimatedCost, &row.CostSource,
+		&row.UsageTokens, &row.UsageCompletionTokens,
+		&row.VideoDuration, &row.VideoResolution, &row.VideoRatio,
+		&row.VideoSeed, &row.VideoFPS, &row.Progress,
 		&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
 		&row.EventName, &row.UserDisplayName, &row.PieceName,
 	)
@@ -244,6 +271,42 @@ func (s *GenerationLogStore) UpdateByTaskID(taskID string, outputs []OutputResou
 		return fmt.Errorf("generation log not found for task: %s", taskID)
 	}
 	return nil
+}
+
+// UpdateMetadataByTaskID persists video generation metadata + progress sampled
+// from the provider response. Only non-zero values overwrite existing ones so
+// partial responses never erase previously stored data.
+func (s *GenerationLogStore) UpdateMetadataByTaskID(taskID string, md VideoMetadata) error {
+	query := `UPDATE generation_logs SET
+		usage_tokens = GREATEST(usage_tokens, $1),
+		usage_completion_tokens = GREATEST(usage_completion_tokens, $2),
+		video_duration = CASE WHEN $3 > 0 THEN $3 ELSE video_duration END,
+		video_resolution = CASE WHEN $4 <> '' THEN $4 ELSE video_resolution END,
+		video_ratio = CASE WHEN $5 <> '' THEN $5 ELSE video_ratio END,
+		video_seed = CASE WHEN $6 > 0 THEN $6 ELSE video_seed END,
+		video_fps = CASE WHEN $7 > 0 THEN $7 ELSE video_fps END,
+		progress = GREATEST(progress, $8),
+		updated_at = NOW()
+		WHERE task_id = $9 AND deleted_at IS NULL`
+	_, err := s.db.Exec(query,
+		md.UsageTokens, md.UsageCompletionTokens,
+		md.Duration, md.Resolution, md.Ratio, md.Seed, md.FPS,
+		md.Progress, taskID,
+	)
+	return err
+}
+
+// GetProgressByTaskID returns the stored progress percent for a task.
+func (s *GenerationLogStore) GetProgressByTaskID(taskID string) (int, error) {
+	var progress int
+	err := s.db.QueryRow(
+		`SELECT progress FROM generation_logs WHERE task_id = $1 AND deleted_at IS NULL`,
+		taskID,
+	).Scan(&progress)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return progress, err
 }
 
 // List returns paginated generation logs, newest first (light columns).
@@ -367,6 +430,11 @@ func buildLogWhere(f ListLogsFilter) (string, []interface{}) {
 	if f.ResourceType != "" {
 		add("gl.resource_type", f.ResourceType, false)
 	}
+	// Only generations that actually produced an output (used by the videos
+	// gallery; empty outputs have nothing to show).
+	if f.HasOutputs {
+		where += " AND gl.outputs IS NOT NULL AND gl.outputs <> '' AND gl.outputs <> '[]'"
+	}
 	return where, args
 }
 
@@ -405,18 +473,37 @@ func itoa(n int) string {
 // ─── Server communications ─────────────────────────────────────
 
 // ServerCommunication stores a trace of every request sent to an external AI API.
+// Credential fields are ALWAYS stored masked (see credential.MaskPublic) — never raw secrets.
 type ServerCommunication struct {
-	ID           string    `json:"id"`
-	TaskID       string    `json:"task_id"`
-	ModelName    string    `json:"model_name"`
-	Endpoint     string    `json:"endpoint"`
-	Method       string    `json:"method"`
-	RequestBody  string    `json:"request_body,omitempty"`
-	ResponseBody string    `json:"response_body,omitempty"`
-	StatusCode   int       `json:"status_code"`
-	DurationMs   int64     `json:"duration_ms"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                 string    `json:"id"`
+	TaskID             string    `json:"task_id"`
+	ModelName          string    `json:"model_name"`
+	Endpoint           string    `json:"endpoint"`
+	Method             string    `json:"method"`
+	// phase separates the generation submit ("generate") from status polls
+	// ("poll") so both traces of one task group into a single logical record.
+	Phase              string    `json:"phase,omitempty"`
+	// Polling aggregates: how many polls happened and the submit→finish span.
+	PollCount          int       `json:"poll_count"`
+	StartedAt          time.Time `json:"started_at,omitempty"`
+	FinishedAt         time.Time `json:"finished_at,omitempty"`
+	TotalDurationMs    int64     `json:"total_duration_ms"`
+	RequestBody        string    `json:"request_body,omitempty"`
+	ResponseBody       string    `json:"response_body,omitempty"`
+	StatusCode         int       `json:"status_code"`
+	DurationMs         int64     `json:"duration_ms"`
+	ErrorMessage       string    `json:"error_message,omitempty"`
+	// Audit: who triggered the call.
+	UserID             int64     `json:"user_id"`
+	Username           string    `json:"username"`
+	TenantSlug         string    `json:"tenant_slug"`
+	// Audit: which credentials were used (masked).
+	CredentialProvider string    `json:"credential_provider"`
+	APIKeyMask         string    `json:"api_key_mask"`
+	AccessKeyMask      string    `json:"access_key_mask"`
+	SecretKeyMask      string    `json:"secret_key_mask"`
+	AuthType           string    `json:"auth_type"` // bearer | ak_sk | none
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // ServerCommunicationStore persists external API traces.
@@ -430,25 +517,121 @@ func NewServerCommunicationStore(db *sql.DB) *ServerCommunicationStore {
 }
 
 const serverCommCols = `id, task_id, model_name, endpoint, method,
+	COALESCE(phase, '') AS phase,
+	COALESCE(poll_count, 0) AS poll_count,
+	COALESCE(started_at, '0001-01-01T00:00:00Z') AS started_at,
+	COALESCE(finished_at, '0001-01-01T00:00:00Z') AS finished_at,
+	COALESCE(total_duration_ms, 0) AS total_duration_ms,
 	COALESCE(request_body, '') AS request_body,
 	COALESCE(response_body, '') AS response_body,
 	status_code, duration_ms,
 	COALESCE(error_message, '') AS error_message,
+	COALESCE(user_id, 0) AS user_id,
+	COALESCE(username, '') AS username,
+	COALESCE(tenant_slug, '') AS tenant_slug,
+	COALESCE(credential_provider, '') AS credential_provider,
+	COALESCE(api_key_mask, '') AS api_key_mask,
+	COALESCE(access_key_mask, '') AS access_key_mask,
+	COALESCE(secret_key_mask, '') AS secret_key_mask,
+	COALESCE(auth_type, '') AS auth_type,
 	created_at`
 
 // Create inserts a server communication trace.
+//
+// Polling traces (phase "poll") are task-focused: when a poll trace for the
+// same task already exists, it is UPDATED in place — the response body and
+// status refresh to the latest terminal poll, poll_count accumulates, and
+// total_duration_ms is recomputed as submit→finish so the log shows one row
+// per task event instead of one row per polling tick.
 func (s *ServerCommunicationStore) Create(log *ServerCommunication) error {
 	if log.ID == "" {
 		log.ID = uuid.New().String()
 	}
+	if log.Phase == "poll" && log.TaskID != "" {
+		// Task-focused upsert: keep a single poll trace per task, refreshed on
+		// every terminal poll (newest response_body / status wins). poll_count
+		// accumulates; total_duration_ms = finished_at - started_at spans the
+		// whole generation so progress can be estimated while polling.
+		query := `UPDATE server_communications SET
+			response_body = $1,
+			status_code = $2,
+			error_message = $3,
+			poll_count = COALESCE(poll_count, 0) + 1,
+			started_at = COALESCE(started_at, $6::timestamptz),
+			finished_at = CASE WHEN $5::timestamptz IS NOT NULL THEN NOW() ELSE finished_at END,
+			total_duration_ms = CASE
+				WHEN $5::timestamptz IS NOT NULL AND started_at IS NOT NULL
+					AND started_at > '0001-01-01'::timestamptz AND started_at < NOW()
+				THEN LEAST(
+					(EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000)::BIGINT,
+					999999999
+				)
+				ELSE total_duration_ms END,
+			created_at = NOW()
+			WHERE task_id = $4 AND phase = 'poll'
+			RETURNING id, COALESCE(started_at, '0001-01-01T00:00:00Z'),
+				COALESCE(finished_at, '0001-01-01T00:00:00Z'), poll_count, total_duration_ms`
+		var existingID string
+		err := s.db.QueryRow(query,
+			nullIfEmptyStr(log.ResponseBody), log.StatusCode, nullIfEmptyStr(log.ErrorMessage), log.TaskID, nullTimePtr(log.FinishedAt), nullTimePtr(log.StartedAt),
+		).Scan(&existingID, &log.StartedAt, &log.FinishedAt, &log.PollCount, &log.TotalDurationMs)
+		if err == nil {
+			log.ID = existingID
+			log.CreatedAt = log.FinishedAt
+			return nil
+		}
+		// No existing poll trace for this task — fall through to insert.
+	}
 	query := `INSERT INTO server_communications
-		(id, task_id, model_name, endpoint, method, request_body, response_body, status_code, duration_ms, error_message, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+		(id, task_id, model_name, endpoint, method, phase, poll_count, started_at, finished_at, total_duration_ms,
+		 request_body, response_body, status_code, duration_ms, error_message,
+		 user_id, username, tenant_slug, credential_provider, api_key_mask, access_key_mask, secret_key_mask, auth_type, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7,
+			CASE WHEN $8::timestamptz IS NULL THEN NOW() ELSE $8::timestamptz END,
+			CASE WHEN $9::timestamptz IS NULL THEN NOW() ELSE $9::timestamptz END,
+			$10,
+			$11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20, $21, $22, $23, NOW())
 		RETURNING created_at`
 	return s.db.QueryRow(query, log.ID, log.TaskID, log.ModelName, log.Endpoint, log.Method,
+		nullIfEmptyStr(log.Phase), log.PollCount,
+		nullTimePtr(log.StartedAt), nullTimePtr(log.FinishedAt), log.TotalDurationMs,
 		nullIfEmptyStr(log.RequestBody), nullIfEmptyStr(log.ResponseBody),
-		log.StatusCode, log.DurationMs, nullIfEmptyStr(log.ErrorMessage)).
+		log.StatusCode, log.DurationMs, nullIfEmptyStr(log.ErrorMessage),
+		log.UserID, log.Username, log.TenantSlug, log.CredentialProvider,
+		log.APIKeyMask, log.AccessKeyMask, log.SecretKeyMask, log.AuthType).
 		Scan(&log.CreatedAt)
+}
+
+// nullTimePtr returns nil for the zero time so the insert stores NULL and
+// defaults to NOW() instead of year 1.
+func nullTimePtr(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// AttachTaskIDByPhase stamps the task ID onto the most recent row of the
+// given phase for a model. Used to backfill the generation submit trace once
+// the provider returns the task ID, so generate and poll rows share it.
+func (s *ServerCommunicationStore) AttachTaskIDByPhase(phase, taskID, modelName string) error {
+	query := `UPDATE server_communications
+		SET task_id = $1
+		WHERE id = (
+			SELECT id FROM server_communications
+			WHERE phase = $2 AND task_id = '' AND model_name = $3
+			ORDER BY created_at DESC
+			LIMIT 1
+		)`
+	result, err := s.db.Exec(query, taskID, phase, modelName)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return fmt.Errorf("no %s trace to attach task %s", phase, taskID)
+	}
+	return nil
 }
 
 // GetByID returns one trace, or nil.
@@ -456,8 +639,12 @@ func (s *ServerCommunicationStore) GetByID(id string) (*ServerCommunication, err
 	log := &ServerCommunication{}
 	err := s.db.QueryRow(`SELECT `+serverCommCols+` FROM server_communications WHERE id = $1`, id).Scan(
 		&log.ID, &log.TaskID, &log.ModelName, &log.Endpoint, &log.Method,
+		&log.Phase, &log.PollCount, &log.StartedAt, &log.FinishedAt, &log.TotalDurationMs,
 		&log.RequestBody, &log.ResponseBody,
-		&log.StatusCode, &log.DurationMs, &log.ErrorMessage, &log.CreatedAt)
+		&log.StatusCode, &log.DurationMs, &log.ErrorMessage,
+		&log.UserID, &log.Username, &log.TenantSlug, &log.CredentialProvider,
+		&log.APIKeyMask, &log.AccessKeyMask, &log.SecretKeyMask, &log.AuthType,
+		&log.CreatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -531,8 +718,12 @@ func (s *ServerCommunicationStore) List(filter ServerCommFilter) (*ServerCommLis
 	for rows.Next() {
 		var l ServerCommunication
 		if err := rows.Scan(&l.ID, &l.TaskID, &l.ModelName, &l.Endpoint, &l.Method,
+			&l.Phase, &l.PollCount, &l.StartedAt, &l.FinishedAt, &l.TotalDurationMs,
 			&l.RequestBody, &l.ResponseBody,
-			&l.StatusCode, &l.DurationMs, &l.ErrorMessage, &l.CreatedAt); err != nil {
+			&l.StatusCode, &l.DurationMs, &l.ErrorMessage,
+			&l.UserID, &l.Username, &l.TenantSlug, &l.CredentialProvider,
+			&l.APIKeyMask, &l.AccessKeyMask, &l.SecretKeyMask, &l.AuthType,
+			&l.CreatedAt); err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)

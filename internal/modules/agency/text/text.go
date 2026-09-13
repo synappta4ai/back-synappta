@@ -33,6 +33,7 @@ func (s *Service) Generate(c *gin.Context) {
 		return
 	}
 	req.ResourceType = "text"
+	agency.AttachCaller(&req, c)
 
 	core, ok := s.resolve(c)
 	if !ok {
