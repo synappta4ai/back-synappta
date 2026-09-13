@@ -217,8 +217,8 @@ func (s *Store) CreateEvent(ev *Event) error {
 	query := `INSERT INTO events (id, name, description, metadata, venue, starts_at, ends_at, status, active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING created_at, updated_at`
-	return s.db.QueryRow(query, ev.ID, ev.Name, nullIfEmpty(ev.Description),
-		nullIfEmpty(ev.Metadata), nullIfEmpty(ev.Venue), ev.StartsAt, ev.EndsAt,
+	return s.db.QueryRow(query, ev.ID, ev.Name, ev.Description,
+		nullIfEmpty(ev.Metadata), ev.Venue, ev.StartsAt, ev.EndsAt,
 		ev.Status, ev.Active).Scan(&ev.CreatedAt, &ev.UpdatedAt)
 }
 
@@ -286,8 +286,8 @@ func (s *Store) CreateProgram(pr *Program) error {
 	query := `INSERT INTO programs (id, event_id, number, name, description, scheduled_at, sort_order, active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING created_at, updated_at`
-	return s.db.QueryRow(query, pr.ID, pr.EventID, pr.Number, nullIfEmpty(pr.Name),
-		nullIfEmpty(pr.Description), pr.ScheduledAt, pr.SortOrder, pr.Active).
+	return s.db.QueryRow(query, pr.ID, pr.EventID, pr.Number, pr.Name,
+		pr.Description, pr.ScheduledAt, pr.SortOrder, pr.Active).
 		Scan(&pr.CreatedAt, &pr.UpdatedAt)
 }
 
@@ -352,9 +352,9 @@ func (s *Store) CreatePiece(pc *Piece) error {
 	query := `INSERT INTO pieces (id, event_id, program_id, number, piece_code, name, description, type, output_format, duration, aspect_ratio, active)
 		VALUES ($1, $2, NULLIF($3,'')::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING created_at, updated_at`
-	return s.db.QueryRow(query, pc.ID, pc.EventID, pc.ProgramID, pc.Number, nullIfEmpty(pc.PieceCode),
-		nullIfEmpty(pc.Name), nullIfEmpty(pc.Description), nullIfEmpty(pc.Type),
-		nullIfEmpty(pc.OutputFormat), pc.Duration, nullIfEmpty(pc.AspectRatio), pc.Active).
+	return s.db.QueryRow(query, pc.ID, pc.EventID, pc.ProgramID, pc.Number, pc.PieceCode,
+		pc.Name, pc.Description, pc.Type,
+		pc.OutputFormat, pc.Duration, pc.AspectRatio, pc.Active).
 		Scan(&pc.CreatedAt, &pc.UpdatedAt)
 }
 
@@ -1264,6 +1264,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 
 		ev.POST("/:id/programs", h(m.resolve)("CreateProgram"))
 		ev.GET("/:id/programs", h(m.resolve)("ListPrograms"))
+		ev.POST("/:id/pieces", h(m.resolve)("CreatePiece"))
 	}
 
 	pr := rg.Group("/programs")
@@ -1324,6 +1325,8 @@ func h(resolve HandlerResolver) func(method string) gin.HandlerFunc {
 				hdl.UpdateProgram(c)
 			case "SoftDeleteProgram":
 				hdl.SoftDeleteProgram(c)
+			case "CreatePiece":
+				hdl.CreatePiece(c)
 			case "ListPieces":
 				hdl.ListPieces(c)
 			case "GetPiece":
