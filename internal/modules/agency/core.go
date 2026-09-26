@@ -14,6 +14,7 @@ import (
 	"synapta/config"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
+	"synapta/internal/modules/model"
 	"synapta/internal/utils"
 )
 
@@ -269,11 +270,18 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	}
 	modelName = m.Name
 
-	// Resolve per-tenant credentials
-	creds, err := s.resolveProvider(m)
-	if err != nil {
-		errLog = err.Error()
-		return nil, err
+	// Resolve per-tenant credentials (API models only: downloaded models run
+	// on our own inference worker and need no external provider).
+	var creds *credential.Resolve
+	if m.Type != model.TypeDownloaded {
+		resolved, err := s.resolveProvider(m)
+		if err != nil {
+			errLog = err.Error()
+			return nil, err
+		}
+		creds = resolved
+	} else {
+		creds = &credential.Resolve{}
 	}
 
 	// Resolve file IDs in content to data URLs (or asset:// URIs if synced)
@@ -308,8 +316,11 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		InputDuration: inputDuration,
 		APIKey:        creds.APIKey,
 	}
-	// Route resolution: per-tenant creds → model catalog route → provider default
-	genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+	// Route resolution: per-tenant creds → model catalog route → provider
+	// default. Downloaded models have no HTTP route (gRPC to the worker).
+	if m.Type != model.TypeDownloaded {
+		genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+	}
 	if req.GenerateAudio != nil {
 		genReq.GenerateAudio = *req.GenerateAudio
 	}
@@ -501,16 +512,25 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
 	}
-	creds, err := s.resolveProvider(m)
-	if err != nil {
-		return nil, err
+	var creds *credential.Resolve
+	if m.Type != model.TypeDownloaded {
+		resolved, err := s.resolveProvider(m)
+		if err != nil {
+			return nil, err
+		}
+		creds = resolved
+	} else {
+		creds = &credential.Resolve{}
 	}
 	gen := s.pickGenerator(m.Name)
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
 
-	baseURL, endpoint := resolveRoute(m, creds)
+	baseURL, endpoint := "", ""
+	if m.Type != model.TypeDownloaded {
+		baseURL, endpoint = resolveRoute(m, creds)
+	}
 
 	pollStart := time.Now()
 	result, err := gen.GetStatus(taskID, creds.APIKey, baseURL, endpoint)
@@ -687,15 +707,24 @@ func (s *Core) CancelTask(taskID string) error {
 	if m == nil {
 		return fmt.Errorf("model for task %s not found", taskID)
 	}
-	creds, err := s.resolveProvider(m)
-	if err != nil {
-		return err
+	var creds *credential.Resolve
+	if m.Type != model.TypeDownloaded {
+		resolved, err := s.resolveProvider(m)
+		if err != nil {
+			return err
+		}
+		creds = resolved
+	} else {
+		creds = &credential.Resolve{}
 	}
 	gen := s.pickGenerator(m.Name)
 	if gen == nil {
 		return fmt.Errorf("no generator available for model: %s", m.Name)
 	}
-	baseURL, endpoint := resolveRoute(m, creds)
+	baseURL, endpoint := "", ""
+	if m.Type != model.TypeDownloaded {
+		baseURL, endpoint = resolveRoute(m, creds)
+	}
 	return gen.CancelTask(taskID, creds.APIKey, baseURL, endpoint)
 }
 
@@ -705,9 +734,15 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
-	creds, err := s.resolveProvider(m)
-	if err != nil {
-		return nil, err
+	var creds *credential.Resolve
+	if m.Type != model.TypeDownloaded {
+		resolved, err := s.resolveProvider(m)
+		if err != nil {
+			return nil, err
+		}
+		creds = resolved
+	} else {
+		creds = &credential.Resolve{}
 	}
 
 	resolvedContent, err := s.resolveContent(req.Content, m.Name)
@@ -729,8 +764,11 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 		ImageMode:   req.ImageMode,
 		APIKey:      creds.APIKey,
 	}
-	// Route resolution: per-tenant creds → model catalog route → provider default
-	genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+	// Route resolution: per-tenant creds → model catalog route → provider
+	// default. Downloaded models have no HTTP route (gRPC to the worker).
+	if m.Type != model.TypeDownloaded {
+		genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+	}
 	if req.GenerateAudio != nil {
 		genReq.GenerateAudio = *req.GenerateAudio
 	}
@@ -783,11 +821,20 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 	if gen == nil {
 		return &StatusResult{Status: logEntry.Status}, nil
 	}
-	creds, err := s.resolveProvider(m)
-	if err != nil {
-		return &StatusResult{Status: logEntry.Status, Error: err.Error()}, nil
+	var creds *credential.Resolve
+	if m.Type != model.TypeDownloaded {
+		resolved, rerr := s.resolveProvider(m)
+		if rerr != nil {
+			return &StatusResult{Status: logEntry.Status, Error: rerr.Error()}, nil
+		}
+		creds = resolved
+	} else {
+		creds = &credential.Resolve{}
 	}
-	baseURL, endpoint := resolveRoute(m, creds)
+	baseURL, endpoint := "", ""
+	if m.Type != model.TypeDownloaded {
+		baseURL, endpoint = resolveRoute(m, creds)
+	}
 
 	result, err := gen.GetStatus(logEntry.TaskID, creds.APIKey, baseURL, endpoint)
 	if err != nil {

@@ -32,6 +32,11 @@ type Config struct {
 	EncryptionKey       string // 32-byte key for credential encryption at rest
 	OutputsDir          string
 
+	// Inference worker (brain-master Python gRPC server) for downloaded
+	// models. Empty disables the downloaded-model side of the catalog.
+	WorkerAddr           string
+	WorkerTimeoutSeconds int
+
 	// Default tenant: created at startup if missing; the platform superadmin
 	// gets a membership in it so tenant-scoped requests work out of the box.
 	DefaultTenantSlug string
@@ -151,7 +156,14 @@ func Load() *Config {
 		dbConnMaxLifetime = 1800
 	}
 
-	log.Printf("[config] env=%s port=%s CORS_ALLOW_ORIGINS=%s", env, port, tern(corsOrigins != "", corsOrigins, "(dev default *)"))
+	workerTimeout, err := strconv.Atoi(getEnv("BM_WORKER_TIMEOUT_SECONDS", "6"))
+	if err != nil || workerTimeout <= 0 {
+		workerTimeout = 6
+	}
+
+	log.Printf("[config] env=%s port=%s CORS_ALLOW_ORIGINS=%s worker=%s",
+		env, port, tern(corsOrigins != "", corsOrigins, "(dev default *)"),
+		tern(os.Getenv("BM_WORKER_ADDR") != "", os.Getenv("BM_WORKER_ADDR"), "(not configured)"))
 
 	return &Config{
 		Env:             env,
@@ -179,6 +191,9 @@ func Load() *Config {
 		JWTSecret:     jwtSecret,
 		EncryptionKey: encryptionKey,
 		OutputsDir:    outputsDir,
+
+		WorkerAddr:           strings.TrimSpace(os.Getenv("BM_WORKER_ADDR")),
+		WorkerTimeoutSeconds: workerTimeout,
 
 		DefaultTenantSlug: getEnv("DEFAULT_TENANT_SLUG", "synapta"),
 		DefaultTenantName: getEnv("DEFAULT_TENANT_NAME", "Synapta"),

@@ -41,6 +41,7 @@ import (
 	"synapta/internal/modules/tenant"
 	"synapta/internal/runtime"
 	"synapta/internal/tenancy"
+	"synapta/internal/worker"
 )
 
 func main() {
@@ -109,6 +110,13 @@ func main() {
 	authMw := middleware.Auth(cfg.JWTSecret)
 	tenantMw := tenancy.Middleware(reg)
 	adminMw := middleware.RequireRole(1)
+
+	// ─── Inference worker (downloaded models, live catalog) ──
+	// Stateless client: no persistent connection, no cached catalog. Every
+	// read goes live to the worker; if BM_WORKER_ADDR is unset the
+	// downloaded side of the model catalog is simply absent.
+	model.SetWorkerClient(worker.NewClient())
+	model.SetWorkerAddr(cfg.WorkerAddr)
 
 	// ─── Router ───────────────────────────────────────────────
 	if cfg.IsProduction() {

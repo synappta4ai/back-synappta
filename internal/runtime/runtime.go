@@ -32,6 +32,7 @@ import (
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
 	"synapta/internal/tenancy"
+	"synapta/internal/worker"
 )
 
 // Manager builds and caches per-tenant bundles.
@@ -245,6 +246,13 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
+
+	// Downloaded-model generator — registered LAST on purpose: it claims any
+	// model name outside the API catalog, so it must not shadow API
+	// generators. Dispatches jobs to the brain-master inference worker over
+	// gRPC (stateless client: no persistent connection, no cached state).
+	core.RegisterGenerator(agencyvideo.NewDownloadedGenerator(
+		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir))
 
 	// Cost calculators. Seedance25 must precede Seedance: the latter's
 	// substring match ("dreamina-seedance") also covers the 2.5 model.

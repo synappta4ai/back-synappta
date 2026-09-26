@@ -9,7 +9,7 @@
     {
       "url": "http://localhost:{port}",
       "variables": {
-        "port": { "default": "9099" }
+        "port": { "default": "8099" }
       }
     }
   ],
@@ -162,11 +162,15 @@
     "/api/v1/models": {
       "get": {
         "tags": ["Models"],
-        "summary": "List all models",
+        "summary": "List models (API + live downloaded)",
+        "description": "Merged catalog: 'api' models (static, external providers) and 'downloaded' models (read live from the inference worker; absent when the worker is unreachable — header X-Worker-Status: unreachable). Nothing is cached.",
         "operationId": "listModels",
-        "security": [],
+        "parameters": [
+          { "name": "modality", "in": "query", "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },
+          { "name": "type", "in": "query", "schema": { "type": "string", "enum": ["api", "downloaded"] }, "description": "Filter by model type; omit for merged view" }
+        ],
         "responses": {
-          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModels" } } } }
         }
       }
     },
@@ -175,10 +179,23 @@
         "tags": ["Models"],
         "summary": "List models by modality",
         "operationId": "listModelsByModality",
-        "security": [],
-        "parameters": [{ "name": "modality", "in": "path", "required": true, "schema": { "type": "string", "enum": ["video", "image", "text"] } }],
+        "parameters": [
+          { "name": "modality", "in": "path", "required": true, "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },
+          { "name": "type", "in": "query", "schema": { "type": "string", "enum": ["api", "downloaded"] } }
+        ],
         "responses": {
-          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse" } } } }
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModels" } } } }
+        }
+      }
+    },
+    "/api/v1/worker/status": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "Live inference worker status",
+        "description": "Reads worker telemetry and catalog live on every call (no cache). Reports reachability, device and model count. connected=false when the worker is unreachable.",
+        "operationId": "workerStatus",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseWorkerStatus" } } } }
         }
       }
     },
@@ -1343,6 +1360,63 @@
           "success": { "type": "boolean" },
           "message": { "type": "string" },
           "data": { "nullable": true }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Stable identifier sent in generation requests" },
+          "modality": { "type": "string", "enum": ["video", "audio", "image", "text", ""], "description": "Empty when the worker mode has no Synapta modality yet (e.g. tts)" },
+          "type": { "type": "string", "enum": ["api", "downloaded"], "description": "api = external provider; downloaded = runs on the inference worker" },
+          "generator": { "type": "string" },
+          "credential_provider": { "type": "string", "nullable": true },
+          "downloaded": { "$ref": "#/components/schemas/DownloadedModel", "nullable": true },
+          "base_url": { "type": "string" },
+          "endpoint": { "type": "string" },
+          "gallery_sync": { "type": "boolean" },
+          "display_name": { "type": "string" },
+          "defaults": { "type": "object", "nullable": true }
+        }
+      },
+      "DownloadedModel": {
+        "type": "object",
+        "description": "Live details reported by the inference worker; never cached by Synapta.",
+        "properties": {
+          "mode": { "type": "string", "enum": ["image", "video", "tts", "audio"] },
+          "engine": { "type": "string", "enum": ["diffusers", "v1_bridge", "mock"] },
+          "pipeline": { "type": "string" },
+          "repo": { "type": "string" },
+          "steps": { "type": "integer" },
+          "vram_gb": { "type": "integer" },
+          "family": { "type": "string" },
+          "available": { "type": "boolean", "description": "false when the worker lists the model but cannot run it" },
+          "notes": { "type": "string" }
+        }
+      },
+      "ApiResponseModels": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Model" } }
+        }
+      },
+      "WorkerStatus": {
+        "type": "object",
+        "properties": {
+          "configured": { "type": "boolean", "description": "BM_WORKER_ADDR is set" },
+          "connected": { "type": "boolean" },
+          "device_name": { "type": "string" },
+          "cuda_available": { "type": "boolean" },
+          "model_count": { "type": "integer" }
+        }
+      },
+      "ApiResponseWorkerStatus": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/WorkerStatus" }
         }
       },
       "ApiResponseMessage": {

@@ -27,6 +27,26 @@ const (
 	ProviderAnthropic CredentialProvider = "anthropic"
 )
 
+// ModelType distinguishes how a model is served:
+//   - "api": external provider HTTP API (per-tenant credentials).
+//   - "downloaded": weights executed by the brain-master inference worker
+//     (gRPC). Listed live from the worker; never cached by Synapta.
+type ModelType string
+
+const (
+	TypeAPI        ModelType = "api"
+	TypeDownloaded ModelType = "downloaded"
+)
+
+// IsValidType reports whether the type filter string is one of the two.
+func IsValidType(s string) bool {
+	switch ModelType(strings.ToLower(s)) {
+	case TypeAPI, TypeDownloaded:
+		return true
+	}
+	return false
+}
+
 // Model is a single catalog entry (defined in code, immutable at runtime).
 type Model struct {
 	// Name is the stable identifier clients send in generation requests.
@@ -36,11 +56,16 @@ type Model struct {
 	// Generator name registered in the agency pipeline that serves this model.
 	Generator string `json:"generator"`
 	// CredentialProvider whose per-tenant credential is required.
-	CredentialProvider CredentialProvider `json:"credential_provider"`
+	// Empty for downloaded models (they run on our own worker).
+	CredentialProvider CredentialProvider `json:"credential_provider,omitempty"`
+	// Type: "api" | "downloaded". Derived from Downloaded at init.
+	Type ModelType `json:"type"`
+	// Downloaded carries inference-worker details; nil for API models.
+	Downloaded *DownloadedModel `json:"downloaded,omitempty"`
 	// BaseURL is the provider API base origin (scheme://host[/path]).
-	BaseURL string `json:"base_url"`
+	BaseURL string `json:"base_url,omitempty"`
 	// Endpoint is the provider API route appended to BaseURL.
-	Endpoint string `json:"endpoint"`
+	Endpoint string `json:"endpoint,omitempty"`
 	// GallerySync: uploads reference files to the BytePlus asset library
 	// before generation and references them as asset://<id>.
 	GallerySync bool `json:"gallery_sync"`
@@ -50,6 +75,31 @@ type Model struct {
 	Defaults Defaults `json:"defaults"`
 }
 
+// DownloadedModel describes a model whose weights run on the brain-master
+// inference worker. Every field is reported live by the worker's ListModels
+// RPC; Synapta never persists or caches it.
+type DownloadedModel struct {
+	// Mode as the worker reports it: image | video | tts | audio.
+	Mode string `json:"mode"`
+	// Engine: diffusers | v1_bridge | mock.
+	Engine string `json:"engine"`
+	// Pipeline family inside the worker's engine factory.
+	Pipeline string `json:"pipeline"`
+	// Repo is the Hugging Face repository holding the weights.
+	Repo string `json:"repo,omitempty"`
+	// Steps the worker runs by default for this model.
+	Steps int32 `json:"steps"`
+	// VRAMGb is the worker's declared VRAM requirement.
+	VRAMGb int32 `json:"vram_gb"`
+	// Family groups related models (sd, sdxl, wan, ...).
+	Family string `json:"family,omitempty"`
+	// Available: false when the worker lists the model but cannot run it
+	// (e.g. V1 bridge volume not mounted).
+	Available bool `json:"available"`
+	// Notes from the worker catalog.
+	Notes string `json:"notes,omitempty"`
+}
+
 // Defaults enumerates the options a modality supports.
 type Defaults struct {
 	Ratios      []string `json:"ratios,omitempty"`
@@ -57,7 +107,9 @@ type Defaults struct {
 	Durations   []int    `json:"durations,omitempty"`
 }
 
-// catalog is the single source of truth for every model Synapta can run.
+// catalog is the single source of truth for every API model Synapta can run.
+// Downloaded models are NOT listed here: they arrive live from the worker
+// (see live.go). init() labels every static entry as TypeAPI.
 var catalog = []Model{
 	// ─── Video ────────────────────────────────────────────────
 	{
@@ -153,7 +205,15 @@ var catalog = []Model{
 	},
 }
 
-// List returns every model in the catalog, optionally filtered by modality.
+// init labels the static catalog: every entry without worker details is an
+// API model. Downloaded entries are merged at request time in live.go.
+func init() {
+	for i := range catalog {
+		catalog[i].Type = TypeAPI
+	}
+}
+
+// List returns every static API model, optionally filtered by modality.
 // An empty modality returns all models.
 func List(modality Modality) []Model {
 	out := make([]Model, 0, len(catalog))
@@ -165,7 +225,8 @@ func List(modality Modality) []Model {
 	return out
 }
 
-// ByName resolves a model by its exact name (case-insensitive), or nil.
+// ByName resolves an API model by its exact name (case-insensitive), or nil.
+// Downloaded models are not resolvable here: they live on the worker only.
 func ByName(name string) *Model {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	for i := range catalog {

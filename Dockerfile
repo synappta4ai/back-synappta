@@ -23,9 +23,9 @@ COPY --from=builder /app/migrations /app/migrations
 RUN mkdir -p /app/uploads /app/outputs && chown -R app:app /app
 USER app
 
-EXPOSE 9099
+EXPOSE 8099
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://localhost:${PORT:-9099}/healthz || exit 1
+  CMD wget -qO- http://localhost:${PORT:-8099}/healthz || exit 1
 
 ENTRYPOINT ["/app/synapta"]
