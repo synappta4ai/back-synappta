@@ -45,6 +45,24 @@ type File struct {
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 	DeletedAt *time.Time `json:"deleted_at"`
+
+	// Computed for API responses (never persisted): public, JWT-free URLs
+	// for <img>/<video> tags and external AI APIs. Filled by the service.
+	URL          string `json:"url,omitempty"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	// Computed: IDs of the events (projects) this file is assigned to.
+	// Empty when the resource is not linked to any project.
+	ProjectIDs []string `json:"project_ids,omitempty"`
+	// Computed: ingredients (character/location/prop) that reference this
+	// file — shown as resource metadata in the admin gallery.
+	Ingredients []FileIngredient `json:"ingredients,omitempty"`
+}
+
+// FileIngredient summarizes an ingredient referencing a file.
+type FileIngredient struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Name string `json:"name"`
 }
 
 type PaginatedFiles struct {
@@ -53,6 +71,8 @@ type PaginatedFiles struct {
 	Page       int    `json:"page"`
 	PageSize   int    `json:"pageSize"`
 	TotalPages int    `json:"totalPages"`
+	// Tenant that owns these files (filled for platform superadmin views).
+	TenantSlug string `json:"tenant_slug,omitempty"`
 }
 
 // ─── Disk store ─────────────────────────────────────────────────
@@ -210,6 +230,106 @@ func scanFile(f *File, scanner interface {
 		&f.Storage, &f.Duration, &f.SHA256, &f.Trashed, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt)
 }
 
+// ─── Event (project) assignment M:N ────────────────────────────
+
+// LinkEvent assigns a file to a project. Idempotent: re-linking an existing
+// pair is a no-op.
+func (s *Store) LinkEvent(fileID, eventID string) error {
+	_, err := s.db.Exec(`INSERT INTO event_files (file_id, event_id) VALUES ($1, $2)
+		ON CONFLICT DO NOTHING`, fileID, eventID)
+	return err
+}
+
+// UnlinkEvent removes a file's assignment to a project.
+func (s *Store) UnlinkEvent(fileID, eventID string) error {
+	_, err := s.db.Exec(`DELETE FROM event_files WHERE file_id = $1 AND event_id = $2`, fileID, eventID)
+	return err
+}
+
+// ProjectIDsByFiles returns, for each file, the event IDs it is assigned to.
+func (s *Store) ProjectIDsByFiles(fileIDs []string) (map[string][]string, error) {
+	out := make(map[string][]string, len(fileIDs))
+	if len(fileIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT file_id::text, event_id::text FROM event_files
+		WHERE file_id = ANY($1::uuid[]) ORDER BY created_at`, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fileID, eventID string
+		if err := rows.Scan(&fileID, &eventID); err != nil {
+			return nil, err
+		}
+		out[fileID] = append(out[fileID], eventID)
+	}
+	return out, rows.Err()
+}
+
+// ListFilesByEvent returns the active (non-trashed, non-deleted) files
+// assigned to a project, newest first, optionally narrowed by category.
+func (s *Store) ListFilesByEvent(eventID, category string) ([]File, error) {
+	where := `WHERE ef.event_id = $1 AND f.trashed = FALSE AND f.deleted_at IS NULL`
+	args := []interface{}{eventID}
+	if category != "" {
+		where += ` AND f.category = $2`
+		args = append(args, category)
+	}
+	rows, err := s.db.Query(`SELECT `+fileColsSelect("f.")+` FROM event_files ef
+		JOIN files f ON f.id = ef.file_id `+where+` ORDER BY ef.created_at DESC, f.created_at DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var files []File
+	for rows.Next() {
+		var f File
+		if err := scanFile(&f, rows); err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// fileColsSelect prefixes fileCols column names with a table alias.
+func fileColsSelect(alias string) string {
+	cols := strings.Split(fileCols, ", ")
+	for i, c := range cols {
+		cols[i] = alias + c
+	}
+	return strings.Join(cols, ", ")
+}
+
+// IngredientsByFiles returns, for each file, the ingredients
+// (character/location/prop) that reference it.
+func (s *Store) IngredientsByFiles(fileIDs []string) (map[string][]FileIngredient, error) {
+	out := make(map[string][]FileIngredient, len(fileIDs))
+	if len(fileIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT icf.file_id::text, i.id::text, i.type, i.name
+		FROM ingredient_files icf
+		JOIN ingredients i ON i.id = icf.ingredient_id AND i.deleted_at IS NULL
+		WHERE icf.file_id = ANY($1::uuid[])
+		ORDER BY i.name`, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fileID string
+		var ing FileIngredient
+		if err := rows.Scan(&fileID, &ing.ID, &ing.Type, &ing.Name); err != nil {
+			return nil, err
+		}
+		out[fileID] = append(out[fileID], ing)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateFile(f *File) error {
 	query := `INSERT INTO files (id, filename, path, size, mime_type, category, format, storage, duration, sha256)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -281,7 +401,7 @@ func (s *Store) ListFiles(category, storage string, trashed bool) ([]File, error
 	return files, rows.Err()
 }
 
-func (s *Store) ListFilesPage(page, pageSize int, category, storage, search string) (*PaginatedFiles, error) {
+func (s *Store) ListFilesPage(page, pageSize int, category, storage, search, eventID string) (*PaginatedFiles, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -293,6 +413,11 @@ func (s *Store) ListFilesPage(page, pageSize int, category, storage, search stri
 	args := []interface{}{}
 	argIdx := 1
 
+	if eventID != "" {
+		where += fmt.Sprintf(" AND id IN (SELECT file_id FROM event_files WHERE event_id = $%d)", argIdx)
+		args = append(args, eventID)
+		argIdx++
+	}
 	if category != "" {
 		where += fmt.Sprintf(" AND category = $%d", argIdx)
 		args = append(args, category)
@@ -380,10 +505,19 @@ func (s *Store) ListExpiredTemp(maxAge time.Duration) ([]File, error) {
 type Service struct {
 	store   *Store
 	baseURL string
+	// tenantSlug names the tenant in public serve URLs
+	// (/t/:slug/files/:id/serve): <img>/<video> tags cannot send JWTs, so
+	// file URLs handed to browsers or external AI APIs must be public.
+	tenantSlug string
 }
 
-func NewService(store *Store, baseURL string) *Service {
-	return &Service{store: store, baseURL: baseURL}
+func NewService(store *Store, baseURL, tenantSlug string) *Service {
+	return &Service{store: store, baseURL: baseURL, tenantSlug: tenantSlug}
+}
+
+// publicFileURL builds a JWT-free serve URL for browsers and external APIs.
+func (s *Service) publicFileURL(id, suffix string) string {
+	return s.baseURL + "/api/v1/t/" + s.tenantSlug + "/files/" + id + suffix
 }
 
 type UploadResult struct {
@@ -423,12 +557,12 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		if existing != nil {
 			thumbnailURL := ""
 			if strings.HasPrefix(existing.MimeType, "image/") {
-				thumbnailURL = s.baseURL + "/api/v1/files/" + existing.ID + "/thumbnail"
+				thumbnailURL = s.publicFileURL(existing.ID, "/thumbnail")
 			}
 			format := existing.Format
 			return &UploadResult{
 				ID: existing.ID, Filename: existing.Filename,
-				URL:  s.baseURL + "/api/v1/files/" + existing.ID,
+				URL:  s.publicFileURL(existing.ID, "/serve"),
 				Size: existing.Size, MimeType: existing.MimeType, Format: format,
 				Category: existing.Category, ThumbnailURL: thumbnailURL,
 				Duplicate: true,
@@ -472,7 +606,7 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		if _, err := s.store.GenerateThumbnail(fullPath, 300, 300); err != nil {
 			fmt.Printf("warning: failed to generate thumbnail for %s: %v\n", fullPath, err)
 		} else {
-			thumbnailURL = s.baseURL + "/api/v1/files/" + file.ID + "/thumbnail"
+			thumbnailURL = s.publicFileURL(file.ID, "/thumbnail")
 		}
 	}
 
@@ -483,7 +617,7 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 
 	return &UploadResult{
 		ID: file.ID, Filename: filename,
-		URL:  s.baseURL + "/api/v1/files/" + file.ID,
+		URL:  s.publicFileURL(file.ID, "/serve"),
 		Size: file.Size, MimeType: mimeType, Format: format, Category: category,
 		ThumbnailURL: thumbnailURL,
 	}, nil
@@ -586,16 +720,98 @@ func (s *Service) HardDelete(id string) error {
 	return s.store.HardDeleteFile(id)
 }
 
-func (s *Service) ListFilesPage(page, pageSize int, category, storage, search string) (*PaginatedFiles, error) {
-	return s.store.ListFilesPage(page, pageSize, category, storage, search)
+// DecorateOne fills the computed public URL fields of a single file.
+func (s *Service) DecorateOne(f *File) *File {
+	if f == nil {
+		return f
+	}
+	f.URL = s.publicFileURL(f.ID, "/serve")
+	if strings.HasPrefix(f.MimeType, "image/") {
+		f.ThumbnailURL = s.publicFileURL(f.ID, "/thumbnail")
+	}
+	return f
+}
+
+// decorate fills the computed public URL fields for API responses.
+func (s *Service) decorate(files []File) []File {
+	for i := range files {
+		files[i].URL = s.publicFileURL(files[i].ID, "/serve")
+		if strings.HasPrefix(files[i].MimeType, "image/") {
+			files[i].ThumbnailURL = s.publicFileURL(files[i].ID, "/thumbnail")
+		}
+	}
+	return files
+}
+
+func (s *Service) ListFilesPage(page, pageSize int, category, storage, search, eventID string) (*PaginatedFiles, error) {
+	pageData, err := s.store.ListFilesPage(page, pageSize, category, storage, search, eventID)
+	if err != nil {
+		return nil, err
+	}
+	s.decorate(pageData.Items)
+	if err := s.attachComputed(pageData.Items); err != nil {
+		return nil, err
+	}
+	pageData.TenantSlug = s.tenantSlug
+	return pageData, nil
+}
+
+// attachComputed fills the computed metadata fields (project IDs and
+// referencing ingredients) for each listed file.
+func (s *Service) attachComputed(files []File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	ids := make([]string, len(files))
+	for i, f := range files {
+		ids[i] = f.ID
+	}
+	byFile, err := s.store.ProjectIDsByFiles(ids)
+	if err != nil {
+		return err
+	}
+	ingsByFile, err := s.store.IngredientsByFiles(ids)
+	if err != nil {
+		return err
+	}
+	for i := range files {
+		files[i].ProjectIDs = byFile[files[i].ID]
+		files[i].Ingredients = ingsByFile[files[i].ID]
+	}
+	return nil
+}
+
+// ListFilesByEvent returns the active files assigned to a project.
+func (s *Service) ListFilesByEvent(eventID, category string) ([]File, error) {
+	files, err := s.store.ListFilesByEvent(eventID, category)
+	if err != nil {
+		return nil, err
+	}
+	return s.decorate(files), nil
+}
+
+// LinkEvent assigns a file to a project.
+func (s *Service) LinkEvent(fileID, eventID string) error { return s.store.LinkEvent(fileID, eventID) }
+
+// UnlinkEvent removes a file's project assignment.
+func (s *Service) UnlinkEvent(fileID, eventID string) error {
+	return s.store.UnlinkEvent(fileID, eventID)
 }
 
 func (s *Service) ListFiles(category, storage string, trashed bool) ([]File, error) {
-	return s.store.ListFiles(category, storage, trashed)
+	files, err := s.store.ListFiles(category, storage, trashed)
+	if err != nil {
+		return nil, err
+	}
+	return s.decorate(files), nil
 }
 
 func (s *Service) ListTrash() ([]File, error) {
-	return s.store.ListFiles("", "", true)
+	files, err := s.store.ListFiles("", "", true)
+	if err != nil {
+		return nil, err
+	}
+	return s.decorate(files), nil
 }
 
 func (s *Service) PurgeExpiredTemp() error {
@@ -645,6 +861,7 @@ func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 //   - storage   (optional): persistent | temp (default persistent)
 //   - force     (optional): "true"/"1" stores a new copy even if an identical
 //     active file already exists (dedup bypass)
+//   - event_id  (optional): project (event) to assign the resource to
 func (h *Handler) Upload(c *gin.Context) {
 	category := c.PostForm("category")
 	if category == "" {
@@ -653,6 +870,7 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	storage := c.DefaultPostForm("storage", "persistent")
 	force := c.PostForm("force") == "true" || c.PostForm("force") == "1"
+	eventID := c.PostForm("event_id")
 
 	file, err := c.FormFile("file")
 	if err != nil {
@@ -677,6 +895,14 @@ func (h *Handler) Upload(c *gin.Context) {
 		utils.BadRequest(c, err.Error())
 		return
 	}
+	// Assign the resource to the requested project (also for dedup hits: the
+	// user is linking this project to an existing identical resource).
+	if eventID != "" {
+		if linkErr := h.svc.LinkEvent(result.ID, eventID); linkErr != nil {
+			utils.InternalError(c, "uploaded but failed to link to project: "+linkErr.Error())
+			return
+		}
+	}
 	if result.Duplicate {
 		// Not a new resource — 200 with the existing file + duplicate flag.
 		utils.Success(c, result)
@@ -696,7 +922,7 @@ func (h *Handler) GetFile(c *gin.Context) {
 		utils.NotFound(c, "file not found")
 		return
 	}
-	utils.Success(c, f)
+	utils.Success(c, h.svc.DecorateOne(f))
 }
 
 // ServeFile handles GET /files/:id/serve
@@ -779,15 +1005,50 @@ func (h *Handler) ListFiles(c *gin.Context) {
 }
 
 // ListFilesPage handles GET /files/page
+//
+// Optional filters: category, storage, q (filename search) and event_id
+// (project assignment — only resources linked to that project).
 func (h *Handler) ListFilesPage(c *gin.Context) {
 	page, _ := atoiDefault(c.Query("page"), 1)
 	pageSize, _ := atoiDefault(c.Query("pageSize"), 50)
-	result, err := h.svc.ListFilesPage(page, pageSize, c.Query("category"), c.Query("storage"), c.Query("q"))
+	result, err := h.svc.ListFilesPage(page, pageSize, c.Query("category"), c.Query("storage"), c.Query("q"), c.Query("event_id"))
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
 	}
 	utils.Success(c, result)
+}
+
+// ListFilesByEvent handles GET /files/by-event/:eventId — the project's
+// assigned resources (all active files linked via event_files).
+func (h *Handler) ListFilesByEvent(c *gin.Context) {
+	files, err := h.svc.ListFilesByEvent(c.Param("eventId"), c.Query("category"))
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if files == nil {
+		files = []File{}
+	}
+	utils.Success(c, files)
+}
+
+// LinkEvent handles PUT /files/:id/event/:eventId — assign a resource to a project.
+func (h *Handler) LinkEvent(c *gin.Context) {
+	if err := h.svc.LinkEvent(c.Param("id"), c.Param("eventId")); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Message(c, "file linked to project")
+}
+
+// UnlinkEvent handles DELETE /files/:id/event/:eventId — unassign a resource from a project.
+func (h *Handler) UnlinkEvent(c *gin.Context) {
+	if err := h.svc.UnlinkEvent(c.Param("id"), c.Param("eventId")); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Message(c, "file unlinked from project")
 }
 
 func atoiDefault(s string, def int) (int, error) {
@@ -838,8 +1099,11 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 	{
 		g.POST("/upload", m.priv("Upload"))
 		g.GET("/page", m.priv("ListFilesPage"))
+		g.GET("/by-event/:eventId", m.priv("ListFilesByEvent"))
 		g.GET("", m.priv("ListFiles"))
 		g.GET("/:id", m.priv("GetFile"))
+		g.PUT("/:id/event/:eventId", m.priv("LinkEvent"))
+		g.DELETE("/:id/event/:eventId", m.priv("UnlinkEvent"))
 		g.GET("/:id/serve", m.priv("ServeFile"))
 		g.GET("/:id/thumbnail", m.priv("ServeThumbnail"))
 		g.DELETE("/:id", m.priv("SoftDelete"))
@@ -877,6 +1141,12 @@ func dispatch(hdl *Handler, method string, c *gin.Context) {
 		hdl.Upload(c)
 	case "ListFilesPage":
 		hdl.ListFilesPage(c)
+	case "ListFilesByEvent":
+		hdl.ListFilesByEvent(c)
+	case "LinkEvent":
+		hdl.LinkEvent(c)
+	case "UnlinkEvent":
+		hdl.UnlinkEvent(c)
 	case "ListFiles":
 		hdl.ListFiles(c)
 	case "GetFile":

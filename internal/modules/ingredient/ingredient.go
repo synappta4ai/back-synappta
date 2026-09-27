@@ -110,6 +110,24 @@ func (s *Store) Create(ing *Ingredient) error {
 		Scan(&ing.CreatedAt, &ing.UpdatedAt)
 }
 
+// FindActiveByTypeAndName returns the newest non-deleted ingredient with the
+// given type+name, or nil when there is no match. Used to dedup ingredient
+// creation (same type + same name = same ingredient, no copies).
+func (s *Store) FindActiveByTypeAndName(ingType, name string) (*Ingredient, error) {
+	ing := &Ingredient{}
+	err := s.db.QueryRow(`SELECT id, type, name, description, metadata, created_at, updated_at, deleted_at
+		FROM ingredients WHERE type = $1 AND name = $2 AND deleted_at IS NULL
+		ORDER BY created_at DESC LIMIT 1`, ingType, name).
+		Scan(&ing.ID, &ing.Type, &ing.Name, &ing.Description, &ing.Metadata, &ing.CreatedAt, &ing.UpdatedAt, &ing.DeletedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ing, nil
+}
+
 func (s *Store) GetByID(id string) (*Ingredient, error) {
 	ing := &Ingredient{}
 	err := s.db.QueryRow(`SELECT id, type, name, description, metadata, created_at, updated_at, deleted_at
@@ -356,6 +374,15 @@ func (s *Service) Create(req CreateIngredientRequest) (*Ingredient, error) {
 	}
 	if !validTypes[t] {
 		return nil, fmt.Errorf("invalid type %q: must be one of character, location, prop", t)
+	}
+	// Dedup: same type + same name = same ingredient. Reuse the existing row
+	// instead of creating a copy (uploads retried by the UI hit this path).
+	existing, err := s.store.FindActiveByTypeAndName(t, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return existing, nil
 	}
 	ing := &Ingredient{
 		ID:          uuid.New().String(),

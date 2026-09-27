@@ -223,9 +223,9 @@ func TestListByModalityMerged(t *testing.T) {
 	m.ListByModality(c)
 	env, code := decode(t, w)
 
-	// Static video models (3 seedance) + live Wan = 4.
-	if code != http.StatusOK || len(env.Data) != 4 {
-		t.Fatalf("video merged: want 4, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	// Static video models (3 seedance + 7 higgsfield) + live Wan = 11.
+	if code != http.StatusOK || len(env.Data) != 11 {
+		t.Fatalf("video merged: want 11, got %d (status %d): %s", len(env.Data), code, w.Body.String())
 	}
 }
 

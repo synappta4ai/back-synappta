@@ -131,8 +131,11 @@ type GeneratorRequest struct {
 	InputDuration float64
 	ImageMode     string
 	APIKey        string
-	BaseURL       string
-	Endpoint      string
+	// AuthKey is the credential material for the Authorization header:
+	// plain APIKey for most providers, "keyID:secret" for Higgsfield.
+	AuthKey  string
+	BaseURL  string
+	Endpoint string
 }
 
 // GeneratorResult is the response returned by a generator.

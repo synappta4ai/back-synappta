@@ -18,13 +18,15 @@ import (
 
 // Provider names mirror the model catalog's CredentialProvider values.
 const (
-	ProviderBytePlus  = "byteplus"
-	ProviderGemini    = "gemini"
-	ProviderAnthropic = "anthropic"
+	ProviderBytePlus   = "byteplus"
+	ProviderGemini     = "gemini"
+	ProviderAnthropic  = "anthropic"
+	ProviderHiggsfield = "higgsfield"
 )
 
 var validProviders = map[string]bool{
 	ProviderBytePlus: true, ProviderGemini: true, ProviderAnthropic: true,
+	ProviderHiggsfield: true,
 }
 
 // IsValidProvider reports whether the provider name is one of the supported ones.
@@ -81,6 +83,16 @@ type Resolve struct {
 	Endpoint        string
 	BaseURL         string
 	Extra           string
+}
+
+// AuthKey returns the credential material generators use for the
+// Authorization header. Higgsfield authenticates with "Key <id>:<secret>";
+// every other provider uses the plain API key.
+func (r *Resolve) AuthKey() string {
+	if r.AccessKeyID != "" && r.SecretAccessKey != "" && r.APIKey == "" {
+		return r.AccessKeyID + ":" + r.SecretAccessKey
+	}
+	return r.APIKey
 }
 
 // UpsertRequest is the payload for creating/updating a credential.
@@ -167,6 +179,13 @@ func validateKeyFormat(provider, apiKey string) error {
 	case ProviderBytePlus:
 		if isAnthropicKey || isGeminiKey {
 			return conflict("BytePlus Console → ModelArk → API Key Management (console.byteplus.com/ark)")
+		}
+	case ProviderHiggsfield:
+		// Higgsfield keys are UUID-shaped ids + secrets, not API keys; the
+		// real payload goes in access_key_id + secret_access_key. An api_key
+		// here is always a paste mistake.
+		if k != "" {
+			return conflict("Higgsfield Console (open.higgsfield.ai) — use Key ID + Key Secret fields, not an API key")
 		}
 	}
 	return nil

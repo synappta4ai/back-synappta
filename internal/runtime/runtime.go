@@ -214,7 +214,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("file store: %w", err)
 	}
-	fileSvc := file.NewService(fileStore, m.cfg.BaseURL)
+	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug)
 	credStore := credential.NewStore(pool, m.cfg.EncryptionKey)
 	eventSvc := event.NewService(event.NewStore(pool))
 	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL)
@@ -246,6 +246,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
+	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API

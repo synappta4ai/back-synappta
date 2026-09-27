@@ -163,12 +163,24 @@ func (h *Handler) ListGeneratedAssets(c *gin.Context) {
 // ListGeneratedVideos handles GET /agency/videos — completed video
 // generations with project/piece/user context, for the admin gallery.
 func (h *Handler) ListGeneratedVideos(c *gin.Context) {
+	h.listGeneratedByModality(c, h.core.ListGeneratedVideos)
+}
+
+// ListGeneratedImages handles GET /agency/images — completed image
+// generations with the same enriched context as videos.
+func (h *Handler) ListGeneratedImages(c *gin.Context) {
+	h.listGeneratedByModality(c, h.core.ListGeneratedImages)
+}
+
+// listGeneratedByModality runs a modality gallery listing with paging.
+// Optional ?event_id= narrows the gallery to one project (event).
+func (h *Handler) listGeneratedByModality(c *gin.Context, list func(page, limit int, eventID string) (*ListLogsResponse, error)) {
 	page := atoiDefault(c.Query("page"), 1)
 	limit := atoiDefault(c.Query("limit"), 20)
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
-	result, err := h.core.ListGeneratedVideos(page, limit)
+	result, err := list(page, limit, c.Query("event_id"))
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
@@ -226,6 +238,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		gallery.Use(adminMw)
 		gallery.GET("/assets", m.priv("ListGeneratedAssets"))
 		gallery.GET("/videos", m.priv("ListGeneratedVideos"))
+		gallery.GET("/images", m.priv("ListGeneratedImages"))
 
 		// Modality routes (video/image/audio/text).
 		for name, fn := range m.modalities {
@@ -262,6 +275,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListGeneratedAssets(c)
 		case "ListGeneratedVideos":
 			hdl.ListGeneratedVideos(c)
+		case "ListGeneratedImages":
+			hdl.ListGeneratedImages(c)
 		default:
 			utils.InternalError(c, "unknown handler method: "+method)
 		}

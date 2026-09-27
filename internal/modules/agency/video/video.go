@@ -27,6 +27,7 @@ var ValidResolutionsVideo = map[string]bool{
 	"480p":  true,
 	"720p":  true,
 	"1080p": true,
+	"2K":    true, // MiniMax H3
 }
 
 var videoURLPattern = regexp.MustCompile(`^https?://`)

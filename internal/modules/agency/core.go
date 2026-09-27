@@ -315,6 +315,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		ImageMode:     req.ImageMode,
 		InputDuration: inputDuration,
 		APIKey:        creds.APIKey,
+		AuthKey:       creds.AuthKey(),
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -533,7 +534,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 	}
 
 	pollStart := time.Now()
-	result, err := gen.GetStatus(taskID, creds.APIKey, baseURL, endpoint)
+	result, err := gen.GetStatus(taskID, creds.AuthKey(), baseURL, endpoint)
 	pollDur := time.Since(pollStart).Milliseconds()
 
 	// Log server communication — ONLY for meaningful polls: terminal states
@@ -725,7 +726,7 @@ func (s *Core) CancelTask(taskID string) error {
 	if m.Type != model.TypeDownloaded {
 		baseURL, endpoint = resolveRoute(m, creds)
 	}
-	return gen.CancelTask(taskID, creds.APIKey, baseURL, endpoint)
+	return gen.CancelTask(taskID, creds.AuthKey(), baseURL, endpoint)
 }
 
 // PreviewPayload builds the AI API payload without sending it or saving logs.
@@ -763,6 +764,7 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 		Resolution:  req.Resolution,
 		ImageMode:   req.ImageMode,
 		APIKey:      creds.APIKey,
+		AuthKey:     creds.AuthKey(),
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -836,7 +838,7 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		baseURL, endpoint = resolveRoute(m, creds)
 	}
 
-	result, err := gen.GetStatus(logEntry.TaskID, creds.APIKey, baseURL, endpoint)
+	result, err := gen.GetStatus(logEntry.TaskID, creds.AuthKey(), baseURL, endpoint)
 	if err != nil {
 		return &StatusResult{Status: logEntry.Status, Error: err.Error()}, nil
 	}
@@ -1325,8 +1327,20 @@ func (s *Core) ListAssets(pieceID string) ([]GeneratedAsset, error) {
 
 // ListGeneratedVideos returns completed generations that produced outputs
 // (videos today), enriched with project/piece/user context for the admin
-// gallery. Logs stay task-focused: one entry per task.
-func (s *Core) ListGeneratedVideos(page, limit int) (*ListLogsResponse, error) {
+// gallery. Logs stay task-focused: one entry per task. When eventID is set
+// only generations of that project (event) are returned.
+func (s *Core) ListGeneratedVideos(page, limit int, eventID string) (*ListLogsResponse, error) {
+	return s.listGeneratedByModality(page, limit, config.ModalityVideo, eventID)
+}
+
+// ListGeneratedImages returns completed image generations with the same
+// enriched context as videos, for the admin images gallery. Optional eventID
+// narrows the list to one project.
+func (s *Core) ListGeneratedImages(page, limit int, eventID string) (*ListLogsResponse, error) {
+	return s.listGeneratedByModality(page, limit, config.ModalityImage, eventID)
+}
+
+func (s *Core) listGeneratedByModality(page, limit int, modality, eventID string) (*ListLogsResponse, error) {
 	if s.logStore == nil {
 		return nil, fmt.Errorf("log store not available")
 	}
@@ -1334,8 +1348,9 @@ func (s *Core) ListGeneratedVideos(page, limit int) (*ListLogsResponse, error) {
 		Page:         page,
 		Limit:        limit,
 		Status:       config.STATUS_SUCCESS,
-		ResourceType: config.ModalityVideo,
+		ResourceType: modality,
 		HasOutputs:   true,
+		EventID:      eventID,
 	}
 	logs, total, err := s.logStore.ListByFilter(filter)
 	if err != nil {

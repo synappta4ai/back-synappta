@@ -22,9 +22,10 @@ const (
 type CredentialProvider string
 
 const (
-	ProviderBytePlus  CredentialProvider = "byteplus"
-	ProviderGemini    CredentialProvider = "gemini"
-	ProviderAnthropic CredentialProvider = "anthropic"
+	ProviderBytePlus   CredentialProvider = "byteplus"
+	ProviderGemini     CredentialProvider = "gemini"
+	ProviderAnthropic  CredentialProvider = "anthropic"
+	ProviderHiggsfield CredentialProvider = "higgsfield"
 )
 
 // ModelType distinguishes how a model is served:
@@ -202,6 +203,93 @@ var catalog = []Model{
 		BaseURL:     "https://api.anthropic.com",
 		Endpoint:    "/v1/messages",
 		DisplayName: "Claude Text",
+	},
+
+	// ─── Video (Higgsfield) ──────────────────────────────────
+	{
+		Name: "higgsfield-kling-3-0-turbo-t2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/kling-video/v3.0-turbo/text-to-video",
+		DisplayName: "Kling 3.0 Turbo",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "9:16", "1:1"},
+			Resolutions: []string{"720p", "1080p"},
+			Durations:   []int{3, 5, 10, 15},
+		},
+	},
+	{
+		Name: "higgsfield-wan-2-6-reference", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/wan/v2.6/reference-to-video",
+		DisplayName: "Wan 2.6 Reference",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
+			Resolutions: []string{"720p", "1080p"},
+			Durations:   []int{5, 10},
+		},
+	},
+	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai.
+	{
+		Name: "higgsfield-seedance-2-5-t2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/bytedance/seedance-2.5/text-to-video",
+		DisplayName: "Seedance 2.5",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "4:3", "1:1", "3:4", "9:16", "21:9"},
+			Resolutions: []string{"480p", "720p"},
+			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
+		},
+	},
+	{
+		Name: "higgsfield-seedance-2-5-i2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/bytedance/seedance-2.5/image-to-video",
+		DisplayName: "Seedance 2.5 (Imagen a Video)",
+		Defaults: Defaults{
+			Ratios:      nil, // framing follows the input image
+			Resolutions: []string{"480p", "720p"},
+			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
+		},
+	},
+	{
+		Name: "higgsfield-minimax-h3-t2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/minimax/h3/text-to-video",
+		DisplayName: "MiniMax H3 (2K)",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "4:3", "1:1", "3:4", "9:16", "21:9"},
+			Resolutions: []string{"2K"},
+			Durations:   []int{5, 8, 10, 12, 15},
+		},
+	},
+	{
+		Name: "higgsfield-ltx-2-5-pro-t2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/lightricks/ltx-2.5/text-to-video/pro",
+		DisplayName: "LTX 2.5 Pro",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "9:16"},
+			Resolutions: []string{"720p", "1080p"},
+			Durations:   []int{6, 8, 10},
+		},
+	},
+	{
+		Name: "higgsfield-happyhorse-1-1-t2v", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/alibaba/happy-horse/v1.1/text-to-video",
+		DisplayName: "HappyHorse 1.1",
+		Defaults: Defaults{
+			Ratios:      []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
+			Resolutions: []string{"720p", "1080p"},
+			Durations:   []int{3, 5, 8, 10, 15},
+		},
 	},
 }
 
