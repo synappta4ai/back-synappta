@@ -94,7 +94,7 @@ func (g *HiggsfieldGenerator) Validate(req *agency.GeneratorRequest) error {
 func (g *HiggsfieldGenerator) Generate(req *agency.GeneratorRequest) (*agency.GeneratorResult, error) {
 	payload := g.BuildPayload(req)
 
-	authKey := req.APIKey
+	authKey := req.AuthKey
 	result, err := g.doRequest(req.BaseURL+req.Endpoint, "POST", payload, authKey)
 	if err != nil {
 		return nil, err

@@ -144,8 +144,8 @@ func (s *Core) resolveProvider(m *modelRef) (*credential.Resolve, error) {
 	if res == nil {
 		return nil, fmt.Errorf("no credentials configured for provider %q — add them in admin → tenants → gestionar", m.CredentialProvider)
 	}
-	if res.APIKey == "" {
-		return nil, fmt.Errorf("provider %q has no API key configured — generation needs an API key (AK/SK is only used for gallery sync); add it in admin → tenants → gestionar", m.CredentialProvider)
+	if res.AuthKey() == "" {
+		return nil, fmt.Errorf("provider %q has no credentials for generation — add an API key or Key ID + Key Secret in admin → tenants → gestionar", m.CredentialProvider)
 	}
 	return res, nil
 }
@@ -1268,6 +1268,15 @@ func (s *Core) ListLogs(f ListLogsFilter) (*ListLogsResponse, error) {
 		totalPages = 1
 	}
 	return &ListLogsResponse{Logs: logs, Total: total, Page: f.Page, Limit: f.Limit, TotalPages: totalPages}, nil
+}
+
+// RecentTasksForUser returns the caller's recent generations (any modality),
+// newest first — powers the studio take-reel hydration after a page reload.
+func (s *Core) RecentTasksForUser(userID int64, limit int) ([]GenerationLog, error) {
+	if s.logStore == nil {
+		return nil, fmt.Errorf("log store not available")
+	}
+	return s.logStore.ListRecentByUser(userID, limit)
 }
 
 // SumLogsCost returns the total estimated cost for filtered logs.

@@ -15,3 +15,7 @@ outputs/
 
 # Go
 vendor/
+
+# Logs and editor backups
+*.log
+*~

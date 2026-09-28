@@ -368,6 +368,32 @@ func (s *GenerationLogStore) SumCostByFilter(f ListLogsFilter) (float64, error) 
 	return total, nil
 }
 
+// ListRecentByUser returns the user's most recent generations (own rows only).
+// Includes the request payload so clients can rebuild the original studio
+// request (prompt, ratio, resolution, duration) after a page reload.
+func (s *GenerationLogStore) ListRecentByUser(userID int64, limit int) ([]GenerationLog, error) {
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`SELECT `+genLogFullCols+`, `+genLogJoinCols+` `+genLogFromJoins+`
+		WHERE gl.deleted_at IS NULL AND gl.user_id = $1
+		ORDER BY gl.created_at DESC LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []GenerationLog
+	for rows.Next() {
+		var l GenerationLog
+		if err := s.scanDetailRow(&l, rows); err != nil {
+			return nil, err
+		}
+		logs = append(logs, l)
+	}
+	return logs, rows.Err()
+}
+
 // ListNonFinalTaskIDs returns task ids with a non-terminal status (reconciler input).
 func (s *GenerationLogStore) ListNonFinalTaskIDs(limit int) ([]GenerationLog, error) {
 	rows, err := s.db.Query(`SELECT `+genLogFullCols+`, `+genLogJoinCols+` `+genLogFromJoins+`

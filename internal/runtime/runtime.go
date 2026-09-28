@@ -247,6 +247,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
 	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	core.RegisterGenerator(agencyimage.NewHiggsfieldImageGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -226,6 +227,29 @@ func TestListByModalityMerged(t *testing.T) {
 	// Static video models (3 seedance + 7 higgsfield) + live Wan = 11.
 	if code != http.StatusOK || len(env.Data) != 11 {
 		t.Fatalf("video merged: want 11, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	}
+}
+
+func TestListImageMerged(t *testing.T) {
+	m, _ := setup(t)
+
+	c, w := testCtx(t, "/api/v1/models/image")
+	c.Params = gin.Params{{Key: "modality", Value: "image"}}
+	m.ListByModality(c)
+	env, code := decode(t, w)
+
+	// Static image models (2 gemini + seedream + 3 higgsfield) + live Wan image.
+	if code != http.StatusOK || len(env.Data) < 6 {
+		t.Fatalf("image merged: want >= 6, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	}
+	hf := 0
+	for _, mm := range env.Data {
+		if strings.Contains(mm.Name, "higgsfield") {
+			hf++
+		}
+	}
+	if hf != 3 {
+		t.Fatalf("image merged: want 3 higgsfield models, got %d", hf)
 	}
 }
 

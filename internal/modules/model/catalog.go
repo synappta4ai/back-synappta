@@ -291,6 +291,42 @@ var catalog = []Model{
 			Durations:   []int{3, 5, 8, 10, 15},
 		},
 	},
+
+	// ─── Image (Higgsfield) ──────────────────────────────
+	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai.
+	{
+		Name: "higgsfield-soul-2-standard", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/higgsfield-ai/soul/v2/standard",
+		DisplayName: "Soul 2",
+		Defaults: Defaults{
+			Ratios:      []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
+			Resolutions: []string{"2K", "4K"},
+		},
+	},
+	{
+		Name: "higgsfield-ideogram-4-0", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/ideogram/v4.0",
+		DisplayName: "Ideogram 4.0",
+		Defaults: Defaults{
+			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
+			Resolutions: nil, // no resolution tier: rendering_speed-driven
+		},
+	},
+	{
+		Name: "higgsfield-recraft-4-1", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/recraft/v4.1/text-to-image",
+		DisplayName: "Recraft 4.1",
+		Defaults: Defaults{
+			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
+			Resolutions: []string{"1K"},
+		},
+	},
 }
 
 // init labels the static catalog: every entry without worker details is an

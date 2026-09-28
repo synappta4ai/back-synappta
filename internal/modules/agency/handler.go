@@ -76,6 +76,22 @@ func (h *Handler) ListGenerationLogs(c *gin.Context) {
 	utils.Success(c, result)
 }
 
+// RecentTasks handles GET /agency/tasks/recent — the caller's own recent
+// generations (newest first) so the client can restore the take reel after
+// a page reload. Query: ?limit= (default 20, max 100).
+func (h *Handler) RecentTasks(c *gin.Context) {
+	limit := atoiDefault(c.Query("limit"), 20)
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	tasks, err := h.core.RecentTasksForUser(utils.UserIDFromContext(c), limit)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, tasks)
+}
+
 // GetGenerationLogsCostSummary handles GET /agency/logs/generation/cost-summary
 func (h *Handler) GetGenerationLogsCostSummary(c *gin.Context) {
 	var f ListLogsFilter
@@ -233,6 +249,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 			logs.GET("/server-communications/:id", m.priv("GetServerCommunication"))
 		}
 
+		// The caller's recent tasks (own rows only) — take-reel hydration.
+		g.GET("/tasks/recent", m.priv("RecentTasks"))
+
 		// Generated assets + videos gallery (admin-only)
 		gallery := g.Group("")
 		gallery.Use(adminMw)
@@ -263,6 +282,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListSyncedAssets(c)
 		case "ListGenerationLogs":
 			hdl.ListGenerationLogs(c)
+		case "RecentTasks":
+			hdl.RecentTasks(c)
 		case "GetGenerationLogsCostSummary":
 			hdl.GetGenerationLogsCostSummary(c)
 		case "GetGenerationLog":
