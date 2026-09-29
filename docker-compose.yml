@@ -3,6 +3,7 @@ version: "3.9"
 services:
   api:
     build: .
+    container_name: ${CONTAINER_NAME:-synapta-back-v0}
     environment:
       - APP_ENV=${APP_ENV}
       - PORT=${PORT}
@@ -16,8 +17,6 @@ services:
       # gRPC + artifact server. Sin worker, el catálogo downloaded no aparece.
       - BM_WORKER_ADDR=${BM_WORKER_ADDR}
       - BM_WORKER_ARTIFACT_BASE=${BM_WORKER_ARTIFACT_BASE}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "${PORT}:${PORT}"
     volumes:
