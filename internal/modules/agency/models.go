@@ -17,6 +17,8 @@ type modelEntry struct {
 	Generator          string
 	BaseURL            string
 	Endpoint           string
+	ImageEndpoint      string
+	ReferenceEndpoint  string
 	GallerySync        bool
 	Type               model.ModelType
 }
@@ -33,6 +35,8 @@ func LookupModel(name string) *modelEntry {
 			Generator:          m.Generator,
 			BaseURL:            m.BaseURL,
 			Endpoint:           m.Endpoint,
+			ImageEndpoint:      m.ImageEndpoint,
+			ReferenceEndpoint:  m.ReferenceEndpoint,
 			GallerySync:        m.GallerySync,
 			Type:               model.TypeAPI,
 		}

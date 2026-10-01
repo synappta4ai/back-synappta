@@ -186,10 +186,13 @@ func (g *HiggsfieldGenerator) CancelTask(taskID, apiKey, baseURL, endpoint strin
 
 // BuildPayload builds the flat Higgsfield JSON body for the endpoint.
 // Text-to-video endpoints take prompt/duration/resolution/aspect_ratio.
-// Reference endpoints (wan reference-to-video, genjutsu…) take image_urls /
-// video_urls arrays; image-to-video endpoints (seedance …/image-to-video,
-// model names with "-i2v") take the singular image_url. The schemas are
-// strict (additionalProperties:false) so only the documented shape is sent.
+// Reference endpoints (seedance …/reference-to-video, wan reference-to-video,
+// genjutsu…) take image_urls / video_urls / audio_urls arrays; image-to-video
+// endpoints (seedance …/image-to-video, model names with "-i2v") take the
+// singular image_url. The schemas are strict (additionalProperties:false) and
+// providers silently DROP unknown fields, so the request is routed by
+// content: one image rides the verified i2v twin; multiple references ride
+// the multi-reference route.
 func (g *HiggsfieldGenerator) BuildPayload(req *agency.GeneratorRequest) map[string]interface{} {
 	payload := map[string]interface{}{
 		"prompt": agency.CompileContentText(req.Content),
@@ -207,6 +210,7 @@ func (g *HiggsfieldGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 
 	imageURLs := make([]string, 0, 3)
 	videoURLs := make([]string, 0, 3)
+	audioURLs := make([]string, 0, 3)
 	for _, item := range req.Content {
 		switch item.Type {
 		case "image":
@@ -217,20 +221,58 @@ func (g *HiggsfieldGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 			if item.DataURL != "" {
 				videoURLs = append(videoURLs, item.DataURL)
 			}
+		case "audio":
+			if item.DataURL != "" {
+				audioURLs = append(audioURLs, item.DataURL)
+			}
 		}
 	}
 
+	// Content-based routing: a text-to-video model with reference images gets
+	// redirected to its image-to-video twin (when the catalog defines one).
+	// Rationale: t2v schemas reject unknown fields, so an image sent as
+	// image_urls/image_url to a t2v endpoint is silently ignored and the model
+	// "invents" the subject from the prompt alone.
 	lowerModel := strings.ToLower(req.Model)
-	useSingularImage := strings.Contains(lowerModel, "-i2v") || strings.Contains(lowerModel, "image-to-video")
+	useSingularImage := false
+	switch {
+	case strings.Contains(lowerModel, "-i2v"), strings.Contains(lowerModel, "image-to-video"),
+		strings.HasSuffix(req.Endpoint, "/image-to-video"):
+		// Dedicated image-to-video route: the schema takes one image_url.
+		useSingularImage = true
+	case strings.Contains(lowerModel, "reference"), strings.HasSuffix(req.Endpoint, "/reference-to-video"):
+		// Dedicated multi-reference route: image_urls / video_urls arrays are
+		// the documented shape — no rerouting needed.
+	default:
+		// Content-based routing for text-to-video models. Rationale: t2v
+		// schemas reject unknown fields, so references sent to a t2v endpoint
+		// are silently ignored and the model "invents" the subject. Exactly
+		// one image rides the verified i2v twin; multiple references (or any
+		// video/audio) need the multi-reference route, which keeps aspect_ratio.
+		switch {
+		case len(imageURLs) == 1 && len(videoURLs) == 0 && len(audioURLs) == 0 && req.ImageEndpoint != "":
+			req.Endpoint = req.ImageEndpoint
+			useSingularImage = true
+		case (len(imageURLs) > 1 || len(videoURLs) > 0 || len(audioURLs) > 0) && req.ReferenceEndpoint != "":
+			req.Endpoint = req.ReferenceEndpoint
+		}
+	}
+
 	if len(imageURLs) > 0 {
 		if useSingularImage {
 			payload["image_url"] = imageURLs[0]
+			// The i2v schema has no aspect_ratio: framing follows the input
+			// image, so the text-to-video aspect selection must not leak in.
+			delete(payload, "aspect_ratio")
 		} else {
 			payload["image_urls"] = imageURLs
 		}
 	}
 	if len(videoURLs) > 0 {
 		payload["video_urls"] = videoURLs
+	}
+	if len(audioURLs) > 0 {
+		payload["audio_urls"] = audioURLs
 	}
 	return payload
 }

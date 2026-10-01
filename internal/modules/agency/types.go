@@ -133,9 +133,20 @@ type GeneratorRequest struct {
 	APIKey        string
 	// AuthKey is the credential material for the Authorization header:
 	// plain APIKey for most providers, "keyID:secret" for Higgsfield.
-	AuthKey  string
-	BaseURL  string
+	AuthKey string
+	BaseURL string
+	// Endpoint is the primary submit route (usually text-to-video).
 	Endpoint string
+	// ImageEndpoint is the model's verified image-to-video twin route, when the
+	// provider splits t2v/i2v into separate endpoints. When the request content
+	// carries reference images, the core switches Endpoint to ImageEndpoint so
+	// the reference image is actually honored by the provider.
+	ImageEndpoint string
+	// ReferenceEndpoint is the multi-reference route (image_urls / video_urls /
+	// audio_urls arrays). The generator switches Endpoint here when the request
+	// carries more than one reference, which the single-image i2v route cannot
+	// express.
+	ReferenceEndpoint string
 }
 
 // GeneratorResult is the response returned by a generator.

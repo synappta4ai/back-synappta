@@ -321,6 +321,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
 	if m.Type != model.TypeDownloaded {
 		genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+		genReq.ImageEndpoint = m.ImageEndpoint
+		genReq.ReferenceEndpoint = m.ReferenceEndpoint
 	}
 	if req.GenerateAudio != nil {
 		genReq.GenerateAudio = *req.GenerateAudio
@@ -770,6 +772,8 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
 	if m.Type != model.TypeDownloaded {
 		genReq.BaseURL, genReq.Endpoint = resolveRoute(m, creds)
+		genReq.ImageEndpoint = m.ImageEndpoint
+		genReq.ReferenceEndpoint = m.ReferenceEndpoint
 	}
 	if req.GenerateAudio != nil {
 		genReq.GenerateAudio = *req.GenerateAudio

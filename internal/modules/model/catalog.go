@@ -67,6 +67,15 @@ type Model struct {
 	BaseURL string `json:"base_url,omitempty"`
 	// Endpoint is the provider API route appended to BaseURL.
 	Endpoint string `json:"endpoint,omitempty"`
+	// ImageEndpoint is the model's verified image-to-video twin route. When a
+	// generation request carries reference images, the core submits to this
+	// route instead of Endpoint (text-to-video schemas silently drop image
+	// fields, which would ignore the user's reference entirely).
+	ImageEndpoint string `json:"image_endpoint,omitempty"`
+	// ReferenceEndpoint is the model's multi-reference route (image_urls /
+	// video_urls / audio_urls arrays). Used when the request carries more than
+	// one reference, which the single-image i2v route cannot express.
+	ReferenceEndpoint string `json:"reference_endpoint,omitempty"`
 	// GallerySync: uploads reference files to the BytePlus asset library
 	// before generation and references them as asset://<id>.
 	GallerySync bool `json:"gallery_sync"`
@@ -231,12 +240,17 @@ var catalog = []Model{
 		},
 	},
 	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai.
+	// ImageEndpoint routes a t2v model with reference images to its verified
+	// image-to-video twin (the strict t2v schema silently DROPS unknown fields
+	// like image_urls, so the reference image would be ignored).
 	{
 		Name: "higgsfield-seedance-2-5-t2v", Modality: ModalityVideo,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/bytedance/seedance-2.5/text-to-video",
-		DisplayName: "Seedance 2.5",
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/bytedance/seedance-2.5/text-to-video",
+		ImageEndpoint:     "/bytedance/seedance-2.5/image-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+		DisplayName:       "Seedance 2.5",
 		Defaults: Defaults{
 			Ratios:      []string{"16:9", "4:3", "1:1", "3:4", "9:16", "21:9"},
 			Resolutions: []string{"480p", "720p"},
@@ -246,9 +260,10 @@ var catalog = []Model{
 	{
 		Name: "higgsfield-seedance-2-5-i2v", Modality: ModalityVideo,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/bytedance/seedance-2.5/image-to-video",
-		DisplayName: "Seedance 2.5 (Imagen a Video)",
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/bytedance/seedance-2.5/image-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+		DisplayName:       "Seedance 2.5 (Imagen a Video)",
 		Defaults: Defaults{
 			Ratios:      nil, // framing follows the input image
 			Resolutions: []string{"480p", "720p"},
