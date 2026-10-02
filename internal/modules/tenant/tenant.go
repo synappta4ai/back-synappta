@@ -20,13 +20,19 @@ import (
 
 // TenantView is the API representation of a tenant.
 type TenantView struct {
-	ID        int64     `json:"id"`
-	Slug      string    `json:"slug"`
-	Name      string    `json:"name"`
-	Active    bool      `json:"active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID     int64  `json:"id"`
+	Slug   string `json:"slug"`
+	Name   string `json:"name"`
+	Active bool   `json:"active"`
+	// Permisos base de la empresa: aplican a todos sus usuarios (migración 00003).
+	Permissions []string  `json:"permissions"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
+
+// tenantColumns are the shared SELECT columns for tenant rows; permissions
+// viaja serializado como JSON porque database/sql no escanea text[] directo.
+const tenantColumns = `id, slug, name, active, to_jsonb(COALESCE(permissions, '{}'::text[]))::text, created_at, updated_at`
 
 // Store reads/writes tenant rows in the system schema.
 type Store struct {
@@ -37,9 +43,13 @@ func NewStore(db *sql.DB) *Store { return &Store{db: db} }
 
 func (s *Store) ByID(id int64) (*TenantView, error) {
 	var t TenantView
+	var permsJSON string
 	err := s.db.QueryRow(
-		`SELECT id, slug, name, active, created_at, updated_at FROM tenants WHERE id = $1`, id,
-	).Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &t.CreatedAt, &t.UpdatedAt)
+		`SELECT `+tenantColumns+` FROM tenants WHERE id = $1`, id,
+	).Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &permsJSON, &t.CreatedAt, &t.UpdatedAt)
+	if err == nil {
+		t.Permissions = parsePermsJSON(permsJSON)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -50,7 +60,7 @@ func (s *Store) ByID(id int64) (*TenantView, error) {
 }
 
 func (s *Store) List() ([]TenantView, error) {
-	rows, err := s.db.Query(`SELECT id, slug, name, active, created_at, updated_at FROM tenants ORDER BY id`)
+	rows, err := s.db.Query(`SELECT ` + tenantColumns + ` FROM tenants ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,12 +68,25 @@ func (s *Store) List() ([]TenantView, error) {
 	var out []TenantView
 	for rows.Next() {
 		var t TenantView
-		if err := rows.Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		var permsJSON string
+		if err := rows.Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &permsJSON, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
+		t.Permissions = parsePermsJSON(permsJSON)
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// SetPermissions replaces the tenant's base permissions (inherited by all
+// its users on top of their own extras).
+func (s *Store) SetPermissions(id int64, perms []string) error {
+	result, err := s.db.Exec(
+		`UPDATE tenants SET permissions = $1, updated_at = NOW() WHERE id = $2`, perms, id)
+	if err != nil {
+		return err
+	}
+	return requireRows(result)
 }
 
 // Service orchestrates tenant lifecycle via the tenancy provisioner.
@@ -174,8 +197,8 @@ func (s *Service) UpsertCredentialForTenant(id int64, req *credential.UpsertRequ
 // Secrets travel in PLAINTEXT — the file must be handled like the raw API
 // keys it holds.
 type CredentialsExport struct {
-	Version     int                            `json:"version"`
-	ExportedAt  time.Time                      `json:"exported_at"`
+	Version     int                             `json:"version"`
+	ExportedAt  time.Time                       `json:"exported_at"`
 	Credentials []credential.ExportedCredential `json:"credentials"`
 }
 
@@ -263,7 +286,7 @@ func (s *Service) Create(name, slug string) (*TenantView, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &TenantView{ID: t.ID, Slug: t.Slug, Name: t.Name, Active: t.Active, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}, nil
+	return &TenantView{ID: t.ID, Slug: t.Slug, Name: t.Name, Active: t.Active, Permissions: []string{}, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}, nil
 }
 
 // List returns all tenants.
@@ -465,6 +488,32 @@ func (h *Handler) TenantImportCredentials(c *gin.Context) {
 	utils.Success(c, gin.H{"imported": imported})
 }
 
+// TenantPermissions handles PUT /tenants/:id/permissions (platform superadmin).
+// Body: {permissions: ["..."]} — replaces the company-level permission set.
+func (h *Handler) TenantPermissions(c *gin.Context) {
+	id, ok := parseTenantID(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Permissions []string `json:"permissions"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	perms, err := normalizePermissions(req.Permissions)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	if err := h.svc.store.SetPermissions(id, perms); err != nil {
+		utils.NotFound(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"permissions": perms})
+}
+
 // Deactivate handles PATCH /tenants/:id/deactivate (platform superadmin)
 func (h *Handler) Deactivate(c *gin.Context) {
 	var id int64
@@ -530,6 +579,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
 			g.GET("/platform-users", usersHdl.ListPlatformUsers)
 			g.GET("/:id/users", usersHdl.List)
 			g.POST("/:id/users", usersHdl.Create)
+			g.PUT("/:id/permissions", m.hdl.TenantPermissions)
 			g.PATCH("/:id/users/:userId/role", usersHdl.UpdateRole)
 			g.PUT("/:id/users/:userId/permissions", usersHdl.UpdatePermissions)
 			g.DELETE("/:id/users/:userId", usersHdl.Remove)

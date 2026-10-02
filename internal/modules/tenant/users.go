@@ -1,7 +1,10 @@
 // Gestión de usuarios por tenant (plataforma superadmin):
 // crea usuarios globales con membresía en la empresa, cambia su rol y sus
-// permisos por tenant, y los quita. Los permisos viven en
-// tenant_memberships.permissions (migración 00002) y viajan en el JWT al login.
+// permisos por tenant, y los quita. Los permisos efectivos de un usuario son
+// la UNIÓN de los permisos base de la empresa (tenants.permissions, migración
+// 00003) y los extras por membresía (tenant_memberships.permissions, 00002);
+// esa unión viaja en el JWT al login. El rol 0 (SUPER_ADMIN) nunca se asigna
+// por esta vía: los endpoints lo rechazan.
 package tenant
 
 import (
@@ -224,10 +227,15 @@ func (s *memberStore) removeMember(tenantID, userID int64) error {
 	return requireRows(result)
 }
 
-// membershipsForUser returns (tenantID, roleLevel, permissions) of every active membership.
+// membershipsForUser returns (tenantID, roleLevel, effectivePermissions) of
+// every active membership. Effective = empresa (tenants.permissions) ∪ extras
+// de la membresía, para que cambiar los permisos de la empresa afecte en el
+// acto a todos sus usuarios.
 func (s *memberStore) membershipsForUser(userID int64) ([]tenancy.Membership, error) {
 	rows, err := s.db.Query(`
-		SELECT m.tenant_id, m.role_level, to_jsonb(COALESCE(m.permissions, '{}'::text[]))::text
+		SELECT m.tenant_id, m.role_level,
+		       to_jsonb(COALESCE(m.permissions, '{}'::text[]))::text,
+		       to_jsonb(COALESCE(t.permissions, '{}'::text[]))::text
 		FROM tenant_memberships m
 		JOIN tenants t ON t.id = m.tenant_id
 		WHERE m.user_id = $1 AND t.active = true`, userID)
@@ -238,11 +246,11 @@ func (s *memberStore) membershipsForUser(userID int64) ([]tenancy.Membership, er
 	var out []tenancy.Membership
 	for rows.Next() {
 		var m tenancy.Membership
-		var permsJSON string
-		if err := rows.Scan(&m.TenantID, &m.RoleLevel, &permsJSON); err != nil {
+		var memberJSON, tenantJSON string
+		if err := rows.Scan(&m.TenantID, &m.RoleLevel, &memberJSON, &tenantJSON); err != nil {
 			return nil, err
 		}
-		m.Permissions = parsePermsJSON(permsJSON)
+		m.Permissions = unionPerms(parsePermsJSON(memberJSON), parsePermsJSON(tenantJSON))
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -254,6 +262,28 @@ func requireRows(result sql.Result) error {
 		return errors.New("membresía no encontrada")
 	}
 	return nil
+}
+
+// unionPerms merges two permission sets; '*' gana sobre todo lo demás.
+func unionPerms(sets ...[]string) []string {
+	for _, set := range sets {
+		for _, p := range set {
+			if p == "*" {
+				return []string{"*"}
+			}
+		}
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, set := range sets {
+		for _, p := range set {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 func roleNameFor(level int) string {
@@ -347,8 +377,8 @@ func (h *TenantUsersHandler) Create(c *gin.Context) {
 	}
 	roleLevel := 3
 	if req.RoleLevel != nil {
-		if *req.RoleLevel < 0 || *req.RoleLevel > 3 {
-			utils.BadRequest(c, "role_level debe estar entre 0 y 3")
+		if *req.RoleLevel < 1 || *req.RoleLevel > 3 {
+			utils.BadRequest(c, "role_level debe estar entre 1 (ADMIN) y 3 (USER); SUPER_ADMIN no se asigna por esta vía")
 			return
 		}
 		roleLevel = *req.RoleLevel
@@ -393,6 +423,7 @@ func (h *TenantUsersHandler) Create(c *gin.Context) {
 }
 
 // UpdateRole handles PATCH /tenants/:id/users/:userId/role  {role_level}
+// (rol 0/SUPER_ADMIN rechazado: solo existe el superadmin de plataforma).
 func (h *TenantUsersHandler) UpdateRole(c *gin.Context) {
 	tenantID, userID, ok := parseTwoIDs(c)
 	if !ok {
@@ -402,11 +433,11 @@ func (h *TenantUsersHandler) UpdateRole(c *gin.Context) {
 		RoleLevel *int `json:"role_level"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.RoleLevel == nil {
-		utils.BadRequest(c, "role_level requerido (0-3)")
+		utils.BadRequest(c, "role_level requerido (1-3)")
 		return
 	}
-	if *req.RoleLevel < 0 || *req.RoleLevel > 3 {
-		utils.BadRequest(c, "role_level debe estar entre 0 y 3")
+	if *req.RoleLevel < 1 || *req.RoleLevel > 3 {
+		utils.BadRequest(c, "role_level debe estar entre 1 (ADMIN) y 3 (USER); SUPER_ADMIN no se asigna por esta vía")
 		return
 	}
 	if err := h.store.updateRole(tenantID, userID, *req.RoleLevel); err != nil {

@@ -176,10 +176,15 @@ func (p *Provisioner) MembershipRoleLevel(tenantID, userID int64) (int, error) {
 	return level, err
 }
 
-// MembershipsForUser returns every active membership (tenant, role, permissions).
+// MembershipsForUser returns every active membership (tenant, role,
+// effective permissions). Effective = permisos de la empresa (tenants.permissions)
+// ∪ extras de la membresía, para que los cambios a nivel de empresa alcancen
+// a todos sus usuarios.
 func (p *Provisioner) MembershipsForUser(userID int64) ([]Membership, error) {
 	rows, err := p.reg.System().Query(`
-		SELECT m.tenant_id, m.role_level, to_jsonb(COALESCE(m.permissions, '{}'::text[]))::text
+		SELECT m.tenant_id, m.role_level,
+		       to_jsonb(COALESCE(m.permissions, '{}'::text[]))::text,
+		       to_jsonb(COALESCE(t.permissions, '{}'::text[]))::text
 		FROM tenant_memberships m
 		JOIN tenants t ON t.id = m.tenant_id
 		WHERE m.user_id = $1 AND t.active = true`, userID)
@@ -190,14 +195,36 @@ func (p *Provisioner) MembershipsForUser(userID int64) ([]Membership, error) {
 	var out []Membership
 	for rows.Next() {
 		var m Membership
-		var permsJSON string
-		if err := rows.Scan(&m.TenantID, &m.RoleLevel, &permsJSON); err != nil {
+		var memberJSON, tenantJSON string
+		if err := rows.Scan(&m.TenantID, &m.RoleLevel, &memberJSON, &tenantJSON); err != nil {
 			return nil, err
 		}
-		m.Permissions = parsePermsJSON(permsJSON)
+		m.Permissions = unionPerms(parsePermsJSON(memberJSON), parsePermsJSON(tenantJSON))
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// unionPerms merges two permission sets; '*' gana sobre todo lo demás.
+func unionPerms(sets ...[]string) []string {
+	for _, set := range sets {
+		for _, p := range set {
+			if p == "*" {
+				return []string{"*"}
+			}
+		}
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, set := range sets {
+		for _, p := range set {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // parsePermsJSON parses a JSON array of strings (to_jsonb of a text[]);
