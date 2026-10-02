@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,19 +28,19 @@ var (
 
 // User is a platform user row.
 type User struct {
-	ID           int64          `json:"id"`
-	Username     string         `json:"username"`
-	Name         string         `json:"name"`
-	Surname      string         `json:"surname"`
-	UserName     string         `json:"user_name"`
-	Email        string         `json:"email"`
-	PlatformRole int            `json:"platform_role"`
-	Active       bool           `json:"active"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
-	DeletedAt    *time.Time     `json:"deleted_at,omitempty"`
-	PasswordHash string         `json:"-"`
-	Preferences  Preferences  `json:"preferences,omitempty"`
+	ID           int64       `json:"id"`
+	Username     string      `json:"username"`
+	Name         string      `json:"name"`
+	Surname      string      `json:"surname"`
+	UserName     string      `json:"user_name"`
+	Email        string      `json:"email"`
+	PlatformRole int         `json:"platform_role"`
+	Active       bool        `json:"active"`
+	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+	DeletedAt    *time.Time  `json:"deleted_at,omitempty"`
+	PasswordHash string      `json:"-"`
+	Preferences  Preferences `json:"preferences,omitempty"`
 }
 
 // Preferences is a JSONB value type for user preferences.
@@ -184,6 +185,31 @@ func (s *Store) FirstTenantForUser(userID int64) (int64, string, error) {
 	return id, slug, err
 }
 
+// TenantForUser validates that the user is a member of the given active tenant.
+// Returns the tenant id + slug, or 0 when there is no membership.
+func (s *Store) TenantForUser(userID, tenantID int64) (int64, string, error) {
+	var id int64
+	var slug string
+	err := s.db.QueryRow(`
+		SELECT t.id, t.slug FROM tenants t
+		JOIN tenant_memberships m ON m.tenant_id = t.id
+		WHERE m.user_id = $1 AND m.tenant_id = $2 AND t.active = true`, userID, tenantID).Scan(&id, &slug)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	return id, slug, err
+}
+
+// TenantSlugByID returns the slug of an active tenant, or "" when missing.
+func (s *Store) TenantSlugByID(tenantID int64) (string, error) {
+	var slug string
+	err := s.db.QueryRow(`SELECT slug FROM tenants WHERE id = $1 AND active = true`, tenantID).Scan(&slug)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return slug, err
+}
+
 // UpdateUserActive toggles a user's active flag.
 func (s *Store) UpdateUserActive(id int64, active bool) error {
 	result, err := s.db.Exec(`UPDATE users SET active = $1, updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`, active, id)
@@ -230,6 +256,34 @@ func (s *Store) UpdateThemePreferences(userID int64, theme ThemePreferences) err
 		`UPDATE users SET preferences = jsonb_set(COALESCE(preferences, '{}'), '{theme}', $1::jsonb, true),
 		updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`,
 		theme, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("user not found")
+	}
+	return nil
+}
+
+// UpdateAvatarPreference stores (or, when both are empty, clears) the user's
+// profile avatar: the owning file id plus its cached public serve URL.
+func (s *Store) UpdateAvatarPreference(userID int64, fileID, url string) error {
+	if fileID == "" && url == "" {
+		result, err := s.db.Exec(
+			`UPDATE users SET preferences = COALESCE(preferences, '{}') - ARRAY['avatar_file_id','avatar_url']::text[],
+			updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, userID)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n == 0 {
+			return errors.New("user not found")
+		}
+		return nil
+	}
+	result, err := s.db.Exec(
+		`UPDATE users SET preferences = jsonb_set(jsonb_set(COALESCE(preferences, '{}'), '{avatar_file_id}', to_jsonb($1::text), true), '{avatar_url}', to_jsonb($2::text), true),
+		updated_at = NOW() WHERE id = $3 AND deleted_at IS NULL`,
+		fileID, url, userID)
 	if err != nil {
 		return err
 	}
@@ -300,6 +354,22 @@ func (s *Service) SeedSuperAdmin() error {
 
 // Login verifies credentials and issues a tenant-scoped JWT.
 func (s *Service) Login(username, password string) (*TokenResponse, error) {
+	return s.loginAs(username, password, nil)
+}
+
+// LoginForTenant authenticates the user and issues a token scoped to the
+// given tenant (validating the membership). tenantPerms supplies the
+// membership permissions to embed in the token.
+func (s *Service) LoginForTenant(username, password string, tenantID int64, tenantPerms []string) (*TokenResponse, error) {
+	return s.loginAs(username, password, &loginTenant{ID: tenantID, Permissions: tenantPerms})
+}
+
+type loginTenant struct {
+	ID          int64
+	Permissions []string
+}
+
+func (s *Service) loginAs(username, password string, tenantSel *loginTenant) (*TokenResponse, error) {
 	user, err := s.store.GetUserByUsername(username)
 	if err != nil {
 		return nil, err
@@ -311,10 +381,38 @@ func (s *Service) Login(username, password string) (*TokenResponse, error) {
 		return nil, ErrInvalidCreds
 	}
 
-	// Default tenant = first active membership.
-	tenantID, tenantSlug, err := s.store.FirstTenantForUser(user.ID)
-	if err != nil {
-		return nil, err
+	// Default tenant = first active membership, or the explicitly selected one.
+	var tenantID int64
+	var tenantSlug string
+	var memberPerms []string
+	if tenantSel != nil && tenantSel.ID > 0 {
+		tenantID, tenantSlug, err = s.store.TenantForUser(user.ID, tenantSel.ID)
+		if err != nil {
+			return nil, err
+		}
+		memberPerms = tenantSel.Permissions
+		if tenantID == 0 && user.PlatformRole == 0 {
+			// El superadmin de plataforma opera en cualquier tenant activo
+			// (equivale al bypass X-Tenant-Slug del middleware).
+			slug, slugErr := s.store.TenantSlugByID(tenantSel.ID)
+			if slugErr != nil {
+				return nil, slugErr
+			}
+			if slug != "" {
+				tenantID, tenantSlug = tenantSel.ID, slug
+				if len(memberPerms) == 0 {
+					memberPerms = []string{"*"}
+				}
+			}
+		}
+		if tenantID == 0 {
+			return nil, ErrInvalidCreds
+		}
+	} else {
+		tenantID, tenantSlug, err = s.store.FirstTenantForUser(user.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()
@@ -333,6 +431,10 @@ func (s *Service) Login(username, password string) (*TokenResponse, error) {
 	if tenantID > 0 {
 		claims["tenant_id"] = tenantID
 		claims["tenant_slug"] = tenantSlug
+		if memberPerms == nil {
+			memberPerms = []string{}
+		}
+		claims["permissions"] = memberPerms
 	}
 
 	tokenStr, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(s.jwtSecret))
@@ -341,10 +443,11 @@ func (s *Service) Login(username, password string) (*TokenResponse, error) {
 	}
 
 	return &TokenResponse{
-		Token:      tokenStr,
-		User:       toResponse(user),
-		TenantID:   tenantID,
-		TenantSlug: tenantSlug,
+		Token:       tokenStr,
+		User:        toResponse(user),
+		TenantID:    tenantID,
+		TenantSlug:  tenantSlug,
+		Permissions: memberPerms,
 	}, nil
 }
 
@@ -433,6 +536,21 @@ func (s *Service) UpdateThemePreferences(userID int64, theme ThemePreferences) e
 	return s.store.UpdateThemePreferences(userID, theme)
 }
 
+// UpdateUserAvatar stores the user's profile avatar (file id + public serve
+// URL) or clears it when both values are empty. Returns the fresh profile.
+func (s *Service) UpdateUserAvatar(userID int64, avatarFileID, avatarURL string) (*UserResponse, error) {
+	if len(avatarFileID) > 128 {
+		return nil, errors.New("avatar_file_id too long")
+	}
+	if len(avatarURL) > 2048 {
+		return nil, errors.New("avatar_url too long")
+	}
+	if err := s.store.UpdateAvatarPreference(userID, avatarFileID, avatarURL); err != nil {
+		return nil, err
+	}
+	return s.GetUserProfile(userID)
+}
+
 func roleName(level int) string {
 	switch level {
 	case 0:
@@ -454,11 +572,18 @@ func orDefault(v, def string) string {
 }
 
 func toResponse(u *User) *UserResponse {
-	return &UserResponse{
+	resp := &UserResponse{
 		ID: u.ID, Username: u.Username, Name: u.Name, Surname: u.Surname,
 		UserName: u.UserName, Email: u.Email, RoleLevel: u.PlatformRole,
 		RoleName: roleName(u.PlatformRole), Active: u.Active,
 	}
+	if v, ok := u.Preferences["avatar_file_id"].(string); ok {
+		resp.AvatarFileID = v
+	}
+	if v, ok := u.Preferences["avatar_url"].(string); ok {
+		resp.AvatarURL = v
+	}
+	return resp
 }
 
 // ─── DTOs ─────────────────────────────────────────────────────
@@ -487,13 +612,18 @@ type UserResponse struct {
 	RoleLevel int    `json:"role_level"`
 	RoleName  string `json:"role_name"`
 	Active    bool   `json:"active"`
+	// Profile avatar: owning file id plus the cached public serve URL,
+	// both persisted under users.preferences.
+	AvatarFileID string `json:"avatar_file_id,omitempty"`
+	AvatarURL    string `json:"avatar_url,omitempty"`
 }
 
 type TokenResponse struct {
-	Token      string        `json:"token"`
-	User       *UserResponse `json:"user"`
-	TenantID   int64         `json:"tenant_id"`
-	TenantSlug string        `json:"tenant_slug,omitempty"`
+	Token       string        `json:"token"`
+	User        *UserResponse `json:"user"`
+	TenantID    int64         `json:"tenant_id"`
+	TenantSlug  string        `json:"tenant_slug,omitempty"`
+	Permissions []string      `json:"permissions,omitempty"`
 }
 
 // ─── HTTP layer ───────────────────────────────────────────────
@@ -593,6 +723,36 @@ func (h *Handler) UpdateTheme(c *gin.Context) {
 	utils.Success(c, req.Theme)
 }
 
+// UpdateAvatar handles PUT /user/profile/avatar
+// Accepts {avatar_file_id, avatar_url}; both empty clears the avatar.
+func (h *Handler) UpdateAvatar(c *gin.Context) {
+	id := utils.UserIDFromContext(c)
+	if id <= 0 {
+		utils.Unauthorized(c, "invalid token")
+		return
+	}
+	var req struct {
+		AvatarFileID string `json:"avatar_file_id"`
+		AvatarURL    string `json:"avatar_url"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	fileID := strings.TrimSpace(req.AvatarFileID)
+	url := strings.TrimSpace(req.AvatarURL)
+	user, err := h.svc.UpdateUserAvatar(id, fileID, url)
+	if err != nil {
+		if strings.Contains(err.Error(), "user not found") {
+			utils.NotFound(c, err.Error())
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, user)
+}
+
 // ListUsers handles GET /admin/users
 func (h *Handler) ListUsers(c *gin.Context) {
 	users, err := h.svc.ListUsers()
@@ -646,6 +806,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, adminMw gin.HandlerFun
 	{
 		user.GET("/preferences/theme", m.hdl.GetTheme)
 		user.POST("/preferences/theme", m.hdl.UpdateTheme)
+		user.PUT("/profile/avatar", m.hdl.UpdateAvatar)
 	}
 
 	adm := rg.Group("/admin")

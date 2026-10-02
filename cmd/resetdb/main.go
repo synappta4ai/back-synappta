@@ -45,7 +45,11 @@ func main() {
 	rows.Close()
 
 	for _, s := range schemas {
-		if _, err := pool.ExecContext(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, s)); err != nil {
+		quoted, err := db.QuoteSchema(s)
+		if err != nil {
+			log.Fatalf("quote schema %s: %v", s, err)
+		}
+		if _, err := pool.ExecContext(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, quoted)); err != nil {
 			log.Fatalf("drop %s: %v", s, err)
 		}
 		fmt.Printf("dropped schema %s\n", s)

@@ -3,6 +3,7 @@ package tenancy
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -64,9 +65,14 @@ func (p *Provisioner) ProvisionSchema(slug string) error {
 	if !ValidSlug(slug) {
 		return fmt.Errorf("invalid tenant slug %q", slug)
 	}
+	// Los slugs admiten guion: el identificador debe ir comillado en SQL.
+	quotedSchema, err := QuotedSchemaName(slug)
+	if err != nil {
+		return err
+	}
 
 	// Create schema if missing (idempotent).
-	if _, err := p.reg.System().Exec(fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schema)); err != nil {
+	if _, err := p.reg.System().Exec(fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, quotedSchema)); err != nil {
 		return fmt.Errorf("failed to create schema %s: %w", schema, err)
 	}
 
@@ -96,7 +102,7 @@ func (p *Provisioner) ProvisionSchema(slug string) error {
 	// system migration creates goose_db_version in public; including
 	// public would let goose find that version=1 record and skip
 	// 00001_core.sql entirely for every tenant.
-	if _, err := pool.Exec(fmt.Sprintf("SET search_path TO %s", schema)); err != nil {
+	if _, err := pool.Exec(fmt.Sprintf("SET search_path TO %s", quotedSchema)); err != nil {
 		return fmt.Errorf("failed to set search_path for %s: %w", schema, err)
 	}
 
@@ -168,6 +174,43 @@ func (p *Provisioner) MembershipRoleLevel(tenantID, userID int64) (int, error) {
 		return -1, nil
 	}
 	return level, err
+}
+
+// MembershipsForUser returns every active membership (tenant, role, permissions).
+func (p *Provisioner) MembershipsForUser(userID int64) ([]Membership, error) {
+	rows, err := p.reg.System().Query(`
+		SELECT m.tenant_id, m.role_level, to_jsonb(COALESCE(m.permissions, '{}'::text[]))::text
+		FROM tenant_memberships m
+		JOIN tenants t ON t.id = m.tenant_id
+		WHERE m.user_id = $1 AND t.active = true`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Membership
+	for rows.Next() {
+		var m Membership
+		var permsJSON string
+		if err := rows.Scan(&m.TenantID, &m.RoleLevel, &permsJSON); err != nil {
+			return nil, err
+		}
+		m.Permissions = parsePermsJSON(permsJSON)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// parsePermsJSON parses a JSON array of strings (to_jsonb of a text[]);
+// database/sql no escanea text[] directo a []string.
+func parsePermsJSON(raw string) []string {
+	var perms []string
+	if raw == "" || raw == "[]" {
+		return []string{}
+	}
+	if err := json.Unmarshal([]byte(raw), &perms); err != nil || perms == nil {
+		return []string{}
+	}
+	return perms
 }
 
 // TenantIDBySlug resolves a slug to its tenant id, or 0 when missing.

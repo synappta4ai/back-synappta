@@ -23,13 +23,21 @@ import (
 	"synapta/internal/db"
 )
 
-var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,62}$`)
+// slugRe: slugs empiezan con alfanumérico, siguen [a-z0-9_-]; el máximo (55)
+// garantiza que tenant_<slug> quepa como identificador PostgreSQL (63 bytes).
+var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,54}$`)
 
 // ValidSlug reports whether a tenant slug is well-formed.
 func ValidSlug(slug string) bool { return slugRe.MatchString(slug) }
 
 // SchemaName maps a tenant slug to its PostgreSQL schema name.
 func SchemaName(slug string) string { return "tenant_" + slug }
+
+// QuotedSchemaName returns SchemaName(slug) safely quoted for SQL
+// interpolation. Slugs allow dashes, so the raw name is never SQL-safe.
+func QuotedSchemaName(slug string) (string, error) {
+	return db.QuoteSchema(SchemaName(slug))
+}
 
 type ctxKey int
 
@@ -43,6 +51,13 @@ type Tenant struct {
 	Active    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// Membership is a user's role + permission set inside one tenant.
+type Membership struct {
+	TenantID    int64
+	RoleLevel   int
+	Permissions []string
 }
 
 // Context injects a tenant into a request context.

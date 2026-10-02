@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -41,6 +42,7 @@ import (
 	"synapta/internal/modules/tenant"
 	"synapta/internal/runtime"
 	"synapta/internal/tenancy"
+	"synapta/internal/utils"
 	"synapta/internal/worker"
 )
 
@@ -148,6 +150,8 @@ func main() {
 	// ─── Modules ──────────────────────────────────────────────
 	registry := modules.NewRegistry()
 	registry.Register(auth.NewModule(auth.NewHandler(authSvc)))
+	tenantUsersHdl := tenant.NewTenantUsersHandler(sysDB)
+	tenant.SetTenantUsersHandler(tenantUsersHdl)
 	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner, reg, cfg.EncryptionKey))))
 	registry.Register(model.NewModule())
 
@@ -175,6 +179,45 @@ func main() {
 	registry.Register(agencyModule)
 
 	registry.Setup(v1, authMw, tenantMw, adminMw)
+
+	// ─── Login con selector de tenant (permisos por membresía) ─
+	v1.POST("/auth/login-tenant", func(c *gin.Context) {
+		var req struct {
+			Username string `json:"username" binding:"required"`
+			Password string `json:"password" binding:"required"`
+			TenantID int64  `json:"tenant_id" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			utils.BadRequest(c, err.Error())
+			return
+		}
+		memberships, err := tenantUsersHdl.MembershipsForUserByUsername(req.Username)
+		if err != nil {
+			utils.InternalError(c, "internal server error")
+			return
+		}
+		var perms []string
+		for _, m := range memberships {
+			if m.TenantID == req.TenantID {
+				perms = m.Permissions
+				break
+			}
+		}
+		if perms == nil && len(memberships) > 0 {
+			// No es miembro: LoginForTenant lo rechaza con credenciales inválidas.
+			perms = []string{}
+		}
+		token, err := authSvc.LoginForTenant(req.Username, req.Password, req.TenantID, perms)
+		if err != nil {
+			if errors.Is(err, auth.ErrInvalidCreds) {
+				utils.Unauthorized(c, err.Error())
+				return
+			}
+			utils.InternalError(c, "internal server error")
+			return
+		}
+		utils.Success(c, token)
+	})
 
 	// ─── Health endpoints (outside /api/v1 auth) ──────────────
 	router.GET("/healthz", func(c *gin.Context) {

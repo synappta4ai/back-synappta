@@ -60,6 +60,16 @@ func Auth(jwtSecret string) gin.HandlerFunc {
 		if roleName, ok := claims["role_name"].(string); ok {
 			c.Set("role_name", roleName)
 		}
+		// Permisos de la membresía activa (tenant-scoped, p.ej. "events.manage").
+		if rawPerms, ok := claims["permissions"].([]interface{}); ok {
+			perms := make([]string, 0, len(rawPerms))
+			for _, p := range rawPerms {
+				if s, ok := p.(string); ok {
+					perms = append(perms, s)
+				}
+			}
+			c.Set("permissions", perms)
+		}
 		if name, ok := claims["name"].(string); ok {
 			c.Set("user_name", name)
 		}

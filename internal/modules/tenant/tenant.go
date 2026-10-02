@@ -501,6 +501,13 @@ func NewModule(hdl *Handler) *Module { return &Module{hdl: hdl} }
 
 func (m *Module) Name() string { return "tenants" }
 
+// usersHdl serves the per-tenant user-management endpoints.
+var usersHdl *TenantUsersHandler
+
+// SetTenantUsersHandler wires the shared system DB into the users handlers.
+// Called from main before routes are registered.
+func SetTenantUsersHandler(h *TenantUsersHandler) { usersHdl = h }
+
 func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
 	g := rg.Group("/tenants")
 	g.Use(authMw, gin.HandlerFunc(func(c *gin.Context) {
@@ -517,6 +524,19 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
 		g.GET("", m.hdl.List)
 		g.POST("", m.hdl.Create)
 		g.PATCH("/:id/deactivate", m.hdl.Deactivate)
+
+		// Per-tenant user management (platform superadmin).
+		if usersHdl != nil {
+			g.GET("/platform-users", usersHdl.ListPlatformUsers)
+			g.GET("/:id/users", usersHdl.List)
+			g.POST("/:id/users", usersHdl.Create)
+			g.PATCH("/:id/users/:userId/role", usersHdl.UpdateRole)
+			g.PUT("/:id/users/:userId/permissions", usersHdl.UpdatePermissions)
+			g.DELETE("/:id/users/:userId", usersHdl.Remove)
+			g.GET("/permissions", func(c *gin.Context) {
+				utils.Success(c, CatalogPermissions())
+			})
+		}
 
 		// Per-tenant model/credential management (platform superadmin).
 		g.GET("/:id/models", m.hdl.TenantModels)

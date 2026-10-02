@@ -43,17 +43,24 @@ func Open(databaseURL string, pool PoolConfig) (*sql.DB, error) {
 // new connection via RuntimeParams. This is essential for
 // schema-per-tenant multi-tenancy because the pgx driver ignores the
 // options=-csearch_path connection parameter.
+// The schema identifier is quoted here, so names with dashes (e.g.
+// tenant_drako-inc) resolve as a single identifier instead of arithmetic.
 func OpenWithSearchPath(databaseURL string, schema string, pool PoolConfig) (*sql.DB, error) {
 	config, err := pgx.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pgx config: %w", err)
 	}
 
+	quotedSchema, err := QuoteSchema(schema)
+	if err != nil {
+		return nil, err
+	}
+
 	// Set search_path as a runtime parameter — applied on every new connection
 	if config.RuntimeParams == nil {
 		config.RuntimeParams = make(map[string]string)
 	}
-	config.RuntimeParams["search_path"] = fmt.Sprintf("%s, public", schema)
+	config.RuntimeParams["search_path"] = fmt.Sprintf("%s, public", quotedSchema)
 
 	connStr := stdlib.RegisterConnConfig(config)
 
@@ -81,6 +88,25 @@ func Ping(db *sql.DB) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return db.PingContext(ctx)
+}
+
+// QuoteSchema validates and quotes a PostgreSQL schema identifier (e.g.
+// tenant_drako-inc) for safe interpolation into SQL (CREATE SCHEMA,
+// SET search_path, GUC values). Slugs allow dashes, so the raw name must
+// never be interpolated unquoted.
+func QuoteSchema(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("empty schema identifier")
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return "", fmt.Errorf("invalid schema identifier %q: only [a-z0-9_-] allowed", name)
+		}
+	}
+	if len(name) > 63 {
+		return "", fmt.Errorf("schema identifier %q too long (max 63)", name)
+	}
+	return `"` + name + `"`, nil
 }
 
 // QuoteIdent validates and quotes a PostgreSQL identifier (schema or table name).
