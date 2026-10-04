@@ -295,13 +295,17 @@ func (s *GenerationLogStore) UpdateByTaskID(taskID string, outputs []OutputResou
 // RefundProviderCostByTaskID zeroes the provider-reported spend of a task
 // (Higgsfield refunds failed/nsfw/canceled requests). Only rows whose cost
 // came from the provider estimate are touched, so locally-calculated costs
-// (Seedance, Seedream) keep their behavior.
-func (s *GenerationLogStore) RefundProviderCostByTaskID(taskID string) error {
+// (Seedance, Seedream) keep their behavior. Returns the affected row count.
+func (s *GenerationLogStore) RefundProviderCostByTaskID(taskID string) (int64, error) {
 	query := `UPDATE generation_logs SET
 		estimated_cost = 0, cost_credits = 0, cost_source = 'provider_refund', updated_at = NOW()
 		WHERE task_id = $1 AND deleted_at IS NULL AND cost_source = 'provider_estimate'`
-	_, err := s.db.Exec(query, taskID)
-	return err
+	res, err := s.db.Exec(query, taskID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // UpdateMetadataByTaskID persists video generation metadata + progress sampled

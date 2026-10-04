@@ -440,6 +440,34 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}
 
+	// Console trace of the provider-reported spend (lands in the server log).
+	if costSource == "provider_estimate" {
+		log.Printf("[spend] task=%q model=%q tx=%q credits=%.3f usd=%.4f source=%s",
+			taskID, modelName, providerTxID, costCredits, estimatedCost, costSource)
+		// Also record the estimate as its own server_communications phase so
+		// the admin logs page surfaces the reported values per task.
+		if s.commStore != nil {
+			estResp, _ := json.Marshal(map[string]interface{}{
+				"credits":        costCredits,
+				"usd":            estimatedCost,
+				"transaction_id": providerTxID,
+			})
+			comm := &ServerCommunication{
+				TaskID:       taskID,
+				ModelName:    m.Name,
+				Endpoint:     strings.TrimSuffix(genReq.BaseURL, "/") + "/estimate" + genReq.Endpoint,
+				Method:       "POST",
+				Phase:        "estimate",
+				StartedAt:    time.Now(),
+				RequestBody:  string(apiPayloadBytes),
+				ResponseBody: string(estResp),
+				StatusCode:   200,
+			}
+			s.attachAudit(comm, m, creds, req)
+			_ = s.commStore.Create(comm)
+		}
+	}
+
 	// Track the task for status polling
 	userName := req.UserName
 	if userName == "" {
@@ -928,8 +956,10 @@ func (s *Core) updateLogWithFinalStatus(taskID string, result *GeneratorResult) 
 	// Higgsfield does not charge failed/nsfw/canceled requests (refunded):
 	// zero the provider-reported spend so the totals stay honest.
 	if result.Status == config.STATUS_FAILED {
-		if refundErr := s.logStore.RefundProviderCostByTaskID(taskID); refundErr != nil {
+		if refunded, refundErr := s.logStore.RefundProviderCostByTaskID(taskID); refundErr != nil {
 			fmt.Printf("failed to refund provider cost for task %s: %v\n", taskID, refundErr)
+		} else if refunded > 0 {
+			log.Printf("[spend] task=%q refunded (failed/nsfw/canceled: not charged)", taskID)
 		}
 	}
 }
