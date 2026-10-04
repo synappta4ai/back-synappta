@@ -1,6 +1,9 @@
 package agency
 
 import (
+	"strings"
+	"time"
+
 	"github.com/gin-gonic/gin"
 
 	"synapta/internal/utils"
@@ -90,6 +93,69 @@ func (h *Handler) RecentTasks(c *gin.Context) {
 		return
 	}
 	utils.Success(c, tasks)
+}
+
+// TaskHistory handles GET /agency/tasks/history — the caller's own
+// generations inside a date window (studio take-reel session recovery).
+// Query: ?from=RFC3339|YYYY-MM-DD&to=...&resource_type=video&limit=100.
+func (h *Handler) TaskHistory(c *gin.Context) {
+	f := UserHistoryFilter{ResourceType: c.Query("resource_type")}
+	if from := parseHistoryTime(c.Query("from")); from != nil {
+		f.FromDate = from
+	}
+	if to := parseHistoryTime(c.Query("to")); to != nil {
+		f.ToDate = to
+	}
+	f.Limit = atoiDefault(c.Query("limit"), 100)
+	if f.Limit < 1 || f.Limit > 200 {
+		f.Limit = 100
+	}
+	tasks, err := h.core.UserHistoryForUser(utils.UserIDFromContext(c), f)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, tasks)
+}
+
+// UpdateTaskRating handles PATCH /agency/tasks/rating with body
+// {"task_id": "...", "good": bool, "final": bool} — the two-check rating
+// ("Buena toma" / "Elegida final"). Only the task owner can rate.
+func (h *Handler) UpdateTaskRating(c *gin.Context) {
+	var body struct {
+		TaskID string `json:"task_id" binding:"required"`
+		Good   bool   `json:"good"`
+		Final  bool   `json:"final"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	ok, err := h.core.UpdateLogRating(body.TaskID, utils.UserIDFromContext(c), body.Good, body.Final)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if !ok {
+		utils.NotFound(c, "generation task not found")
+		return
+	}
+	utils.Success(c, nil)
+}
+
+// parseHistoryTime accepts RFC3339 timestamps or plain YYYY-MM-DD dates
+// (midnight UTC) for the history window bounds.
+func parseHistoryTime(raw string) *time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return &t
+		}
+	}
+	return nil
 }
 
 // GetGenerationLogsCostSummary handles GET /agency/logs/generation/cost-summary
@@ -251,6 +317,10 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 
 		// The caller's recent tasks (own rows only) — take-reel hydration.
 		g.GET("/tasks/recent", m.priv("RecentTasks"))
+		// The caller's generations by date window (session recovery) and the
+		// two-check rating of a task (owner-only, body carries task_id).
+		g.GET("/tasks/history", m.priv("TaskHistory"))
+		g.PATCH("/tasks/rating", m.priv("UpdateTaskRating"))
 
 		// Generated assets + videos gallery (admin-only)
 		gallery := g.Group("")
@@ -284,6 +354,10 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListGenerationLogs(c)
 		case "RecentTasks":
 			hdl.RecentTasks(c)
+		case "TaskHistory":
+			hdl.TaskHistory(c)
+		case "UpdateTaskRating":
+			hdl.UpdateTaskRating(c)
 		case "GetGenerationLogsCostSummary":
 			hdl.GetGenerationLogsCostSummary(c)
 		case "GetGenerationLog":

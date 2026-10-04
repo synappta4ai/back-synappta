@@ -37,19 +37,28 @@ type GenerationLog struct {
 	ContentTypes string `json:"content_types"`
 	// Costo estimado de la generacion en USD.
 	EstimatedCost float64 `json:"estimated_cost"`
-	// Fuente del costo: "api_response", "calculator", "pending".
+	// Fuente del costo: "api_response", "calculator", "pending",
+	// "provider_estimate" (informado por la API del proveedor), "provider_refund".
 	CostSource string `json:"cost_source"`
+	// Costo en creditos del proveedor (Higgsfield cobra en creditos).
+	CostCredits float64 `json:"cost_credits"`
+	// Identificador con el que la generacion aparece como "Transaction ID"
+	// en la consola del proveedor (request_id de Higgsfield).
+	ProviderTransactionID string `json:"provider_transaction_id"`
 	// Provider usage tokens (video/text generation accounting).
-	UsageTokens          int64 `json:"usage_tokens"`
+	UsageTokens           int64 `json:"usage_tokens"`
 	UsageCompletionTokens int64 `json:"usage_completion_tokens"`
 	// Video metadata from the provider response.
-	VideoDuration    int    `json:"video_duration"`
-	VideoResolution  string `json:"video_resolution"`
-	VideoRatio       string `json:"video_ratio"`
-	VideoSeed        int64  `json:"video_seed"`
-	VideoFPS         int    `json:"video_fps"`
+	VideoDuration   int    `json:"video_duration"`
+	VideoResolution string `json:"video_resolution"`
+	VideoRatio      string `json:"video_ratio"`
+	VideoSeed       int64  `json:"video_seed"`
+	VideoFPS        int    `json:"video_fps"`
 	// Estimated progress percent 0-100 (100 on terminal states).
 	Progress int `json:"progress"`
+	// Two-check rating set by the creator ("Buena toma" / "Elegida final").
+	RatingGood  bool `json:"rating_good"`
+	RatingFinal bool `json:"rating_final"`
 	// Enriched fields (LEFT JOIN, not stored in generation_logs)
 	EventName       string `json:"event_name"`
 	UserDisplayName string `json:"user_display_name"`
@@ -111,10 +120,12 @@ const genLogListCols = `gl.id, gl.task_id, gl.model_name,
 		COALESCE(gl.outputs, '') AS outputs,
 		gl.resource_type, gl.content_types,
 		gl.estimated_cost, gl.cost_source,
+		gl.cost_credits, COALESCE(gl.provider_transaction_id, '') AS provider_transaction_id,
 		gl.usage_tokens, gl.usage_completion_tokens,
 		gl.video_duration, COALESCE(gl.video_resolution, '') AS video_resolution,
 		COALESCE(gl.video_ratio, '') AS video_ratio,
 		gl.video_seed, gl.video_fps, gl.progress,
+		gl.rating_good, gl.rating_final,
 		gl.created_at, gl.updated_at`
 
 const genLogFullCols = `gl.id, gl.task_id, gl.model_name,
@@ -130,10 +141,12 @@ const genLogFullCols = `gl.id, gl.task_id, gl.model_name,
 		COALESCE(gl.generation_number, 0) AS generation_number,
 		gl.resource_type, gl.content_types,
 		gl.estimated_cost, gl.cost_source,
+		gl.cost_credits, COALESCE(gl.provider_transaction_id, '') AS provider_transaction_id,
 		gl.usage_tokens, gl.usage_completion_tokens,
 		gl.video_duration, COALESCE(gl.video_resolution, '') AS video_resolution,
 		COALESCE(gl.video_ratio, '') AS video_ratio,
 		gl.video_seed, gl.video_fps, gl.progress,
+		gl.rating_good, gl.rating_final,
 		gl.created_at, gl.updated_at, gl.deleted_at`
 
 const genLogJoinCols = `COALESCE(ev.name, '') AS event_name,
@@ -158,9 +171,11 @@ func (s *GenerationLogStore) scanListRow(row *GenerationLog, scanner interface {
 		&outputsStr,
 		&row.ResourceType, &row.ContentTypes,
 		&row.EstimatedCost, &row.CostSource,
+		&row.CostCredits, &row.ProviderTransactionID,
 		&row.UsageTokens, &row.UsageCompletionTokens,
 		&row.VideoDuration, &row.VideoResolution, &row.VideoRatio,
 		&row.VideoSeed, &row.VideoFPS, &row.Progress,
+		&row.RatingGood, &row.RatingFinal,
 		&row.CreatedAt, &row.UpdatedAt,
 		&row.EventName, &row.UserDisplayName, &row.PieceName,
 	)
@@ -186,9 +201,11 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 		&row.GenerationNumber,
 		&row.ResourceType, &row.ContentTypes,
 		&row.EstimatedCost, &row.CostSource,
+		&row.CostCredits, &row.ProviderTransactionID,
 		&row.UsageTokens, &row.UsageCompletionTokens,
 		&row.VideoDuration, &row.VideoResolution, &row.VideoRatio,
 		&row.VideoSeed, &row.VideoFPS, &row.Progress,
+		&row.RatingGood, &row.RatingFinal,
 		&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
 		&row.EventName, &row.UserDisplayName, &row.PieceName,
 	)
@@ -203,8 +220,8 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 
 // Create inserts a new generation log entry.
 func (s *GenerationLogStore) Create(log *GenerationLog) error {
-	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source, cost_credits, provider_transaction_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id, created_at, updated_at`
 
 	outputsStr := marshalOutputs(log.Outputs)
@@ -226,6 +243,8 @@ func (s *GenerationLogStore) Create(log *GenerationLog) error {
 		log.ContentTypes,
 		log.EstimatedCost,
 		log.CostSource,
+		log.CostCredits,
+		log.ProviderTransactionID,
 	).Scan(&log.ID, &log.CreatedAt, &log.UpdatedAt)
 }
 
@@ -271,6 +290,18 @@ func (s *GenerationLogStore) UpdateByTaskID(taskID string, outputs []OutputResou
 		return fmt.Errorf("generation log not found for task: %s", taskID)
 	}
 	return nil
+}
+
+// RefundProviderCostByTaskID zeroes the provider-reported spend of a task
+// (Higgsfield refunds failed/nsfw/canceled requests). Only rows whose cost
+// came from the provider estimate are touched, so locally-calculated costs
+// (Seedance, Seedream) keep their behavior.
+func (s *GenerationLogStore) RefundProviderCostByTaskID(taskID string) error {
+	query := `UPDATE generation_logs SET
+		estimated_cost = 0, cost_credits = 0, cost_source = 'provider_refund', updated_at = NOW()
+		WHERE task_id = $1 AND deleted_at IS NULL AND cost_source = 'provider_estimate'`
+	_, err := s.db.Exec(query, taskID)
+	return err
 }
 
 // UpdateMetadataByTaskID persists video generation metadata + progress sampled
@@ -394,6 +425,72 @@ func (s *GenerationLogStore) ListRecentByUser(userID int64, limit int) ([]Genera
 	return logs, rows.Err()
 }
 
+// UserHistoryFilter selects the caller's generations for the studio
+// date-history (session recovery). FromDate/ToDate are optional bounds on
+// created_at (inclusive/exclusive respectively); ResourceType filters by modality.
+type UserHistoryFilter struct {
+	FromDate     *time.Time
+	ToDate       *time.Time
+	ResourceType string
+	Limit        int
+}
+
+// ListHistoryByUser returns the user's generations inside an optional
+// created_at window (own rows only, newest first), including the request
+// payload so the client can rebuild and re-run the original studio request.
+func (s *GenerationLogStore) ListHistoryByUser(userID int64, f UserHistoryFilter) ([]GenerationLog, error) {
+	if f.Limit < 1 || f.Limit > 200 {
+		f.Limit = 100
+	}
+	query := `SELECT ` + genLogFullCols + `, ` + genLogJoinCols + ` ` + genLogFromJoins + `
+		WHERE gl.deleted_at IS NULL AND gl.user_id = $1`
+	args := []interface{}{userID}
+	if f.FromDate != nil {
+		args = append(args, *f.FromDate)
+		query += fmt.Sprintf(" AND gl.created_at >= $%d", len(args))
+	}
+	if f.ToDate != nil {
+		args = append(args, *f.ToDate)
+		query += fmt.Sprintf(" AND gl.created_at < $%d", len(args))
+	}
+	if f.ResourceType != "" {
+		args = append(args, f.ResourceType)
+		query += fmt.Sprintf(" AND gl.resource_type = $%d", len(args))
+	}
+	query += fmt.Sprintf(" ORDER BY gl.created_at DESC LIMIT $%d", len(args)+1)
+	args = append(args, f.Limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var logs []GenerationLog
+	for rows.Next() {
+		var l GenerationLog
+		if err := s.scanDetailRow(&l, rows); err != nil {
+			return nil, err
+		}
+		logs = append(logs, l)
+	}
+	return logs, rows.Err()
+}
+
+// UpdateRatingByTaskID sets the two-check rating of one task. Only the owner
+// may rate: the update matches user_id too and returns rows affected (0 =
+// not found or not the caller's row).
+func (s *GenerationLogStore) UpdateRatingByTaskID(taskID string, userID int64, good, final bool) (int64, error) {
+	res, err := s.db.Exec(`UPDATE generation_logs
+		SET rating_good = $2, rating_final = $3, updated_at = CURRENT_TIMESTAMP
+		WHERE task_id = $1 AND user_id = $4 AND deleted_at IS NULL`,
+		taskID, good, final, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ListNonFinalTaskIDs returns task ids with a non-terminal status (reconciler input).
 func (s *GenerationLogStore) ListNonFinalTaskIDs(limit int) ([]GenerationLog, error) {
 	rows, err := s.db.Query(`SELECT `+genLogFullCols+`, `+genLogJoinCols+` `+genLogFromJoins+`
@@ -501,28 +598,28 @@ func itoa(n int) string {
 // ServerCommunication stores a trace of every request sent to an external AI API.
 // Credential fields are ALWAYS stored masked (see credential.MaskPublic) — never raw secrets.
 type ServerCommunication struct {
-	ID                 string    `json:"id"`
-	TaskID             string    `json:"task_id"`
-	ModelName          string    `json:"model_name"`
-	Endpoint           string    `json:"endpoint"`
-	Method             string    `json:"method"`
+	ID        string `json:"id"`
+	TaskID    string `json:"task_id"`
+	ModelName string `json:"model_name"`
+	Endpoint  string `json:"endpoint"`
+	Method    string `json:"method"`
 	// phase separates the generation submit ("generate") from status polls
 	// ("poll") so both traces of one task group into a single logical record.
-	Phase              string    `json:"phase,omitempty"`
+	Phase string `json:"phase,omitempty"`
 	// Polling aggregates: how many polls happened and the submit→finish span.
-	PollCount          int       `json:"poll_count"`
-	StartedAt          time.Time `json:"started_at,omitempty"`
-	FinishedAt         time.Time `json:"finished_at,omitempty"`
-	TotalDurationMs    int64     `json:"total_duration_ms"`
-	RequestBody        string    `json:"request_body,omitempty"`
-	ResponseBody       string    `json:"response_body,omitempty"`
-	StatusCode         int       `json:"status_code"`
-	DurationMs         int64     `json:"duration_ms"`
-	ErrorMessage       string    `json:"error_message,omitempty"`
+	PollCount       int       `json:"poll_count"`
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	TotalDurationMs int64     `json:"total_duration_ms"`
+	RequestBody     string    `json:"request_body,omitempty"`
+	ResponseBody    string    `json:"response_body,omitempty"`
+	StatusCode      int       `json:"status_code"`
+	DurationMs      int64     `json:"duration_ms"`
+	ErrorMessage    string    `json:"error_message,omitempty"`
 	// Audit: who triggered the call.
-	UserID             int64     `json:"user_id"`
-	Username           string    `json:"username"`
-	TenantSlug         string    `json:"tenant_slug"`
+	UserID     int64  `json:"user_id"`
+	Username   string `json:"username"`
+	TenantSlug string `json:"tenant_slug"`
 	// Audit: which credentials were used (masked).
 	CredentialProvider string    `json:"credential_provider"`
 	APIKeyMask         string    `json:"api_key_mask"`

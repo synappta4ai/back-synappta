@@ -222,6 +222,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		errLog        string
 		estimatedCost float64
 		costSource    string
+		costCredits   float64
+		providerTxID  string
 	)
 
 	// Defer log save — runs on every return path (including early errors)
@@ -256,6 +258,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			ContentTypes:     extractContentTypes(req.Content),
 			EstimatedCost:    estimatedCost,
 			CostSource:       costSource,
+			CostCredits:      costCredits,
+			ProviderTransactionID: providerTxID,
 		}
 		if saveErr := s.logStore.Create(logEntry); saveErr != nil {
 			fmt.Printf("failed to save generation log: %v\n", saveErr)
@@ -407,13 +411,24 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			_ = s.commStore.AttachTaskIDByPhase("generate", taskID, m.Name)
 		}
 	}
+	// Higgsfield bills each request as a transaction identified by its
+	// request_id (our taskID): recording it lets the app logs be reconciled
+	// against the "Transaction ID" rows shown in the Higgsfield console.
+	if taskID != "" && gen.Name() == "higgsfield" {
+		providerTxID = taskID
+	}
 	if err != nil {
 		errLog = err.Error()
 		return nil, err
 	}
 
-	// Calculate estimated cost
-	if calc := s.pickCalculator(modelName); calc != nil {
+	// Calculate the generation spend: a provider-reported estimate
+	// (Higgsfield /estimate, in credits + USD) wins over local calculators.
+	if result.CostCredits > 0 || result.CostUSD > 0 {
+		costCredits = result.CostCredits
+		estimatedCost = result.CostUSD
+		costSource = "provider_estimate"
+	} else if calc := s.pickCalculator(modelName); calc != nil {
 		if cost, ok := calc.CalculateFromResponse(result.Raw, genReq); ok {
 			estimatedCost = cost
 			costSource = "api_response"
@@ -435,17 +450,17 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	s.tasks[result.TaskID] = &TaskRecord{
 		TaskID: result.TaskID,
 		// Anchor for submit→result durations and progress estimation.
-		CreatedAt:       time.Now(),
-		ModelID:         string(m.CredentialProvider),
-		ModelName:       m.Name,
-		Status:          result.Status,
-		EventName:       req.EventName,
-		PieceCode:       req.PieceCode,
-		GenerationN:     req.GenerationNumber,
-		UserHandle:      userName,
-		UserID:          req.UserID,
-		PushNotified:    terminal,
-		ResourceType:    req.ResourceType,
+		CreatedAt:    time.Now(),
+		ModelID:      string(m.CredentialProvider),
+		ModelName:    m.Name,
+		Status:       result.Status,
+		EventName:    req.EventName,
+		PieceCode:    req.PieceCode,
+		GenerationN:  req.GenerationNumber,
+		UserHandle:   userName,
+		UserID:       req.UserID,
+		PushNotified: terminal,
+		ResourceType: req.ResourceType,
 		Result: &StatusResult{
 			Status: result.Status,
 			Raw:    result.Raw,
@@ -471,6 +486,10 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		Model:   result.Model,
 		Status:  result.Status,
 		Outputs: result.Outputs,
+
+		CostCredits:           costCredits,
+		CostUSD:               estimatedCost,
+		ProviderTransactionID: providerTxID,
 	}, nil
 }
 
@@ -566,13 +585,13 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 			Method:    "GET",
 			// Poll row: phase "poll", anchored to the task's submit time so
 			// the store can compute total_duration_ms = submit → final poll.
-			Phase:           "poll",
-			StartedAt:       record.CreatedAt,
-			DurationMs:      pollDur,
-			RequestBody:     string(reqBytes),
-			ResponseBody:    respBody,
-			StatusCode:      genStatus,
-			ErrorMessage:    errMsg,
+			Phase:        "poll",
+			StartedAt:    record.CreatedAt,
+			DurationMs:   pollDur,
+			RequestBody:  string(reqBytes),
+			ResponseBody: respBody,
+			StatusCode:   genStatus,
+			ErrorMessage: errMsg,
 		}
 		if err == nil && result != nil && isTerminalStatus(result.Status) {
 			comm.FinishedAt = time.Now()
@@ -905,6 +924,13 @@ func (s *Core) updateLogWithFinalStatus(taskID string, result *GeneratorResult) 
 	}
 	if saveErr := s.logStore.UpdateByTaskID(taskID, outputs, result.Status, result.Error); saveErr != nil {
 		fmt.Printf("failed to update generation log for task %s: %v\n", taskID, saveErr)
+	}
+	// Higgsfield does not charge failed/nsfw/canceled requests (refunded):
+	// zero the provider-reported spend so the totals stay honest.
+	if result.Status == config.STATUS_FAILED {
+		if refundErr := s.logStore.RefundProviderCostByTaskID(taskID); refundErr != nil {
+			fmt.Printf("failed to refund provider cost for task %s: %v\n", taskID, refundErr)
+		}
 	}
 }
 
@@ -1281,6 +1307,29 @@ func (s *Core) RecentTasksForUser(userID int64, limit int) ([]GenerationLog, err
 		return nil, fmt.Errorf("log store not available")
 	}
 	return s.logStore.ListRecentByUser(userID, limit)
+}
+
+// UserHistoryForUser returns the caller's generations inside an optional
+// created_at window (session recovery by day in the studio take reel).
+func (s *Core) UserHistoryForUser(userID int64, f UserHistoryFilter) ([]GenerationLog, error) {
+	if s.logStore == nil {
+		return nil, fmt.Errorf("log store not available")
+	}
+	return s.logStore.ListHistoryByUser(userID, f)
+}
+
+// UpdateLogRating sets the two-check rating ("Buena toma"/"Elegida final")
+// of one of the caller's tasks. Returns false when the task does not exist
+// or belongs to another user.
+func (s *Core) UpdateLogRating(taskID string, userID int64, good, final bool) (bool, error) {
+	if s.logStore == nil {
+		return false, fmt.Errorf("log store not available")
+	}
+	n, err := s.logStore.UpdateRatingByTaskID(taskID, userID, good, final)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // SumLogsCost returns the total estimated cost for filtered logs.

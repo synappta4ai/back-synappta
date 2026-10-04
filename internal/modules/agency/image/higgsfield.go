@@ -105,13 +105,19 @@ func (g *HiggsfieldImageGenerator) Generate(req *agency.GeneratorRequest) (*agen
 		return nil, fmt.Errorf("no request_id in response")
 	}
 
-	return &agency.GeneratorResult{
+	genResult := &agency.GeneratorResult{
 		TaskID:  taskID,
 		Model:   req.Model,
 		Status:  config.STATUS_RUNNING,
 		Outputs: []agency.OutputResource{},
 		Raw:     result,
-	}, nil
+	}
+	// Best-effort spend estimate with the exact submitted payload:
+	// successful generations are billed in credits, failures are refunded.
+	genResult.CostCredits, genResult.CostUSD, _ = agency.EstimateHiggsfield(
+		g.httpClient, req.BaseURL, req.Endpoint, req.AuthKey, payload)
+
+	return genResult, nil
 }
 
 // GetStatus polls the async request and collects image URLs on success.

@@ -38,6 +38,8 @@ var higgsfieldStatuses = map[string]string{
 	"failed":    config.STATUS_FAILED,
 	"canceled":  config.STATUS_FAILED,
 	"cancelled": config.STATUS_FAILED,
+	// Moderated content is terminal and NOT charged (refunded) by Higgsfield.
+	"nsfw": config.STATUS_FAILED,
 }
 
 // HiggsfieldGenerator runs async video generation through Higgsfield.
@@ -111,13 +113,19 @@ func (g *HiggsfieldGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		return nil, fmt.Errorf("no request_id in response")
 	}
 
-	return &agency.GeneratorResult{
+	genResult := &agency.GeneratorResult{
 		TaskID:  taskID,
 		Model:   req.Model,
 		Status:  config.STATUS_RUNNING,
 		Outputs: []agency.OutputResource{},
 		Raw:     result,
-	}, nil
+	}
+	// Best-effort spend estimate with the exact submitted payload:
+	// successful generations are billed in credits, failures are refunded.
+	genResult.CostCredits, genResult.CostUSD, _ = agency.EstimateHiggsfield(
+		g.httpClient, req.BaseURL, req.Endpoint, authKey, payload)
+
+	return genResult, nil
 }
 
 // GetStatus polls the async request and downloads the video on success.

@@ -68,6 +68,11 @@ type GenerateResponse struct {
 	Model   string           `json:"model"`
 	Status  string           `json:"status"`
 	Outputs []OutputResource `json:"outputs,omitempty"`
+	// Gasto informado por el proveedor (Higgsfield): creditos y USD estimados.
+	CostCredits float64 `json:"cost_credits,omitempty"`
+	CostUSD     float64 `json:"cost_usd,omitempty"`
+	// "Transaction ID" con el que la generacion aparece en la consola del proveedor.
+	ProviderTransactionID string `json:"provider_transaction_id,omitempty"`
 }
 
 // StatusResponse is returned by GET /agency/*/status/:taskId.
@@ -157,6 +162,10 @@ type GeneratorResult struct {
 	Outputs []OutputResource `json:"outputs,omitempty"`
 	Raw     interface{}      `json:"raw,omitempty"`
 	Error   string           `json:"error,omitempty"`
+	// Gasto estimado por el proveedor en el submit (Higgsfield /estimate):
+	// creditos y USD. Cero cuando el proveedor no lo informa.
+	CostCredits float64 `json:"cost_credits,omitempty"`
+	CostUSD     float64 `json:"cost_usd,omitempty"`
 }
 
 // PipelineRunner is the internal interface satisfied by all domain generators
