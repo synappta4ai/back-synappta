@@ -436,7 +436,10 @@ type UserHistoryFilter struct {
 	FromDate     *time.Time
 	ToDate       *time.Time
 	ResourceType string
-	Limit        int
+	// Cuando viene seteado, la consulta devuelve TODAS las generaciones del
+	// evento (proyecto) en lugar de las filas del propio usuario.
+	EventID string
+	Limit   int
 }
 
 // ListHistoryByUser returns the user's generations inside an optional
@@ -447,8 +450,17 @@ func (s *GenerationLogStore) ListHistoryByUser(userID int64, f UserHistoryFilter
 		f.Limit = 100
 	}
 	query := `SELECT ` + genLogFullCols + `, ` + genLogJoinCols + ` ` + genLogFromJoins + `
-		WHERE gl.deleted_at IS NULL AND gl.user_id = $1`
-	args := []interface{}{userID}
+		WHERE gl.deleted_at IS NULL`
+	args := []interface{}{}
+	if f.EventID != "" {
+		// Project view (projects page): all the generations of the event —
+		// the event belongs to this tenant DB, so the rows are tenant-scoped.
+		args = append(args, f.EventID)
+		query += fmt.Sprintf(" AND gl.event_id = $%d", len(args))
+	} else {
+		args = append(args, userID)
+		query += fmt.Sprintf(" AND gl.user_id = $%d", len(args))
+	}
 	if f.FromDate != nil {
 		args = append(args, *f.FromDate)
 		query += fmt.Sprintf(" AND gl.created_at >= $%d", len(args))

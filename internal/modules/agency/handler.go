@@ -96,10 +96,11 @@ func (h *Handler) RecentTasks(c *gin.Context) {
 }
 
 // TaskHistory handles GET /agency/tasks/history — the caller's own
-// generations inside a date window (studio take-reel session recovery).
-// Query: ?from=RFC3339|YYYY-MM-DD&to=...&resource_type=video&limit=100.
+// generations inside a date window (studio take-reel session recovery), or
+// all the generations of a project when ?event_id= is given.
+// Query: ?from=RFC3339|YYYY-MM-DD&to=...&resource_type=video&event_id=&limit=100.
 func (h *Handler) TaskHistory(c *gin.Context) {
-	f := UserHistoryFilter{ResourceType: c.Query("resource_type")}
+	f := UserHistoryFilter{ResourceType: c.Query("resource_type"), EventID: c.Query("event_id")}
 	if from := parseHistoryTime(c.Query("from")); from != nil {
 		f.FromDate = from
 	}

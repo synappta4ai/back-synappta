@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -30,10 +31,12 @@ func EstimateHiggsfield(httpClient *http.Client, baseURL, endpoint, authKey stri
 
 	body, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("[estimate] marshal payload: %v", err)
 		return 0, 0, false
 	}
 	req, err := http.NewRequest("POST", estURL, strings.NewReader(string(body)))
 	if err != nil {
+		log.Printf("[estimate] build request: %v", err)
 		return 0, 0, false
 	}
 	req.Header.Set("Authorization", "Key "+authKey)
@@ -41,23 +44,31 @@ func EstimateHiggsfield(httpClient *http.Client, baseURL, endpoint, authKey stri
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		log.Printf("[estimate] POST %s: %v", estURL, err)
 		return 0, 0, false
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil || resp.StatusCode >= 400 {
+	if err != nil {
+		log.Printf("[estimate] read body: %v", err)
+		return 0, 0, false
+	}
+	if resp.StatusCode >= 400 {
+		log.Printf("[estimate] POST %s → %d: %.300s", estURL, resp.StatusCode, string(respBytes))
 		return 0, 0, false
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(respBytes, &result); err != nil {
+		log.Printf("[estimate] unmarshal response (%d): %.200s", resp.StatusCode, string(respBytes))
 		return 0, 0, false
 	}
 
 	credits = HiggsfieldNumber(result["credits"])
 	usd = HiggsfieldNumber(result["usd"])
 	if credits == 0 && usd == 0 {
+		log.Printf("[estimate] response sin credits/usd reconocibles: %.300s", string(respBytes))
 		return 0, 0, false
 	}
 	return credits, usd, true
