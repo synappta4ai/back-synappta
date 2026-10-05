@@ -787,7 +787,13 @@ func (s *Service) ListFilesByEvent(eventID, category string) ([]File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.decorate(files), nil
+	files = s.decorate(files)
+	// Ingredients (character/location/prop) para que el front pueda
+	// distinguir los tipos de recursos igual que en la galería.
+	if err := s.attachComputed(files); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // LinkEvent assigns a file to a project.
