@@ -41,7 +41,11 @@ synapta/
 │   ├── system/                # goose sobre public
 │   └── tenant/                # goose sobre cada tenant_<slug>
 ├── scripts/
-│   └── e2e_http.py            # E2E HTTP: login → modelos → generar → artifact
+│   ├── e2e_http.py            # E2E HTTP: login → modelos → generar → artifact
+│   ├── sync-remote-media.mjs  # trae al ./uploads local los medios que solo
+│   │                          # existen en el despliegue remoto (idempotente)
+│   └── deploy-sslip.sh        # deploy del binario linux al host remoto:
+│                              # respalda, reemplaza, reinicia y checa /readyz
 └── internal/
     ├── db/                    # pgx + pool limits + quote ident
     ├── worker/                # cliente gRPC stateless del inference worker
@@ -101,6 +105,10 @@ PUT  /api/v1/credentials                    # credenciales del tenant (cifradas)
 POST /api/v1/files/upload                   # dedup por SHA-256: contenido idéntico activo
                                             # → devuelve el existente (duplicate=true, HTTP 200);
                                             # ?force=true/1 fuerza una copia nueva (HTTP 201)
+GET  /api/v1/files/by-event/:eventId        # recursos asignados a un proyecto, con
+                                            # ingredients (character/location/prop) y project_ids
+PUT  /api/v1/files/:id/event/:eventId       # asignar recurso a proyecto
+DELETE /api/v1/files/:id/event/:eventId     # desasignar
 
 POST /api/v1/events  ·  GET /events/:id     # + /programs, /pieces, /generations
 POST /api/v1/assignments/:targetType/:targetId
@@ -109,6 +117,9 @@ POST /api/v1/agency/video/generate          # + /status/:taskId, /task/:taskId, 
 POST /api/v1/agency/image/generate          #   modelos "downloaded": despachan gRPC al worker y
 POST /api/v1/agency/text/generate           #   el artifact se re-hospeda en /outputs — mismo pipeline
 GET  /api/v1/agency/logs/generation         # logs y costes por tenant
+GET  /api/v1/agency/tasks/history           # ?from&to&resource_type&event_id&limit
+GET  /api/v1/agency/tasks/server-communications  # ?task_id: detalle HTTP del proveedor
+PATCH /api/v1/agency/tasks/rating           # rating excluyente: buena_toma / elegida_final
 
 GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant explícito
 ```
@@ -127,6 +138,19 @@ GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant
                   "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "steps": 30,
                   "vram_gb": 6, "family": "wan", "available": true } }
 ```
+
+## Costos del proveedor (spend)
+
+Cada generación registra `cost_credits`, `cost_usd` y `cost_source` en
+`generation_logs`:
+
+- `provider_estimate` — estimado devuelto por el proveedor (Higgsfield
+  responde `{"credits":"1.5","usd":"0.094"}` como strings). Los fallos de
+  estimate se loguean con el tag `[estimate]` (status + cuerpo) en el log del
+  servidor para poder diagnosticar costos faltantes.
+- `provider_refund` — generación fallida/cancelada/nsfw: el proveedor
+  reembolsa y el registro se pone a cero conservando la traza.
+- Los clientes muestran `X.XX cr` (créditos del proveedor) + equivalente USD.
 
 ## E2E
 

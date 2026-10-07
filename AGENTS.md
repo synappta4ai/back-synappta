@@ -56,3 +56,30 @@ the API catalog. Flow:
 - Known limitation: after a Synapta restart the stream is gone, so an
   orphaned downloaded task polls as `running` forever (the worker does not
   expose a job-status-by-id RPC yet).
+
+## Provider spend (cost tracking)
+
+- Generation records carry `cost_credits`, `cost_usd`, `cost_source`
+  (`provider_estimate` | `provider_refund`) and `transaction_id`.
+- `EstimateHiggsfield` (`internal/modules/agency/estimate.go`) runs
+  post-submit; every failure path logs `[estimate]` with status + response
+  body — do not swallow those errors silently again, missing spend must be
+  diagnosable from the server log.
+- Failed/cancelled/NSFW tasks get refunded by the provider
+  (`RefundProviderCostByTaskID`): zero cost + `cost_source='provider_refund'`.
+- Clients render `cr` as provider credits (Higgsfield) next to the USD
+  equivalent, with explanatory tooltips.
+
+## Ops scripts (scripts/)
+
+- `e2e_http.py` — full HTTP E2E (login → models → generate → artifact).
+- `sync-remote-media.mjs` — pull uploads/outputs that only exist on the
+  remote deployment into local storage. Idempotent, `--dry-run` supported.
+  Requires creds in `../front-synapta/.env.e2e`.
+- `deploy-sslip.sh` — deploy `bin/synapta-linux` to the remote host: scp,
+  discover systemd vs bare process, back up the old binary, swap, restart,
+  wait for `readyz=200`. Build first with
+  `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/synapta-linux .`.
+  Needs the SSH key authorized on the target host.
+- Never commit `.env`, `.env.e2e` or `*.log`; `bin/` and `*.log` are
+  gitignored.
