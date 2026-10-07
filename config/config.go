@@ -37,6 +37,10 @@ type Config struct {
 	WorkerAddr           string
 	WorkerTimeoutSeconds int
 
+	// AgentServerURL is the standalone DCS Agent server (Inmobiliaria /
+	// Cine workflows) that the /agent/chat endpoint proxies to.
+	AgentServerURL string
+
 	// Default tenant: created at startup if missing; the platform superadmin
 	// gets a membership in it so tenant-scoped requests work out of the box.
 	DefaultTenantSlug string
@@ -194,6 +198,8 @@ func Load() *Config {
 
 		WorkerAddr:           strings.TrimSpace(os.Getenv("BM_WORKER_ADDR")),
 		WorkerTimeoutSeconds: workerTimeout,
+
+		AgentServerURL: getEnv("AGENT_SERVER_URL", "http://localhost:3200"),
 
 		DefaultTenantSlug: getEnv("DEFAULT_TENANT_SLUG", "synapta"),
 		DefaultTenantName: getEnv("DEFAULT_TENANT_NAME", "Synapta"),

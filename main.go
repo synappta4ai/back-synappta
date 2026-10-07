@@ -29,6 +29,7 @@ import (
 	agencyimage "synapta/internal/modules/agency/image"
 	agencytext "synapta/internal/modules/agency/text"
 	agencyvideo "synapta/internal/modules/agency/video"
+	"synapta/internal/modules/agent"
 	"synapta/internal/modules/assignment"
 	"synapta/internal/modules/auth"
 	"synapta/internal/modules/credential"
@@ -164,6 +165,7 @@ func main() {
 	registry.Register(skill.NewModule(manager.SkillsFor))
 	registry.Register(push.NewModule(manager.PushFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
+	registry.Register(agent.NewModule(manager.CredentialsFor, cfg.AgentServerURL))
 
 	// Agency core with modality routes attached.
 	agencyModule := agency.NewModule(manager.AgencyCoreFor)

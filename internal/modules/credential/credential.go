@@ -22,11 +22,14 @@ const (
 	ProviderGemini     = "gemini"
 	ProviderAnthropic  = "anthropic"
 	ProviderHiggsfield = "higgsfield"
+	// ProviderOpenRouter is the LLM provider used by the agency agent flow
+	// (DCS Agent chat): its key travels per-request, never via .env.
+	ProviderOpenRouter = "openrouter"
 )
 
 var validProviders = map[string]bool{
 	ProviderBytePlus: true, ProviderGemini: true, ProviderAnthropic: true,
-	ProviderHiggsfield: true,
+	ProviderHiggsfield: true, ProviderOpenRouter: true,
 }
 
 // IsValidProvider reports whether the provider name is one of the supported ones.
@@ -194,7 +197,7 @@ func validateKeyFormat(provider, apiKey string) error {
 // Upsert creates or updates the tenant's credential for a provider.
 func (s *Store) Upsert(req *UpsertRequest) (*Credential, error) {
 	if !validProviders[req.Provider] {
-		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic)", req.Provider)
+		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic, higgsfield, openrouter)", req.Provider)
 	}
 
 	// Trim pasted values — stray whitespace/newlines break Authorization headers.
@@ -239,10 +242,15 @@ func (s *Store) Upsert(req *UpsertRequest) (*Credential, error) {
 			display_name = EXCLUDED.display_name,
 			access_key_id = EXCLUDED.access_key_id,
 			secret_access_key = EXCLUDED.secret_access_key,
-			api_key = EXCLUDED.api_key,
+			-- Empty secrets/URLs on update mean "not edited": keep the stored
+			-- values so saving other fields never wipes the key or endpoint.
+			api_key = CASE WHEN EXCLUDED.api_key = '' THEN credentials.api_key ELSE EXCLUDED.api_key END,
+			base_url = CASE WHEN EXCLUDED.base_url = '' THEN credentials.base_url ELSE EXCLUDED.base_url END,
 			endpoint = EXCLUDED.endpoint,
-			base_url = EXCLUDED.base_url,
-			extra = EXCLUDED.extra,
+			-- Same convention as base_url: empty extra means "not edited",
+			-- so saving a key from the flow panel never wipes the agent model
+			-- configured in admin/models (clear it with {"model":""}).
+			extra = CASE WHEN EXCLUDED.extra = '' THEN credentials.extra ELSE EXCLUDED.extra END,
 			updated_at = NOW()
 		RETURNING id, created_at, updated_at`
 
@@ -362,7 +370,15 @@ type Handler struct {
 	store *Store
 }
 
+// NewHandler creates the HTTP handler for a tenant's credentials.
 func NewHandler(store *Store) *Handler { return &Handler{store: store} }
+
+// Resolve returns the decrypted credential for a provider (nil when the
+// tenant has none). Only server-side flows may call this — secrets are
+// never exposed through the API.
+func (h *Handler) Resolve(provider string) (*Resolve, error) {
+	return h.store.Get(provider)
+}
 
 // List handles GET /credentials
 func (h *Handler) List(c *gin.Context) {
