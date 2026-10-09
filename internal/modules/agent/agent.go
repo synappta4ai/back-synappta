@@ -2,6 +2,10 @@
 // agent-server into the Synapta API. The tenant's LLM provider credential is
 // resolved from the database and injected as X-LLM-* request headers, so the
 // provider key never travels through the browser nor any .env file.
+//
+// When the agent-server is unreachable the module answers the turn itself by
+// calling the tenant's LLM directly (see direct.go), so flows like /agency
+// keep working without that extra service.
 package agent
 
 import (
@@ -9,8 +13,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -45,8 +51,14 @@ func NewModule(resolve CredentialResolver, agentURL string) *Module {
 	if strings.TrimSpace(agentURL) == "" {
 		agentURL = "http://localhost:3200"
 	}
-	// No client timeout: the chat response is a long-lived SSE stream.
-	return &Module{resolve: resolve, agentURL: strings.TrimRight(agentURL, "/"), client: &http.Client{}}
+	// Sin timeout total (la respuesta es un SSE largo) pero con dial corto:
+	// si el agent-server está caído, el fallback al LLM dispara rápido.
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	return &Module{resolve: resolve, agentURL: strings.TrimRight(agentURL, "/"), client: &http.Client{Transport: transport}}
 }
 
 // Name implements modules.Module.
@@ -123,7 +135,12 @@ func (m *Module) Chat(c *gin.Context) {
 
 	resp, err := m.client.Do(upstream)
 	if err != nil {
-		utils.Error(c, http.StatusBadGateway, "agent server unreachable at "+m.agentURL+": "+err.Error())
+		// Agent-server caído (p. ej. localhost:3200 sin proceso): el back
+		// responde el turno llamando directo al LLM del tenant.
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		m.directChat(c, req, hdl, cred)
 		return
 	}
 	defer resp.Body.Close()
