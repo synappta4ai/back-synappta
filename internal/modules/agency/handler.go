@@ -304,6 +304,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		g.POST("/sync-asset", m.priv("SyncAsset"))
 		g.GET("/synced-assets", m.priv("ListSyncedAssets"))
 
+		// Extracción de texto de folletos (paso 1 del flujo).
+		g.POST("/brief/extract", m.priv("ExtractBrief"))
+
 		// Logs — admin-only (tenant admins manage their own resources;
 		// platform superadmin reaches them via tenant selection or X-Tenant-Slug).
 		logs := g.Group("/logs")
@@ -349,6 +352,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 		switch method {
 		case "SyncAsset":
 			hdl.SyncAsset(c)
+		case "ExtractBrief":
+			hdl.ExtractBrief(c)
 		case "ListSyncedAssets":
 			hdl.ListSyncedAssets(c)
 		case "ListGenerationLogs":
