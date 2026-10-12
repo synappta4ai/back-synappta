@@ -37,6 +37,7 @@ import (
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
 	"synapta/internal/modules/model"
+	mcpmodule "synapta/internal/modules/mcp"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
@@ -168,6 +169,9 @@ func main() {
 	registry.Register(agent.NewModule(manager.CredentialsFor, cfg.AgentServerURL))
 
 	// Agency core with modality routes attached.
+	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.
+	registry.Register(mcpmodule.NewModule(manager.EventsFor, manager.AgencyCoreFor))
+
 	agencyModule := agency.NewModule(manager.AgencyCoreFor)
 	agencyModule.AttachModality("video", func(rg *gin.RouterGroup) {
 		agencyvideo.RegisterRoutes(rg, agencyvideo.NewService(manager.AgencyCoreFor))

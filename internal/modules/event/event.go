@@ -926,6 +926,10 @@ type Handler struct {
 
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
+// Service returns the underlying domain service — consumed by the MCP module,
+// which operates on the domain directly instead of over gin.
+func (h *Handler) Service() *Service { return h.svc }
+
 // ─── Events ─────────────────────────────────────────────────────
 
 // Create handles POST /events
