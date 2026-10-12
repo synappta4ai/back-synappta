@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,45 +33,107 @@ const (
 	openrouterModel = "openai/gpt-4o-mini"
 	anthropicBase   = "https://api.anthropic.com"
 	anthropicPath   = "/v1/messages"
-	anthropicModel  = "claude-3-haiku-20240307"
+	// claude-3-haiku-20240307 fue retirado del API (404 not_found_error).
+	anthropicModel = "claude-haiku-4-5"
 )
 
 const (
-	// anglesSystemPrompt exige el artefacto sales_angles en JSON puro.
-	anglesSystemPrompt = `Sos el generador de ángulos de venta de Synapta para emprendimientos inmobiliarios.
-Respondé EXCLUSIVAMENTE con JSON válido, sin markdown y sin texto fuera del JSON:
-{"angles":[{"title":"...","hook":"...","narrative_pitch":"...","target_audience":"...","selected":false}]}
-Respetá exactamente la cantidad de ángulos que el mensaje pide.`
-
-	chatSystemPrompt = `Sos el asistente inmobiliario de Synapta. Respondé en español, con tono profesional y conciso.`
+	// convMaxMsgs guarda los últimos mensajes por conversación (10 turnos).
+	convMaxMsgs = 20
+	// convMaxConvs es el tope de conversaciones en memoria.
+	convMaxConvs = 256
 )
 
-// angleRe detecta el pedido de ángulos del flujo /agency en el mensaje.
+// angleRe detecta el pedido de ángulos del flujo /agency en el mensaje
+// cuando el front no marcó el artefacto explícitamente (ruta legada).
 var angleRe = regexp.MustCompile(`(?i)(á|a)ngulo`)
 
+// chatMsg es un turno del historial en formato OpenAI/Anthropic.
+type chatMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// convStore guarda el historial de turnos del fallback directo en
+// memoria: sin agent-server no hay persistencia entre llamadas y el
+// panel de chat del front necesita continuidad de conversación.
+type convStore struct {
+	mu    sync.Mutex
+	turns map[string][]chatMsg
+	order []string
+}
+
+func newConvStore() *convStore {
+	return &convStore{turns: make(map[string][]chatMsg)}
+}
+
+// history devuelve el historial previo de la conversación.
+func (s *convStore) history(id string) []chatMsg {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]chatMsg, len(s.turns[id]))
+	copy(out, s.turns[id])
+	return out
+}
+
+// append agrega los mensajes del turno y expulsa la conversación más
+// vieja si se supera el tope.
+func (s *convStore) append(id string, msgs ...chatMsg) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.turns[id]; !ok {
+		s.order = append(s.order, id)
+	}
+	turns := append(s.turns[id], msgs...)
+	if len(turns) > convMaxMsgs {
+		turns = turns[len(turns)-convMaxMsgs:]
+	}
+	s.turns[id] = turns
+	for len(s.order) > convMaxConvs {
+		delete(s.turns, s.order[0])
+		s.order = s.order[1:]
+	}
+}
+
 // directChat atiende un turno sin agent-server: resuelve provider/modelo,
-// llama al LLM del tenant y responde con los mismos eventos SSE.
+// elige la persona experta del workflow y llama al LLM del tenant,
+// emitiendo los mismos eventos SSE que el front espera.
 func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve) {
 	provider, model, useCred := routeLLM(hdl, req, cred)
 
-	system := chatSystemPrompt
-	wantsAngles := angleRe.MatchString(req.Message)
+	// El experto del flujo /agency define el tono y el conocimiento;
+	// el artefacto sales_angles solo cuando lo pide el front (o la ruta
+	// legada cuyo mensaje menciona ángulos).
+	persona := personaFor(req.Workflow)
+	wantsAngles := req.Artifact == "sales_angles" || (req.Artifact == "" && angleRe.MatchString(req.Message))
+	system := persona.ChatSystem
 	if wantsAngles {
-		system = anglesSystemPrompt
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), llmTimeout)
-	defer cancel()
-
-	answer, err := llmAnswer(ctx, m.client, provider, useCred, model, system, req.Message)
-	if err != nil {
-		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
-		return
+		system = persona.AnglesSystem
 	}
 
 	convID := req.ConversationID
 	if convID == "" {
 		convID = "local-" + uuid.NewString()
+	}
+
+	// El artefacto es one-shot (sin memoria); el chat arrastra el
+	// historial para que el experto recuerde el proyecto entre turnos.
+	msgs := []chatMsg{{Role: "user", Content: req.Message}}
+	if !wantsAngles {
+		msgs = append(m.convs.history(convID), msgs...)
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), llmTimeout)
+	defer cancel()
+
+	answer, err := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs)
+	if err != nil {
+		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
+		return
+	}
+	if !wantsAngles {
+		m.convs.append(convID, msgs...)
+		m.convs.append(convID, chatMsg{Role: "assistant", Content: answer})
 	}
 
 	c.Status(http.StatusOK)
@@ -128,9 +191,10 @@ func defaultLLMModel(provider string) string {
 	return openrouterModel
 }
 
-// llmAnswer hace una llamada chat-completion (no streaming) y devuelve el
-// texto del asistente.
-func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *credential.Resolve, model, system, user string) (string, error) {
+// llmAnswer hace una llamada chat-completion (no streaming) con el
+// system prompt y el historial de mensajes, y devuelve el texto del
+// asistente.
+func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *credential.Resolve, model, system string, msgs []chatMsg) (string, error) {
 	if provider != credential.ProviderOpenRouter && provider != credential.ProviderAnthropic {
 		return "", fmt.Errorf("provider %q sin soporte directo: usá openrouter o anthropic", provider)
 	}
@@ -152,10 +216,6 @@ func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *
 		path = ep
 	}
 
-	type chatMsg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
 	var body []byte
 	var err error
 	if anthropic {
@@ -163,17 +223,14 @@ func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *
 			"model":      model,
 			"max_tokens": 2048,
 			"system":     system,
-			"messages":   []chatMsg{{Role: "user", Content: user}},
+			"messages":   msgs,
 		})
 	} else {
 		body, err = json.Marshal(map[string]any{
 			"model":       model,
 			"temperature": 0.7,
 			"max_tokens":  2048,
-			"messages": []chatMsg{
-				{Role: "system", Content: system},
-				{Role: "user", Content: user},
-			},
+			"messages":    append([]chatMsg{{Role: "system", Content: system}}, msgs...),
 		})
 	}
 	if err != nil {

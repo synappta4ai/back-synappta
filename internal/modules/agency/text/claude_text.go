@@ -80,10 +80,11 @@ func (g *ClaudeTextGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 	}
 
 	// Map internal model name to a real Anthropic model ID.
+	// (claude-3-haiku-20240307 fue retirado del API: 404 not_found_error.)
 	apiModel := req.Model
 	switch req.Model {
 	case "claude-text", "claude":
-		apiModel = "claude-3-haiku-20240307"
+		apiModel = "claude-haiku-4-5"
 	}
 
 	return map[string]interface{}{

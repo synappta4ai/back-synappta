@@ -160,7 +160,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-test"}
-		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "openai/gpt-4o-mini", "sys", "hola")
+		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "openai/gpt-4o-mini", "sys", []chatMsg{{Role: "user", Content: "hola"}})
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -186,7 +186,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-ant"}
-		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderAnthropic, cred, "claude-3-haiku-20240307", "sys", "hola")
+		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderAnthropic, cred, "claude-3-haiku-20240307", "sys", []chatMsg{{Role: "user", Content: "hola"}})
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -209,7 +209,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-test"}
-		_, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "m", "s", "hola")
+		_, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "m", "s", []chatMsg{{Role: "user", Content: "hola"}})
 		if err == nil || !strings.Contains(err.Error(), "insufficient credits") {
 			t.Fatalf("err=%v, want insufficient credits", err)
 		}
@@ -218,7 +218,7 @@ func TestLLMAnswer(t *testing.T) {
 	t.Run("provider sin soporte directo", func(t *testing.T) {
 		t.Parallel()
 		cred := &credential.Resolve{APIKey: "k"}
-		_, err := llmAnswer(context.Background(), http.DefaultClient, credential.ProviderGemini, cred, "m", "s", "hola")
+		_, err := llmAnswer(context.Background(), http.DefaultClient, credential.ProviderGemini, cred, "m", "s", []chatMsg{{Role: "user", Content: "hola"}})
 		if err == nil || !strings.Contains(err.Error(), "openrouter") {
 			t.Fatalf("err=%v, want mención a openrouter", err)
 		}

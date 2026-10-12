@@ -33,6 +33,9 @@ type chatRequest struct {
 	Message        string `json:"message"`
 	Provider       string `json:"provider"`
 	Workflow       string `json:"workflow,omitempty"`
+	// Artifact pide un artefacto estructurado ("sales_angles") en vez de
+	// una respuesta conversacional. Vacío = chat normal del experto.
+	Artifact string `json:"artifact,omitempty"`
 	// Model overrides the LLM configured in admin/models (credential extra)
 	// for this single request — lets the agency flow pick the model per step.
 	Model string `json:"model,omitempty"`
@@ -43,6 +46,8 @@ type Module struct {
 	resolve  CredentialResolver
 	agentURL string
 	client   *http.Client
+	// Historial de turnos del fallback directo (ver direct.go).
+	convs *convStore
 }
 
 // NewModule creates the proxy module. agentURL points at the DCS Agent
@@ -58,24 +63,55 @@ func NewModule(resolve CredentialResolver, agentURL string) *Module {
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	return &Module{resolve: resolve, agentURL: strings.TrimRight(agentURL, "/"), client: &http.Client{Transport: transport}}
+	return &Module{
+		resolve:  resolve,
+		agentURL: strings.TrimRight(agentURL, "/"),
+		client:   &http.Client{Transport: transport},
+		convs:    newConvStore(),
+	}
 }
 
 // Name implements modules.Module.
 func (m *Module) Name() string { return "agent" }
 
 // Register implements modules.Module: POST /agent/chat (auth + tenant).
+// Además registra las tres rutas especializadas del flujo /agency, una
+// por agente experto; el workflow lo fija la URL, sin depender del body.
 func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFunc) {
 	g := rg.Group("/agent")
 	g.Use(authMw, tenantMw)
 	{
 		g.POST("/chat", m.Chat)
+		for _, slug := range []string{"commercial", "real-estate", "cinema"} {
+			s := slug
+			g.POST("/chat/"+s, func(c *gin.Context) { m.ChatWorkflow(c, s) })
+		}
 	}
 }
 
+// ChatWorkflow procesa un turno de una ruta especializada
+// (/agent/chat/commercial|real-estate|cinema): el slug de la URL elige
+// al experto que atiende el flujo /agency.
+func (m *Module) ChatWorkflow(c *gin.Context, slug string) {
+	workflow, ok := workflowFromSlug(slug)
+	if !ok {
+		utils.BadRequest(c, fmt.Sprintf("unknown agent %q", slug))
+		return
+	}
+	m.chatTurn(c, workflow)
+}
+
 // Chat forwards one message to the agent server and streams its SSE answer
-// back to the client, adding the tenant's LLM credentials as headers.
+// back to the client, adding the tenant's LLM credentials as headers. El
+// workflow sale del body (ruta legada /agent/chat).
 func (m *Module) Chat(c *gin.Context) {
+	m.chatTurn(c, "")
+}
+
+// chatTurn atiende un turno con el workflow forzado por la ruta (vacío
+// = el del body): primero el agent-server, y si no responde el fallback
+// directo con la persona experta del workflow.
+func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	hdl, ok := m.resolve(c)
 	if !ok {
 		return
@@ -90,6 +126,9 @@ func (m *Module) Chat(c *gin.Context) {
 	if req.Message == "" {
 		utils.BadRequest(c, "message is required")
 		return
+	}
+	if forcedWorkflow != "" {
+		req.Workflow = forcedWorkflow
 	}
 	if !credential.IsValidProvider(req.Provider) {
 		utils.BadRequest(c, fmt.Sprintf("invalid provider %q", req.Provider))
