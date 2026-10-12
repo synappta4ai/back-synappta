@@ -96,16 +96,35 @@ func TestWorkflowFromSlug(t *testing.T) {
 func TestConvStore(t *testing.T) {
 	t.Parallel()
 
+	key := func(conv string) conversationKey {
+		return conversationKey{TenantID: 1, UserID: 7, ConvID: conv}
+	}
+
 	t.Run("historial por conversación", func(t *testing.T) {
 		t.Parallel()
 		s := newConvStore()
-		s.append("a", chatMsg{Role: "user", Content: "hola"})
-		s.append("a", chatMsg{Role: "assistant", Content: "hey"})
-		if got := s.history("a"); len(got) != 2 {
+		s.append(key("a"), chatMsg{Role: "user", Content: "hola"})
+		s.append(key("a"), chatMsg{Role: "assistant", Content: "hey"})
+		if got := s.history(key("a")); len(got) != 2 {
 			t.Fatalf("len=%d, want 2", len(got))
 		}
-		if got := s.history("b"); len(got) != 0 {
+		if got := s.history(key("b")); len(got) != 0 {
 			t.Errorf("la conversación b no debería tener historial, len=%d", len(got))
+		}
+	})
+
+	t.Run("aisla el mismo conversation_id entre tenants y usuarios", func(t *testing.T) {
+		t.Parallel()
+		s := newConvStore()
+		tA := conversationKey{TenantID: 1, UserID: 7, ConvID: "shared"}
+		tB := conversationKey{TenantID: 2, UserID: 7, ConvID: "shared"}
+		uB := conversationKey{TenantID: 1, UserID: 8, ConvID: "shared"}
+		s.append(tA, chatMsg{Role: "user", Content: "dato sensible del tenant 1"})
+		if got := s.history(tB); len(got) != 0 {
+			t.Errorf("el tenant 2 no debería ver el historial del tenant 1, len=%d", len(got))
+		}
+		if got := s.history(uB); len(got) != 0 {
+			t.Errorf("otro usuario del mismo tenant no debería ver el historial, len=%d", len(got))
 		}
 	})
 
@@ -113,9 +132,9 @@ func TestConvStore(t *testing.T) {
 		t.Parallel()
 		s := newConvStore()
 		for i := 0; i < convMaxMsgs+6; i++ {
-			s.append("a", chatMsg{Role: "user", Content: "m"})
+			s.append(key("a"), chatMsg{Role: "user", Content: "m"})
 		}
-		if got := s.history("a"); len(got) != convMaxMsgs {
+		if got := s.history(key("a")); len(got) != convMaxMsgs {
 			t.Errorf("len=%d, want %d", len(got), convMaxMsgs)
 		}
 	})
@@ -124,7 +143,7 @@ func TestConvStore(t *testing.T) {
 		t.Parallel()
 		s := newConvStore()
 		for i := 0; i < convMaxConvs+3; i++ {
-			s.append(string(rune('a'+i%26))+string(rune('a'+i/26)), chatMsg{Role: "user", Content: "m"})
+			s.append(key(string(rune('a'+i%26))+string(rune('a'+i/26))), chatMsg{Role: "user", Content: "m"})
 		}
 		s.mu.Lock()
 		n := len(s.turns)

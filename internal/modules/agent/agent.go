@@ -20,12 +20,21 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/modules/agency"
 	"synapta/internal/modules/credential"
+	"synapta/internal/modules/event"
+	"synapta/internal/toolkit"
 	"synapta/internal/utils"
 )
 
 // CredentialResolver supplies the tenant-scoped credential handler per request.
 type CredentialResolver func(c *gin.Context) (*credential.Handler, bool)
+
+// EventsResolver supplies the tenant-scoped events handler per request.
+type EventsResolver func(c *gin.Context) (*event.Handler, bool)
+
+// CoreResolver supplies the tenant-scoped agency core per request.
+type CoreResolver func(c *gin.Context) (*agency.Core, bool)
 
 // chatRequest is the front-end payload for one agent chat turn.
 type chatRequest struct {
@@ -44,6 +53,8 @@ type chatRequest struct {
 // Module registers the /agent routes (tenant-scoped).
 type Module struct {
 	resolve  CredentialResolver
+	events   EventsResolver
+	core     CoreResolver
 	agentURL string
 	client   *http.Client
 	// Historial de turnos del fallback directo (ver direct.go).
@@ -51,8 +62,10 @@ type Module struct {
 }
 
 // NewModule creates the proxy module. agentURL points at the DCS Agent
-// server (default http://localhost:3200).
-func NewModule(resolve CredentialResolver, agentURL string) *Module {
+// server (default http://localhost:3200). events/core aportan los servicios
+// del tenant que el loop de tool-calling del asistente necesita (mismos
+// resolvers del runtime que usa el módulo MCP).
+func NewModule(resolve CredentialResolver, events EventsResolver, core CoreResolver, agentURL string) *Module {
 	if strings.TrimSpace(agentURL) == "" {
 		agentURL = "http://localhost:3200"
 	}
@@ -65,6 +78,8 @@ func NewModule(resolve CredentialResolver, agentURL string) *Module {
 	}
 	return &Module{
 		resolve:  resolve,
+		events:   events,
+		core:     core,
 		agentURL: strings.TrimRight(agentURL, "/"),
 		client:   &http.Client{Transport: transport},
 		convs:    newConvStore(),
@@ -145,6 +160,11 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 		return
 	}
 
+	// Servicios del tenant para el loop de tool-calling del fallback directo.
+	// Si el bundle no resuelve, el chat sigue igual sin tools: no se cae el
+	// turno por falta de dominio.
+	deps := m.tenantDeps(c)
+
 	payload, err := json.Marshal(map[string]string{
 		"conversation_id": req.ConversationID,
 		"message":         req.Message,
@@ -179,7 +199,7 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 		if c.Request.Context().Err() != nil {
 			return
 		}
-		m.directChat(c, req, hdl, cred)
+		m.directChat(c, req, hdl, cred, deps)
 		return
 	}
 	defer resp.Body.Close()
@@ -210,6 +230,35 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 			break
 		}
 	}
+}
+
+// tenantDeps materializa los servicios del tenant (eventos + core de
+// generación) con la identidad del usuario para el loop de tool-calling.
+// Devuelve nil si el bundle no está disponible: el turno de chat sigue sin
+// tools en vez de fallar.
+func (m *Module) tenantDeps(c *gin.Context) *toolkit.Deps {
+	if m.events == nil || m.core == nil {
+		return nil
+	}
+	eventsHdl, ok := m.events(c)
+	if !ok {
+		return nil
+	}
+	core, ok := m.core(c)
+	if !ok {
+		return nil
+	}
+	deps := &toolkit.Deps{
+		Events: eventsHdl.Service(),
+		Core:   core,
+		UserID: utils.UserIDFromContext(c),
+	}
+	if v, ok := c.Get("username"); ok {
+		if s, ok := v.(string); ok {
+			deps.Username = s
+		}
+	}
+	return deps
 }
 
 // modelFromExtra pulls the "model" field out of the credential's extra JSON.

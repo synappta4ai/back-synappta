@@ -166,7 +166,7 @@ func main() {
 	registry.Register(skill.NewModule(manager.SkillsFor))
 	registry.Register(push.NewModule(manager.PushFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
-	registry.Register(agent.NewModule(manager.CredentialsFor, cfg.AgentServerURL))
+	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, cfg.AgentServerURL))
 
 	// Agency core with modality routes attached.
 	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.

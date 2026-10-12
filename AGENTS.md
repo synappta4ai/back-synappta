@@ -57,6 +57,33 @@ the API catalog. Flow:
   orphaned downloaded task polls as `running` forever (the worker does not
   expose a job-status-by-id RPC yet).
 
+## Remote MCP server & assistant tool-calling
+
+Two surfaces expose the same tenant-scoped domain operations:
+
+- **`internal/modules/mcp`** — remote MCP server (Streamable HTTP, stateless
+  JSON) at `POST/GET/DELETE /api/v1/mcp`, behind the same auth+tenant
+  middleware as the rest of the API: clients send the normal login Bearer,
+  no new credentials. Built on the official `modelcontextprotocol/go-sdk`.
+- **`internal/modules/agent`** — the `/agency` assistant's direct fallback
+  runs an agentic loop (`loop.go`, OpenAI + Anthropic wire formats) with the
+  tools in `tools.go` (list/create/update projects, list models,
+  generate video/image, list generations, cancel task). Emits SSE `tool`
+  events for live front activity; caps at 6 rounds.
+
+Both delegate to **`internal/toolkit`** — the shared domain operations
+(find-or-create project/piece anchoring, generation slot numbering, live
+catalog). Add domain capabilities THERE, not in either module.
+
+Key rules:
+
+- Tools operate on the per-request tenant bundle (schema-per-tenant pools):
+  never add cross-tenant state. The assistant's in-memory conversation
+  store is keyed by (tenant, user, conversation) on purpose.
+- `generate_*` tools queue real provider spend — keep them behind the same
+  refund/estimate paths as the REST endpoints (they call `GenerateUnified`).
+- The LLM loop must honor a credential's custom `BaseURL` (gateways).
+
 ## Provider spend (cost tracking)
 
 - Generation records carry `cost_credits`, `cost_usd`, `cost_source`

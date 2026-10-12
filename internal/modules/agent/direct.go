@@ -21,6 +21,8 @@ import (
 	"github.com/google/uuid"
 
 	"synapta/internal/modules/credential"
+	"synapta/internal/tenancy"
+	"synapta/internal/toolkit"
 	"synapta/internal/utils"
 )
 
@@ -36,6 +38,13 @@ const (
 	// claude-3-haiku-20240307 fue retirado del API (404 not_found_error).
 	anthropicModel = "claude-haiku-4-5"
 )
+
+// toolsSystemHint se aplica al system del experto cuando el turno tiene
+// herramientas: le dice que puede operar el tenant (y que debe consultar
+// antes de inventar datos).
+const toolsSystemHint = `
+
+Tenés herramientas para operar la plataforma Synapta del usuario: listar y crear proyectos, listar modelos, generar videos e imágenes, consultar el estado de las generaciones y cancelar tareas. Usalas antes de responder cuando la respuesta dependa de datos reales (qué proyectos existen, qué modelos hay, cómo va una generación). Nunca inventes ids ni estados: si necesitás un dato, consultalo con la herramienta. Cuando generes un video o una imagen, informá el task_id para que el usuario pueda seguirlo en la cola.`
 
 const (
 	// convMaxMsgs guarda los últimos mensajes por conversación (10 turnos).
@@ -54,41 +63,56 @@ type chatMsg struct {
 	Content string `json:"content"`
 }
 
+// conversationKey identifica una conversación DENTRO de su tenant y
+// usuario: dos tenants (o dos usuarios del mismo tenant) que manden el
+// mismo conversation_id nunca comparten historial — el aislamiento no
+// depende de que el cliente elija ids únicos.
+type conversationKey struct {
+	TenantID int64
+	UserID   int64
+	ConvID   string
+}
+
 // convStore guarda el historial de turnos del fallback directo en
 // memoria: sin agent-server no hay persistencia entre llamadas y el
 // panel de chat del front necesita continuidad de conversación.
+//
+// Las claves son (tenant, usuario, conversación): aislar por tenant+user
+// garantiza que un conversation_id ajeno no filtre historial de otro
+// flujo (regla del workspace: los flujos se mantienen aislados por
+// multitenant).
 type convStore struct {
 	mu    sync.Mutex
-	turns map[string][]chatMsg
-	order []string
+	turns map[conversationKey][]chatMsg
+	order []conversationKey
 }
 
 func newConvStore() *convStore {
-	return &convStore{turns: make(map[string][]chatMsg)}
+	return &convStore{turns: make(map[conversationKey][]chatMsg)}
 }
 
 // history devuelve el historial previo de la conversación.
-func (s *convStore) history(id string) []chatMsg {
+func (s *convStore) history(key conversationKey) []chatMsg {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]chatMsg, len(s.turns[id]))
-	copy(out, s.turns[id])
+	out := make([]chatMsg, len(s.turns[key]))
+	copy(out, s.turns[key])
 	return out
 }
 
 // append agrega los mensajes del turno y expulsa la conversación más
 // vieja si se supera el tope.
-func (s *convStore) append(id string, msgs ...chatMsg) {
+func (s *convStore) append(key conversationKey, msgs ...chatMsg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.turns[id]; !ok {
-		s.order = append(s.order, id)
+	if _, ok := s.turns[key]; !ok {
+		s.order = append(s.order, key)
 	}
-	turns := append(s.turns[id], msgs...)
+	turns := append(s.turns[key], msgs...)
 	if len(turns) > convMaxMsgs {
 		turns = turns[len(turns)-convMaxMsgs:]
 	}
-	s.turns[id] = turns
+	s.turns[key] = turns
 	for len(s.order) > convMaxConvs {
 		delete(s.turns, s.order[0])
 		s.order = s.order[1:]
@@ -96,9 +120,10 @@ func (s *convStore) append(id string, msgs ...chatMsg) {
 }
 
 // directChat atiende un turno sin agent-server: resuelve provider/modelo,
-// elige la persona experta del workflow y llama al LLM del tenant,
-// emitiendo los mismos eventos SSE que el front espera.
-func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve) {
+// elige la persona experta del workflow y llama al LLM del tenant con sus
+// herramientas (loop de tool-calling), emitiendo los eventos SSE que el
+// front espera más los eventos "tool" del avance de cada invocación.
+func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve, deps *toolkit.Deps) {
 	provider, model, useCred := routeLLM(hdl, req, cred)
 
 	// El experto del flujo /agency define el tono y el conocimiento;
@@ -109,31 +134,55 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 	system := persona.ChatSystem
 	if wantsAngles {
 		system = persona.AnglesSystem
+	} else if deps != nil {
+		// Con herramientas disponibles el experto pasa a ser operador:
+		// consulta y ejecuta sobre el tenant antes de contestar.
+		system = persona.ChatSystem + toolsSystemHint
 	}
 
 	convID := req.ConversationID
 	if convID == "" {
 		convID = "local-" + uuid.NewString()
 	}
+	// Historial aislado por tenant+usuario: un conversation_id repetido en
+	// otro tenant (o de otro usuario) nunca cruza datos.
+	convKey := conversationKey{
+		TenantID: tenantIDFrom(c),
+		UserID:   utils.UserIDFromContext(c),
+		ConvID:   convID,
+	}
 
 	// El artefacto es one-shot (sin memoria); el chat arrastra el
 	// historial para que el experto recuerde el proyecto entre turnos.
 	msgs := []chatMsg{{Role: "user", Content: req.Message}}
 	if !wantsAngles {
-		msgs = append(m.convs.history(convID), msgs...)
+		msgs = append(m.convs.history(convKey), msgs...)
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), llmTimeout)
 	defer cancel()
 
-	answer, err := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs)
+	var answer string
+	var err error
+	if wantsAngles || deps == nil {
+		// Sin tools (arteFacto one-shot o sin bundle del tenant): una
+		// llamada directa como hasta ahora.
+		answer, err = llmAnswer(ctx, m.client, provider, useCred, model, system, msgs)
+	} else {
+		// Loop agéntico: el LLM consulta/genera y recién entonces
+		// contesta. Cada tool emite SSE "tool" al front.
+		ctx = toolkit.WithDeps(ctx, deps)
+		answer, err = runToolLoop(ctx, m.client, provider, useCred, model, system, msgs, agentTools(), func(ev toolEvent) {
+			sseWrite(c, "tool", ev)
+		})
+	}
 	if err != nil {
 		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
 		return
 	}
 	if !wantsAngles {
-		m.convs.append(convID, msgs...)
-		m.convs.append(convID, chatMsg{Role: "assistant", Content: answer})
+		m.convs.append(convKey, msgs...)
+		m.convs.append(convKey, chatMsg{Role: "assistant", Content: answer})
 	}
 
 	c.Status(http.StatusOK)
@@ -354,6 +403,15 @@ func extractAngles(raw string) ([]map[string]any, bool) {
 		})
 	}
 	return out, true
+}
+
+// tenantIDFrom lee el tenant del ctx del middleware de tenancy; 0 si no
+// hubo (tests / requests internos).
+func tenantIDFrom(c *gin.Context) int64 {
+	if t := tenancy.FromContext(c.Request.Context()); t != nil {
+		return t.ID
+	}
+	return 0
 }
 
 // sseWrite emite un evento SSE; false si el cliente ya se fue.
