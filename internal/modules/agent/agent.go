@@ -42,9 +42,14 @@ type chatRequest struct {
 	Message        string `json:"message"`
 	Provider       string `json:"provider"`
 	Workflow       string `json:"workflow,omitempty"`
-	// Artifact pide un artefacto estructurado ("sales_angles") en vez de
-	// una respuesta conversacional. Vacío = chat normal del experto.
+	// Artifact pide un artefacto estructurado del flujo /agency
+	// ("sales_angles", "scene_prompts", "scene_analysis", "storyboard",
+	// "clip_prompt") en vez de una respuesta conversacional. Vacío = chat
+	// normal del experto.
 	Artifact string `json:"artifact,omitempty"`
+	// Payload es el contexto del paso (brief, cantidades, referencias)
+	// que alimenta al artefacto sin obligar al LLM a parsear el mensaje.
+	Payload json.RawMessage `json:"payload,omitempty"`
 	// Model overrides the LLM configured in admin/models (credential extra)
 	// for this single request — lets the agency flow pick the model per step.
 	Model string `json:"model,omitempty"`
@@ -138,7 +143,13 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
-	if req.Message == "" {
+	if req.Artifact != "" {
+		if _, ok := parseArtifactKind(req.Artifact); !ok {
+			utils.BadRequest(c, fmt.Sprintf("unknown artifact %q", req.Artifact))
+			return
+		}
+	}
+	if req.Message == "" && req.Artifact == "" {
 		utils.BadRequest(c, "message is required")
 		return
 	}
@@ -164,6 +175,13 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	// Si el bundle no resuelve, el chat sigue igual sin tools: no se cae el
 	// turno por falta de dominio.
 	deps := m.tenantDeps(c)
+
+	// Los turnos de artefacto del flujo /agency se resuelven siempre en el
+	// back: el agent-server no conoce los contratos por paso.
+	if req.Artifact != "" {
+		m.directChat(c, req, hdl, cred, deps)
+		return
+	}
 
 	payload, err := json.Marshal(map[string]string{
 		"conversation_id": req.ConversationID,

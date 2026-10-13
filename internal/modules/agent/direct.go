@@ -27,8 +27,17 @@ import (
 )
 
 const (
-	// llmTimeout mata la llamada antes de que el front abortue a los 45s.
+	// llmTimeout mata la llamada de chat antes de que el front abortue.
 	llmTimeout = 40 * time.Second
+
+	// artifactTimeout es más holgado: los artefactos ricos (prompt_video
+	// de hasta 600 palabras) tardan más que un turno de chat.
+	artifactTimeout = 60 * time.Second
+
+	// chatMaxTokens limita el chat libre; artifactMaxTokens da margen a
+	// los contratos largos de los .md (§2.7 del plan).
+	chatMaxTokens     = 2048
+	artifactMaxTokens = 4096
 
 	openrouterBase  = "https://openrouter.ai/api/v1"
 	openrouterPath  = "/chat/completions"
@@ -129,21 +138,28 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 	// El experto del flujo /agency define el tono y el conocimiento;
 	// el artefacto sales_angles solo cuando lo pide el front (o la ruta
 	// legada cuyo mensaje menciona ángulos).
+	// Turno de artefacto (paso del flujo /agency): contrato JSON en vez
+	// de chat, con las secciones del .md del paso. La ruta legacy del
+	// sales_angles (mensaje que menciona "ángulo" sin marcar el artefacto)
+	// sigue cayendo en el mismo camino.
+	kind := req.Artifact
+	if kind == "" && angleRe.MatchString(req.Message) {
+		kind = artifactSalesAngles
+	}
+	if spec, ok := parseArtifactKind(kind); ok {
+		m.artifactTurn(c, req, hdl, cred, spec)
+		return
+	}
+
 	persona := personaFor(req.Workflow)
-	wantsAngles := req.Artifact == "sales_angles" || (req.Artifact == "" && angleRe.MatchString(req.Message))
 	system := persona.ChatSystem
-	if wantsAngles {
-		system = persona.AnglesSystem
-	} else if deps != nil {
+	if deps != nil {
 		// Con herramientas disponibles el experto pasa a ser operador:
 		// consulta y ejecuta sobre el tenant antes de contestar.
 		system = persona.ChatSystem + toolsSystemHint
 	}
 
-	convID := req.ConversationID
-	if convID == "" {
-		convID = "local-" + uuid.NewString()
-	}
+	convID := convIDFor(req)
 	// Historial aislado por tenant+usuario: un conversation_id repetido en
 	// otro tenant (o de otro usuario) nunca cruza datos.
 	convKey := conversationKey{
@@ -152,22 +168,19 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 		ConvID:   convID,
 	}
 
-	// El artefacto es one-shot (sin memoria); el chat arrastra el
-	// historial para que el experto recuerde el proyecto entre turnos.
-	msgs := []chatMsg{{Role: "user", Content: req.Message}}
-	if !wantsAngles {
-		msgs = append(m.convs.history(convKey), msgs...)
-	}
+	// El chat arrastra el historial para que el experto recuerde el
+	// proyecto entre turnos (los artefactos son one-shot y van por
+	// artifactTurn, que no usa memoria).
+	msgs := append(m.convs.history(convKey), chatMsg{Role: "user", Content: req.Message})
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), llmTimeout)
 	defer cancel()
 
 	var answer string
 	var err error
-	if wantsAngles || deps == nil {
-		// Sin tools (arteFacto one-shot o sin bundle del tenant): una
-		// llamada directa como hasta ahora.
-		answer, err = llmAnswer(ctx, m.client, provider, useCred, model, system, msgs)
+	if deps == nil {
+		// Sin bundle del tenant (sin tools): una llamada directa.
+		answer, err = llmAnswer(ctx, m.client, provider, useCred, model, system, msgs, chatMaxTokens)
 	} else {
 		// Loop agéntico: el LLM consulta/genera y recién entonces
 		// contesta. Cada tool emite SSE "tool" al front.
@@ -180,10 +193,8 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
 		return
 	}
-	if !wantsAngles {
-		m.convs.append(convKey, msgs...)
-		m.convs.append(convKey, chatMsg{Role: "assistant", Content: answer})
-	}
+	m.convs.append(convKey, msgs...)
+	m.convs.append(convKey, chatMsg{Role: "assistant", Content: answer})
 
 	c.Status(http.StatusOK)
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
@@ -194,16 +205,140 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 	if !sseWrite(c, "meta", map[string]string{"conversation_id": convID}) {
 		return
 	}
-	if !wantsAngles {
-		sseWrite(c, "text", map[string]string{"text": answer})
+	sseWrite(c, "text", map[string]string{"text": answer})
+}
+
+// artifactTurn atiende un turno de artefacto del flujo /agency sin tools:
+// arma el system prompt con las secciones del .md del paso, pide el JSON
+// del contrato (con más tokens que el chat), lo valida contra el contrato
+// y emite el evento "artifact". Si el artefacto pide información al
+// usuario emite "questions" y fin de turno; el paso 1 inmobiliario
+// mantiene además el alias legacy "sales_angles".
+func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve, spec artifactSpec) {
+	provider, model, useCred := routeLLM(hdl, req, cred)
+
+	system := systemFor(req.Workflow, spec.Step)
+	if system == "" {
+		// Sin secciones del .md embebido cae al prompt de la persona.
+		system = personaFor(req.Workflow).AnglesSystem
+	}
+
+	payload := decodePayload(req.Payload)
+	msgs := []chatMsg{{Role: "user", Content: artifactUserMessage(req, spec)}}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), artifactTimeout)
+	defer cancel()
+
+	answer, err := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs, artifactMaxTokens)
+	if err != nil {
+		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
 		return
 	}
-	angles, ok := extractAngles(answer)
+	data, ok := extractArtifactJSON(answer)
 	if !ok {
-		sseWrite(c, "error", map[string]string{"message": "el LLM no devolvió ángulos en JSON"})
+		startSSE(c)
+		sseWrite(c, "meta", map[string]string{"conversation_id": convIDFor(req)})
+		sseWrite(c, "error", map[string]string{"message": "el LLM no devolvió el artefacto en JSON"})
 		return
 	}
-	sseWrite(c, "sales_angles", map[string]any{"angles": angles})
+
+	startSSE(c)
+	if !sseWrite(c, "meta", map[string]string{"conversation_id": convIDFor(req)}) {
+		return
+	}
+
+	// Un solo reintento de corrección si el contrato no se cumple (§6.2):
+	// si persiste, el artefacto se devuelve con advertencias en vez de
+	// fallar el turno.
+	warns := validateArtifact(spec, data, payload)
+	for attempt := 0; len(warns) > 0 && attempt < 1; attempt++ {
+		msgs = append(msgs,
+			chatMsg{Role: "assistant", Content: answer},
+			chatMsg{Role: "user", Content: correctionMessage(warns)},
+		)
+		retry, retryErr := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs, artifactMaxTokens)
+		if retryErr != nil {
+			break
+		}
+		fixed, fixedOK := extractArtifactJSON(retry)
+		if !fixedOK {
+			break
+		}
+		answer, data = retry, fixed
+		warns = validateArtifact(spec, data, payload)
+	}
+
+	// Estado "necesita_informacion": solo preguntas al chat, sin artefacto.
+	if questions := artifactQuestions(data); questions != nil {
+		if len(questions) == 0 {
+			// El modelo pidió información sin concretar preguntas: no se
+			// cierra el turno en vacío.
+			questions = []string{"El agente necesita más información para continuar: completá el brief del paso o consultá qué falta."}
+		}
+		sseWrite(c, "questions", map[string]any{
+			"step":      spec.Step,
+			"kind":      spec.Kind,
+			"questions": questions,
+		})
+		return
+	}
+	if len(warns) > 0 {
+		appendWarnings(data, warns)
+	}
+
+	if spec.Kind == artifactSalesAngles {
+		normalizeSalesAngles(data)
+		// Alias legacy: el front actual todavía escucha "sales_angles"
+		// para el paso 1 inmobiliario; se retira en la Fase 3.
+		sseWrite(c, "sales_angles", map[string]any{"angles": data["angles"]})
+	}
+	sseWrite(c, "artifact", map[string]any{
+		"step": spec.Step,
+		"kind": spec.Kind,
+		"data": data,
+	})
+}
+
+// artifactUserMessage arma el mensaje de un turno de artefacto: el
+// payload del paso (brief, cantidades, referencias) como JSON legible, más
+// el mensaje libre del usuario si lo hubo. Sin payload, el mensaje lleva
+// la entrada completa (ruta legacy).
+func artifactUserMessage(req chatRequest, spec artifactSpec) string {
+	var sb strings.Builder
+	if req.Message != "" {
+		sb.WriteString("Mensaje del usuario: ")
+		sb.WriteString(req.Message)
+		sb.WriteString("\n\n")
+	}
+	if len(req.Payload) > 0 {
+		fmt.Fprintf(&sb, "Entrada del paso %d (%s):\n", spec.Step, spec.Kind)
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, req.Payload, "", "  "); err == nil {
+			sb.Write(buf.Bytes())
+		} else {
+			sb.Write(req.Payload)
+		}
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("Respondé EXCLUSIVAMENTE con el JSON de la SALIDA de ese paso, sin markdown ni texto alrededor.")
+	return sb.String()
+}
+
+// convIDFor devuelve el conversation_id del turno o uno local nuevo.
+func convIDFor(req chatRequest) string {
+	if req.ConversationID != "" {
+		return req.ConversationID
+	}
+	return "local-" + uuid.NewString()
+}
+
+// startSSE abre las cabeceras del stream SSE de la respuesta.
+func startSSE(c *gin.Context) {
+	c.Status(http.StatusOK)
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Flush()
 }
 
 // routeLLM decide provider/modelo reales de la llamada. Un slug estilo
@@ -242,8 +377,8 @@ func defaultLLMModel(provider string) string {
 
 // llmAnswer hace una llamada chat-completion (no streaming) con el
 // system prompt y el historial de mensajes, y devuelve el texto del
-// asistente.
-func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *credential.Resolve, model, system string, msgs []chatMsg) (string, error) {
+// asistente. maxTokens acota la respuesta (chat vs. artefacto).
+func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *credential.Resolve, model, system string, msgs []chatMsg, maxTokens int) (string, error) {
 	if provider != credential.ProviderOpenRouter && provider != credential.ProviderAnthropic {
 		return "", fmt.Errorf("provider %q sin soporte directo: usá openrouter o anthropic", provider)
 	}
@@ -270,7 +405,7 @@ func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *
 	if anthropic {
 		body, err = json.Marshal(map[string]any{
 			"model":      model,
-			"max_tokens": 2048,
+			"max_tokens": maxTokens,
 			"system":     system,
 			"messages":   msgs,
 		})
@@ -278,7 +413,7 @@ func llmAnswer(ctx context.Context, client *http.Client, provider string, cred *
 		body, err = json.Marshal(map[string]any{
 			"model":       model,
 			"temperature": 0.7,
-			"max_tokens":  2048,
+			"max_tokens":  maxTokens,
 			"messages":    append([]chatMsg{{Role: "system", Content: system}}, msgs...),
 		})
 	}
@@ -365,44 +500,6 @@ func parseLLMText(raw []byte, anthropic bool) (string, error) {
 		return "", fmt.Errorf("respuesta vacía del llm")
 	}
 	return parsed.Choices[0].Message.Content, nil
-}
-
-// extractAngles saca {"angles":[…]} de la respuesta del LLM, tolerando
-// fences markdown y texto alrededor.
-func extractAngles(raw string) ([]map[string]any, bool) {
-	s := strings.TrimSpace(raw)
-	start := strings.IndexByte(s, '{')
-	end := strings.LastIndexByte(s, '}')
-	if start < 0 || end <= start {
-		return nil, false
-	}
-	var parsed struct {
-		Angles []map[string]any `json:"angles"`
-	}
-	if err := json.Unmarshal([]byte(s[start:end+1]), &parsed); err != nil || len(parsed.Angles) == 0 {
-		return nil, false
-	}
-
-	out := make([]map[string]any, 0, len(parsed.Angles))
-	for i, a := range parsed.Angles {
-		title := strField(a, "title")
-		if title == "" {
-			title = fmt.Sprintf("Ángulo %d", i+1)
-		}
-		hook, pitch, audience := strField(a, "hook"), strField(a, "narrative_pitch"), strField(a, "target_audience")
-		if hook == "" && pitch == "" && audience == "" {
-			// Algunos modelos devuelven un solo campo "description".
-			hook = strField(a, "description")
-		}
-		out = append(out, map[string]any{
-			"title":           title,
-			"hook":            hook,
-			"narrative_pitch": pitch,
-			"target_audience": audience,
-			"selected":        a["selected"] == true,
-		})
-	}
-	return out, true
 }
 
 // tenantIDFrom lee el tenant del ctx del middleware de tenancy; 0 si no
