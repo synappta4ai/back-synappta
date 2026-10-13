@@ -37,12 +37,12 @@ const pairingCodeTTL = 10 * time.Minute
 
 // Errors del store, comparables con errors.Is.
 var (
-	ErrCodeExpired   = errors.New("pairing code expired")
-	ErrCodeUsed      = errors.New("pairing code already used")
-	ErrCodeNotFound  = errors.New("pairing code not found")
-	ErrWorkerAuth    = errors.New("invalid worker token")
-	ErrJobNotFound   = errors.New("job not found")
-	ErrWrongWorker   = errors.New("job does not belong to this worker")
+	ErrCodeExpired  = errors.New("pairing code expired")
+	ErrCodeUsed     = errors.New("pairing code already used")
+	ErrCodeNotFound = errors.New("pairing code not found")
+	ErrWorkerAuth   = errors.New("invalid worker token")
+	ErrJobNotFound  = errors.New("job not found")
+	ErrWrongWorker  = errors.New("job does not belong to this worker")
 )
 
 // Worker es una GPU registrada (una fila por máquina emparejada).
@@ -65,20 +65,20 @@ type Worker struct {
 
 // Job es un trabajo encolado para los workers del tenant.
 type Job struct {
-	ID             string          `json:"id"`
-	TenantID       int64           `json:"-"`
-	TaskID         string          `json:"task_id"`
-	WorkerID       string          `json:"worker_id,omitempty"`
-	Payload        json.RawMessage `json:"payload"`
-	Status         string          `json:"status"`
-	Progress       float64         `json:"progress"`
-	StreamStatus   string          `json:"stream_status"`
-	ErrorMessage   string          `json:"error_message"`
-	ArtifactName   string          `json:"artifact_name"`
-	ArtifactURL    string          `json:"artifact_url"`
-	CancelRequested bool           `json:"cancel_requested"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	ID              string          `json:"id"`
+	TenantID        int64           `json:"-"`
+	TaskID          string          `json:"task_id"`
+	WorkerID        string          `json:"worker_id,omitempty"`
+	Payload         json.RawMessage `json:"payload"`
+	Status          string          `json:"status"`
+	Progress        float64         `json:"progress"`
+	StreamStatus    string          `json:"stream_status"`
+	ErrorMessage    string          `json:"error_message"`
+	ArtifactName    string          `json:"artifact_name"`
+	ArtifactURL     string          `json:"artifact_url"`
+	CancelRequested bool            `json:"cancel_requested"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 // Store persiste el registry, los códigos y la cola en el schema de sistema.
@@ -127,10 +127,10 @@ func (s *Store) CreatePairingCode(ctx context.Context, tenantID, createdBy int64
 			return "", time.Time{}, err
 		}
 		expiresAt = time.Now().Add(pairingCodeTTL)
-	_, err = s.db.ExecContext(ctx, `
+		_, err = s.db.ExecContext(ctx, `
 		INSERT INTO worker_pairing_codes (code_hash, tenant_id, created_by, expires_at)
 		VALUES ($1, $2, $3, $4)`,
-		hashToken(code), tenantID, nullableInt64(createdBy), expiresAt)
+			hashToken(code), tenantID, nullableInt64(createdBy), expiresAt)
 		if err == nil {
 			return code, expiresAt, nil
 		}
@@ -199,6 +199,9 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 		modelsText = string(models)
 	}
 	w := &Worker{}
+	// models::text vuelve como string del driver: database/sql no sabe
+	// escanearlo en *json.RawMessage (hace falta convertir a mano).
+	var modelsJSON *string
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO worker_registry
 			(tenant_id, name, token_hash, gpu_name, os, version,
@@ -210,10 +213,13 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 		tenantID, name, hashToken(token), gpu, goos, version,
 		vramTotal, vramFree, modelsText,
 	).Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
-		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &w.Models,
+		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &modelsJSON,
 		&w.LastHeartbeat, &w.CreatedAt)
 	if err != nil {
 		return nil, "", fmt.Errorf("register worker: %w", err)
+	}
+	if modelsJSON != nil {
+		w.Models = json.RawMessage(*modelsJSON)
 	}
 	w.Online = true
 	return w, token, nil
@@ -504,11 +510,15 @@ func (s *Store) scanWorker(row rowScanner) (*Worker, error) {
 
 func scanWorkerRow(row rowScanner) (*Worker, error) {
 	w := &Worker{}
+	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
 	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
-		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &w.Models,
+		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &modelsJSON,
 		&w.LastHeartbeat, &w.CreatedAt)
 	if err != nil {
 		return nil, err
+	}
+	if modelsJSON != nil {
+		w.Models = json.RawMessage(*modelsJSON)
 	}
 	w.Online = time.Since(w.LastHeartbeat) < onlineWindow
 	return w, nil

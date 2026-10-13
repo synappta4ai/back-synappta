@@ -183,7 +183,9 @@ type registerRequest struct {
 	Version     string `json:"version"`
 	VRAMTotalMB int    `json:"vram_total_mb"`
 	VRAMFreeMB  int    `json:"vram_free_mb"`
-	Models      []byte `json:"models"`
+	// RawMessage (y no []byte): el worker manda un array de objetos y
+	// []byte interpretaría JSON como base64 → 400 al emparejar.
+	Models json.RawMessage `json:"models"`
 }
 
 // registerResponse devuelve el token de larga duración (una sola vez).
@@ -233,11 +235,11 @@ func (m *Module) WorkerRegister(c *gin.Context) {
 
 // heartbeatRequest mantiene vivo el estado del worker.
 type heartbeatRequest struct {
-	GPUName    string `json:"gpu_name"`
-	Version    string `json:"version"`
-	VRAMFreeMB int    `json:"vram_free_mb"`
-	JobsActive int    `json:"jobs_active"`
-	Models     []byte `json:"models"`
+	GPUName    string          `json:"gpu_name"`
+	Version    string          `json:"version"`
+	VRAMFreeMB int             `json:"vram_free_mb"`
+	JobsActive int             `json:"jobs_active"`
+	Models     json.RawMessage `json:"models"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
