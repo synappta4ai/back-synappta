@@ -69,7 +69,7 @@ synapta/
 cp .env.example .env
 go run ./cmd/generate-keys     # genera JWT_SECRET, ENCRYPTION_KEY y claves VAPID
 docker compose up -d db        # solo Postgres
-go run .                       # API en :8099 (aplica migraciones al boot)
+go run main.go                      # API en :8099 (aplica migraciones al boot)
 ```
 
 Health: `GET /healthz` · Readiness: `GET /readyz`
