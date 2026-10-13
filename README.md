@@ -92,6 +92,34 @@ BM_ARTIFACT_PORT=50052 py -3 inference-worker/run_mock.py   # gRPC :50051 + arti
 
 Worker remoto (Colab T4 / VM): el worker anuncia su túnel y se usa esa dirección en `BM_WORKER_ADDR` (`tls://…` para cloudflared). Ver `deploy/README.md` de brain-master.
 
+### GPU de usuarios (bridge saliente, "Tu GPU")
+
+Sin `BM_WORKER_ADDR`, el back usa el **bridge saliente**: las máquinas con
+GPU de los clientes se emparejan con un código de 6 dígitos y consultan
+trabajos por HTTP long-poll — sin abrir puertos ni túneles, detrás del NAT
+del hogar. Módulo: `internal/modules/workerbridge`.
+
+- **Tablas** (schema de sistema, migración `00004_worker_registry.sql`):
+  `worker_registry` (token hasheado + snapshot del catálogo),
+  `worker_pairing_codes` (hash del código, TTL 10 min, canje único) y
+  `worker_jobs` (la cola: FIFO, `FOR UPDATE SKIP LOCKED`).
+- **Flujo**: admin del tenant → `POST /api/v1/gpu/pairing-code` → el usuario
+  corre `python pair.py` en su máquina y pega el código → el worker canjea
+  el código por un token (`POST /internal/workers/register`) → heartbeat
+  cada 20 s + claim long-poll de la cola → sube el artefacto al back
+  (`multipart`), que lo guarda en `outputs/` y lo linkea al job.
+- **Dispatch**: el generator `downloaded` encola en `worker_jobs` cuando no
+  hay `BM_WORKER_ADDR`; el estado vive en la DB (sobrevive reinicios de
+  ambos lados) y un reconciler marca `failed` los jobs de GPUs que murieron
+  (nada queda `running` eterno).
+- **Panel en la app**: "Tu GPU" (nav, role_level ≤ 1) muestra las GPUs
+  online/offline, genera el código de emparejamiento y permite revocar.
+
+```bash
+# Los endpoints del worker (register/heartbeat/claim/report/artifacts) van
+# con X-Worker-Token, sin JWT; el tenant se resuelve desde el token.
+```
+
 ## Endpoints principales
 
 ```

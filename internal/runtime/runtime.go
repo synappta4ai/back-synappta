@@ -31,6 +31,7 @@ import (
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/tenancy"
 	"synapta/internal/toolkit"
 	"synapta/internal/worker"
@@ -40,6 +41,10 @@ import (
 type Manager struct {
 	cfg *config.Config
 	reg *tenancy.Registry
+
+	// workerBridgeStore es el registry/cola de GPUs emparejadas (schema de
+	// sistema). nil → los generators downloaded viven solo del gRPC directo.
+	workerBridgeStore *workerbridge.Store
 
 	mu      sync.Mutex
 	bundles map[string]*Bundle // slug → bundle
@@ -70,6 +75,12 @@ type Bundle struct {
 // NewManager creates a bundle manager over the tenancy registry.
 func NewManager(cfg *config.Config, reg *tenancy.Registry) *Manager {
 	return &Manager{cfg: cfg, reg: reg, bundles: map[string]*Bundle{}}
+}
+
+// SetWorkerBridge habilita el camino saliente (GPU de usuarios detrás de
+// NAT) en los generators downloaded de todos los tenants.
+func (m *Manager) SetWorkerBridge(store *workerbridge.Store) {
+	m.workerBridgeStore = store
 }
 
 // Resolve returns the bundle for the request's tenant (set by the tenancy
@@ -262,10 +273,17 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API
-	// generators. Dispatches jobs to the brain-master inference worker over
-	// gRPC (stateless client: no persistent connection, no cached state).
-	core.RegisterGenerator(agencyvideo.NewDownloadedGenerator(
-		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir))
+	// generators. Two dispatch paths, chosen by configuration:
+	//   - BM_WORKER_ADDR set → direct gRPC (local / rented VM with tunnel).
+	//   - bridge store wired (SetWorkerBridge) → outbound queue: the user's
+	//     GPU pulls jobs over HTTP; state lives in worker_jobs (survives
+	//     restarts on both sides).
+	dlGen := agencyvideo.NewDownloadedGenerator(
+		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir)
+	if m.workerBridgeStore != nil && m.cfg.WorkerAddr == "" {
+		dlGen.SetBridge(m.workerBridgeStore, t.ID)
+	}
+	core.RegisterGenerator(dlGen)
 
 	// Cost calculators. Seedance25 must precede Seedance: the latter's
 	// substring match ("dreamina-seedance") also covers the 2.5 model.

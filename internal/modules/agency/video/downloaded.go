@@ -15,6 +15,7 @@ package agencyvideo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -26,9 +27,12 @@ import (
 	"synapta/config"
 	"synapta/internal/modules/agency"
 	"synapta/internal/modules/model"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/utils"
 	"synapta/internal/worker"
 	workerpb "synapta/internal/worker/proto"
+
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // streamTimeout bounds a whole generation stream. The worker of brain-master
@@ -36,14 +40,35 @@ import (
 // against a silently dead worker (no events, no EOF).
 const streamTimeout = 6 * time.Hour
 
+// BridgeQueue es la cola del bridge saliente (Fase A del plan distribuido):
+// el back encola el trabajo y la GPU del usuario lo reclama por HTTP.
+// workerbridge.Store la implementa; los tests usan un fake.
+type BridgeQueue interface {
+	Enqueue(ctx context.Context, tenantID int64, taskID string, payload json.RawMessage) error
+	JobByTaskID(ctx context.Context, tenantID int64, taskID string) (*workerbridge.Job, error)
+	RequestCancel(ctx context.Context, tenantID int64, taskID string) error
+	HasOnlineWorker(ctx context.Context, tenantID int64) (bool, error)
+	SnapshotsForTenant(ctx context.Context, tenantID int64) ([]workerbridge.WorkerModel, error)
+}
+
 // DownloadedGenerator serves every model type "downloaded": the worker owns
-// the weights, Synapta only dispatches jobs over gRPC.
+// the weights, Synapta only dispatches jobs.
+//
+// Dos caminos, elegidos por configuración:
+//   - gRPC directo (BM_WORKER_ADDR): worker en la misma red (modo local o
+//     VM alquilada con túnel). Streaming de progreso en vivo.
+//   - bridge saliente (SetBridge): la GPU del usuario está detrás de su NAT;
+//     el trabajo se encola en worker_jobs y la máquina lo reclama por HTTP.
+//     El estado vive en la DB (sobrevive reinicios de back y de worker).
 type DownloadedGenerator struct {
 	client  *worker.Client
 	addr    string // BM_WORKER_ADDR
 	outputs string // Synapta outputs dir (informational; utils handles storage)
 	store   *downloadedTaskStore
 	label   string
+
+	bridge   BridgeQueue // nil → solo gRPC directo
+	tenantID int64       // dueño de la cola de bridge
 }
 
 // NewDownloadedGenerator builds the generator over the stateless worker
@@ -58,22 +83,60 @@ func NewDownloadedGenerator(client *worker.Client, addr, outputsDir string) *Dow
 	}
 }
 
+// SetBridge activa el camino saliente (GPU del usuario detrás de NAT) y
+// fija el tenant dueño de la cola. Sin bridge, el generator vive solo del
+// gRPC directo como siempre.
+func (g *DownloadedGenerator) SetBridge(q BridgeQueue, tenantID int64) {
+	g.bridge = q
+	g.tenantID = tenantID
+}
+
+// bridgeMode reports whether jobs must flow through the outbound queue
+// instead of the direct gRPC stream.
+func (g *DownloadedGenerator) bridgeMode() bool { return g.bridge != nil && g.addr == "" }
+
 func (g *DownloadedGenerator) Name() string        { return g.label }
 func (g *DownloadedGenerator) ContentType() string { return "video" }
 
-// Match claims every catalog model of type "downloaded" (resolved live
-// against the worker). API models resolve as "api" and unknown names as nil:
-// neither is claimed here — API generators get first pick because this
-// generator is registered last in runtime.go.
+// Match claims every catalog model of type "downloaded". En modo bridge no
+// hay catálogo gRPC vivo: se reclama todo nombre fuera del catálogo API y
+// la validación real (¿la GPU puede correrlo?) ocurre en Validate contra el
+// snapshot del registry y, finalmente, en el worker al ejecutar.
 func (g *DownloadedGenerator) Match(modelName string) bool {
 	m := agency.LookupModel(modelName)
-	return m != nil && m.Type == model.TypeDownloaded
+	if m != nil {
+		return m.Type == model.TypeDownloaded
+	}
+	return g.bridgeMode()
 }
 
-// Validate checks the shared requirements plus a live worker.
+// Validate checks the shared requirements plus a reachable dispatch path:
+// a live gRPC worker, or (bridge mode) at least one GPU online del tenant
+// que declara el modelo.
 func (g *DownloadedGenerator) Validate(req *agency.GeneratorRequest) error {
 	if err := agency.ValidateCommon(req); err.HasErrors() {
 		return err
+	}
+	if g.bridgeMode() {
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		online, err := g.bridge.HasOnlineWorker(ctx, g.tenantID)
+		if err != nil {
+			return fmt.Errorf("worker registry unavailable: %w", err)
+		}
+		if !online {
+			return fmt.Errorf("no hay GPU conectada: emparejá una máquina con tu GPU desde Tu GPU para usar modelos descargados")
+		}
+		snapshots, err := g.bridge.SnapshotsForTenant(ctx, g.tenantID)
+		if err != nil {
+			return fmt.Errorf("worker registry unavailable: %w", err)
+		}
+		for _, s := range snapshots {
+			if strings.EqualFold(s.Key, req.Model) {
+				return nil
+			}
+		}
+		return fmt.Errorf("la GPU conectada no tiene el modelo %q", req.Model)
 	}
 	if g.addr == "" {
 		return fmt.Errorf("inference worker not configured (BM_WORKER_ADDR)")
@@ -142,8 +205,34 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		gReq.NumFrames = int32(clampInt(req.Duration*16, 8, 257)) // 16 fps
 	}
 
-	// Register the running task before the goroutine can race a poll.
+	// Registro el task ANTES de arrancar cualquier goroutine/encolado: un
+	// poll inmediato no debe ver el estado "unknown".
 	g.store.init(jobID, req.Model)
+
+	// ── Camino bridge: el trabajo queda en la DB y la GPU del usuario lo
+	// reclama por HTTP. El estado vive en worker_jobs, no en memoria.
+	if g.bridgeMode() {
+		payload, err := protojson.Marshal(gReq)
+		if err != nil {
+			g.store.fail(jobID, fmt.Sprintf("marshal job payload: %v", err))
+			return nil, fmt.Errorf("marshal job payload: %w", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		if err := g.bridge.Enqueue(ctx, g.tenantID, jobID, payload); err != nil {
+			g.store.fail(jobID, fmt.Sprintf("enqueue: %v", err))
+			return nil, fmt.Errorf("enqueue job for GPU worker: %w", err)
+		}
+		log.Printf("[downloaded] job %s enqueued for bridge (model=%s tenant=%d)", jobID, req.Model, g.tenantID)
+		return &agency.GeneratorResult{
+			TaskID: jobID,
+			Model:  req.Model,
+			Status: config.STATUS_RUNNING,
+			Raw: map[string]interface{}{
+				"job_id": jobID, "engine": "inference-worker-bridge", "model": req.Model,
+			},
+		}, nil
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g.store.attachCancel(jobID, cancel)
@@ -191,9 +280,14 @@ func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.Media
 	})
 }
 
-// GetStatus returns the task's live state; all real state flows in through
-// the background stream.
+// GetStatus returns the task's live state. En modo bridge la fuente de
+// verdad es worker_jobs (la GPU reporta por HTTP y el artefacto se sube al
+// back), así que se lee la DB en cada poll — el mapa local solo cubre el
+// tramo entre el encolado y la primera respuesta.
 func (g *DownloadedGenerator) GetStatus(taskID, apiKey, baseURL, endpoint string) (*agency.GeneratorResult, error) {
+	if g.bridgeMode() {
+		return g.bridgeStatus(taskID)
+	}
 	ts, ok := g.store.get(taskID)
 	if !ok {
 		// Unknown task (e.g. after a restart): report running with worker
@@ -236,8 +330,64 @@ func outputType(name string) string {
 	}
 }
 
+// bridgeStatus mapea una fila de worker_jobs al resultado del generator.
+// Un job desconocido (la DB no lo tiene) se reporta running para que el
+// reconciler siga preguntando, igual que el camino gRPC.
+func (g *DownloadedGenerator) bridgeStatus(taskID string) (*agency.GeneratorResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+	defer cancel()
+	job, err := g.bridge.JobByTaskID(ctx, g.tenantID, taskID)
+	if err != nil {
+		// Todavía sin fila visible: running optimista (el encolado es reciente).
+		return &agency.GeneratorResult{
+			TaskID: taskID, Status: config.STATUS_RUNNING,
+			Raw: map[string]interface{}{"job_id": taskID, "engine": "inference-worker-bridge"},
+		}, nil
+	}
+	result := &agency.GeneratorResult{
+		TaskID: taskID,
+		Status: config.STATUS_RUNNING,
+		Raw: map[string]interface{}{
+			"job_id":        taskID,
+			"engine":        "inference-worker-bridge",
+			"stream_status": job.StreamStatus,
+			"progress":      job.Progress,
+		},
+	}
+	switch job.Status {
+	case "completed":
+		result.Status = config.STATUS_SUCCESS
+		if job.ArtifactURL != "" {
+			result.Outputs = []agency.OutputResource{{
+				URL: job.ArtifactURL, LocalURL: job.ArtifactURL,
+				Type: outputType(job.ArtifactName),
+			}}
+		}
+	case "failed":
+		result.Status = config.STATUS_FAILED
+		result.Error = job.ErrorMessage
+		if result.Error == "" {
+			result.Error = "GPU worker reported failure"
+		}
+	case "cancelled":
+		result.Status = config.STATUS_FAILED
+		result.Error = "cancelled"
+	}
+	return result, nil
+}
+
 // CancelTask drops the local stream and asks the worker to abort the job.
 func (g *DownloadedGenerator) CancelTask(taskID, apiKey, baseURL, endpoint string) error {
+	// Camino bridge: la cancelación viaja como flag en la fila del job y
+	// llega a la GPU en la próxima respuesta de heartbeat.
+	if g.bridgeMode() {
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		if err := g.bridge.RequestCancel(ctx, g.tenantID, taskID); err != nil {
+			return fmt.Errorf("bridge cancel: %w", err)
+		}
+		return nil
+	}
 	if cancel, ok := g.store.cancelFunc(taskID); ok {
 		cancel()
 	}

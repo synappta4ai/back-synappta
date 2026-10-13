@@ -42,6 +42,7 @@ import (
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
 	"synapta/internal/modules/tenant"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/runtime"
 	"synapta/internal/tenancy"
 	"synapta/internal/utils"
@@ -110,6 +111,14 @@ func main() {
 	// ─── Per-tenant service graph ─────────────────────────────
 	manager := runtime.NewManager(cfg, reg)
 
+	// ─── GPU worker bridge (Fase A del plan distribuido) ──────
+	// Tablas en el schema de sistema: el worker se autentica con su propio
+	// token y el tenant se resuelve desde ahí. Si BM_WORKER_ADDR está seteado
+	// (modo local/túnel), el generator downloaded usa el gRPC directo y el
+	// bridge queda disponible igual para el panel "Tu GPU".
+	wbStore := workerbridge.NewStore(sysDB)
+	manager.SetWorkerBridge(wbStore)
+
 	// ─── Middleware ───────────────────────────────────────────
 	authMw := middleware.Auth(cfg.JWTSecret)
 	tenantMw := tenancy.Middleware(reg)
@@ -167,6 +176,7 @@ func main() {
 	registry.Register(push.NewModule(manager.PushFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
 	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, manager.FlowsFor, cfg.AgentServerURL))
+	registry.Register(workerbridge.NewModule(wbStore))
 
 	// Agency core with modality routes attached.
 	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.
@@ -265,6 +275,7 @@ func main() {
 
 	stop := make(chan struct{})
 	go agency.ReconcileLoop(manager.EachCore, stop) // recovers orphaned tasks per tenant
+	go workerbridge.ReconcileLoop(wbStore, stop)   // marca failed jobs de GPUs que murieron
 
 	go func() {
 		log.Printf("[main] synapta listening on :%s (env=%s)", cfg.Port, cfg.Env)
