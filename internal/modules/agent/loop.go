@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,7 +53,9 @@ type llmTurnState struct {
 
 // runToolLoop ejecuta un turno completo con herramientas hasta que el LLM
 // responde sin pedir más tools (o se alcanza maxToolRounds). onEvent recibe
-// el avance de cada tool para el front; devuelve el texto final.
+// el avance de cada tool para el front; devuelve el texto final. Si el LLM
+// invoca ask_user, devuelve errAskUser para que el caller cierre el turno
+// con el evento SSE "questions".
 func runToolLoop(
 	ctx context.Context,
 	client *http.Client,
@@ -61,6 +64,7 @@ func runToolLoop(
 	model, system string,
 	msgs []chatMsg,
 	tools []toolDef,
+	maxTokens int,
 	onEvent func(toolEvent),
 ) (string, error) {
 	anthropic := provider == credential.ProviderAnthropic
@@ -76,7 +80,7 @@ func runToolLoop(
 
 	var final strings.Builder
 	for round := 0; round < maxToolRounds; round++ {
-		state, err := llmStep(ctx, client, provider, cred, model, system, native, tools, anthropic)
+		state, err := llmStep(ctx, client, provider, cred, model, system, native, tools, anthropic, maxTokens)
 		if err != nil {
 			return "", err
 		}
@@ -95,7 +99,13 @@ func runToolLoop(
 		// Ejecuta cada tool pedido y devuelve los results al historial.
 		results := make([]map[string]any, 0, len(state.ToolCalls))
 		for _, call := range state.ToolCalls {
-			result, _ := executeTool(ctx, tools, call, onEvent)
+			result, _, toolErr := executeTool(ctx, tools, call, onEvent)
+			var ask errAskUser
+			if errors.As(toolErr, &ask) {
+				// El LLM pidió cerrar el turno con preguntas al usuario:
+				// se propaga sin tratarla como fallo de la herramienta.
+				return "", ask
+			}
 			if anthropic {
 				results = append(results, map[string]any{
 					"type":        "tool_result",
@@ -126,8 +136,10 @@ func runToolLoop(
 }
 
 // executeTool corre una invocación del LLM contra el registry y serializa el
-// resultado (o el error) como texto para devolverle al modelo.
-func executeTool(ctx context.Context, tools []toolDef, call toolCall, onEvent func(toolEvent)) (string, toolEvent) {
+// resultado (o el error) como texto para devolverle al modelo. El error
+// crudo también vuelve para que runToolLoop distinga errAskUser (cierre
+// del turno con preguntas) de un fallo normal.
+func executeTool(ctx context.Context, tools []toolDef, call toolCall, onEvent func(toolEvent)) (string, toolEvent, error) {
 	var def *toolDef
 	for i := range tools {
 		if tools[i].Name == call.Name {
@@ -142,7 +154,7 @@ func executeTool(ctx context.Context, tools []toolDef, call toolCall, onEvent fu
 		if onEvent != nil {
 			onEvent(ev)
 		}
-		return "error: unknown tool " + call.Name, ev
+		return "error: unknown tool " + call.Name, ev, nil
 	}
 	if onEvent != nil {
 		onEvent(ev)
@@ -156,17 +168,27 @@ func executeTool(ctx context.Context, tools []toolDef, call toolCall, onEvent fu
 		if onEvent != nil {
 			onEvent(ev)
 		}
-		return "error: tenant context missing", ev
+		return "error: tenant context missing", ev, nil
 	}
 
 	out, err := def.Run(ctx, deps, call.Args, onEvent)
 	if err != nil {
+		var ask errAskUser
+		if errors.As(err, &ask) {
+			// Terminar el turno con preguntas no es un fallo de la tool.
+			ev.Status = "ok"
+			ev.Summary = ask.Error()
+			if onEvent != nil {
+				onEvent(ev)
+			}
+			return "questions forwarded to the user; the turn ends here", ev, ask
+		}
 		ev.Status = "error"
 		ev.Error = err.Error()
 		if onEvent != nil {
 			onEvent(ev)
 		}
-		return "error: " + err.Error(), ev
+		return "error: " + err.Error(), ev, err
 	}
 	ev.Status = "ok"
 	if onEvent != nil {
@@ -174,12 +196,12 @@ func executeTool(ctx context.Context, tools []toolDef, call toolCall, onEvent fu
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return fmt.Sprintf("error: marshal result: %v", err), ev
+		return fmt.Sprintf("error: marshal result: %v", err), ev, nil
 	}
 	if len(raw) > maxToolResultLen {
 		raw = append(raw[:maxToolResultLen], []byte("…(truncated)")...)
 	}
-	return string(raw), ev
+	return string(raw), ev, nil
 }
 
 // llmStep da un paso al LLM (con tools) y devuelve texto + tool calls pedidos.
@@ -192,6 +214,7 @@ func llmStep(
 	native []map[string]any,
 	tools []toolDef,
 	anthropic bool,
+	maxTokens int,
 ) (*llmTurnState, error) {
 	base := strings.TrimRight(strings.TrimSpace(cred.BaseURL), "/")
 	path := openrouterPath
@@ -216,7 +239,7 @@ func llmStep(
 	if anthropic {
 		body, err = json.Marshal(map[string]any{
 			"model":      model,
-			"max_tokens": 2048,
+			"max_tokens": maxTokens,
 			"system":     system,
 			"messages":   native,
 			"tools":      anthropicTools(tools),
@@ -225,7 +248,7 @@ func llmStep(
 		body, err = json.Marshal(map[string]any{
 			"model":       model,
 			"temperature": 0.7,
-			"max_tokens":  2048,
+			"max_tokens":  maxTokens,
 			"messages":    append([]map[string]any{{"role": "system", "content": system}}, native...),
 			"tools":       openaiTools(tools),
 		})

@@ -167,7 +167,7 @@ func TestLoopOpenAICallsToolThenAnswers(t *testing.T) {
 	var events []toolEvent
 	text, err := runToolLoop(toolkit.WithDeps(context.Background(), deps), srv.Client(), credential.ProviderOpenRouter, cred,
 		"openai/gpt-4o-mini", "sys", []chatMsg{{Role: "user", Content: "creá el proyecto Boda Lopez"}},
-		agentTools(), func(ev toolEvent) { events = append(events, ev) })
+		agentTools(), chatMaxTokens, func(ev toolEvent) { events = append(events, ev) })
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestLoopAnthropicToolUse(t *testing.T) {
 	cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-ant"}
 	text, err := runToolLoop(toolkit.WithDeps(context.Background(), deps), srv.Client(), credential.ProviderAnthropic, cred,
 		"claude-haiku-4-5", "sys", []chatMsg{{Role: "user", Content: "generá el video"}},
-		agentTools(), nil)
+		agentTools(), chatMaxTokens, nil)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestLoopToolErrorFlowsBackToLLM(t *testing.T) {
 	deps.Core = &failingCore{}
 	cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-test"}
 	text, err := runToolLoop(toolkit.WithDeps(context.Background(), deps), srv.Client(), credential.ProviderOpenRouter, cred,
-		"m", "s", []chatMsg{{Role: "user", Content: "¿cómo va la tarea?"}}, agentTools(), nil)
+		"m", "s", []chatMsg{{Role: "user", Content: "¿cómo va la tarea?"}}, agentTools(), chatMaxTokens, nil)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestLoopUnknownToolIsReported(t *testing.T) {
 	deps, _, _ := testDeps()
 	cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk"}
 	text, err := runToolLoop(toolkit.WithDeps(context.Background(), deps), srv.Client(),
-		credential.ProviderOpenRouter, cred, "m", "s", []chatMsg{{Role: "user", Content: "borrá todo"}}, agentTools(), nil)
+		credential.ProviderOpenRouter, cred, "m", "s", []chatMsg{{Role: "user", Content: "borrá todo"}}, agentTools(), chatMaxTokens, nil)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestLoopUnknownToolIsReported(t *testing.T) {
 func TestExecuteToolWithoutDepsFails(t *testing.T) {
 	t.Parallel()
 
-	result, ev := executeTool(context.Background(), agentTools(), toolCall{Name: "list_projects", Args: nil}, nil)
+	result, ev, _ := executeTool(context.Background(), agentTools(), toolCall{Name: "list_projects", Args: nil}, nil)
 	if !strings.Contains(result, "tenant context missing") {
 		t.Errorf("result=%q", result)
 	}
@@ -334,7 +334,7 @@ func TestExecuteToolRuns(t *testing.T) {
 
 	deps, _, _ := testDeps()
 	ctx := toolkit.WithDeps(context.Background(), deps)
-	result, ev := executeTool(ctx, agentTools(), toolCall{Name: "create_project", Args: json.RawMessage(`{"name":"Casamiento Ana"}`)}, nil)
+	result, ev, _ := executeTool(ctx, agentTools(), toolCall{Name: "create_project", Args: json.RawMessage(`{"name":"Casamiento Ana"}`)}, nil)
 	if ev.Status != "ok" {
 		t.Errorf("ev=%+v", ev)
 	}
@@ -349,7 +349,7 @@ func TestCancelTaskTool(t *testing.T) {
 
 	deps, _, fa := testDeps()
 	ctx := toolkit.WithDeps(context.Background(), deps)
-	result, ev := executeTool(ctx, agentTools(), toolCall{Name: "cancel_task", Args: json.RawMessage(`{"task_id":"task-9"}`)}, nil)
+	result, ev, _ := executeTool(ctx, agentTools(), toolCall{Name: "cancel_task", Args: json.RawMessage(`{"task_id":"task-9"}`)}, nil)
 	if ev.Status != "ok" {
 		t.Errorf("ev=%+v", ev)
 	}

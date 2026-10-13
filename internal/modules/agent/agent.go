@@ -36,6 +36,9 @@ type EventsResolver func(c *gin.Context) (*event.Handler, bool)
 // CoreResolver supplies the tenant-scoped agency core per request.
 type CoreResolver func(c *gin.Context) (*agency.Core, bool)
 
+// FlowsResolver supplies the tenant-scoped agency flow store per request.
+type FlowsResolver func(c *gin.Context) (toolkit.FlowsAPI, bool)
+
 // chatRequest is the front-end payload for one agent chat turn.
 type chatRequest struct {
 	ConversationID string `json:"conversation_id"`
@@ -60,6 +63,7 @@ type Module struct {
 	resolve  CredentialResolver
 	events   EventsResolver
 	core     CoreResolver
+	flows    FlowsResolver
 	agentURL string
 	client   *http.Client
 	// Historial de turnos del fallback directo (ver direct.go).
@@ -67,10 +71,10 @@ type Module struct {
 }
 
 // NewModule creates the proxy module. agentURL points at the DCS Agent
-// server (default http://localhost:3200). events/core aportan los servicios
-// del tenant que el loop de tool-calling del asistente necesita (mismos
-// resolvers del runtime que usa el módulo MCP).
-func NewModule(resolve CredentialResolver, events EventsResolver, core CoreResolver, agentURL string) *Module {
+// server (default http://localhost:3200). events/core/flows aportan los
+// servicios del tenant que el loop de tool-calling del asistente necesita
+// (mismos resolvers del runtime que usa el módulo MCP).
+func NewModule(resolve CredentialResolver, events EventsResolver, core CoreResolver, flows FlowsResolver, agentURL string) *Module {
 	if strings.TrimSpace(agentURL) == "" {
 		agentURL = "http://localhost:3200"
 	}
@@ -85,6 +89,7 @@ func NewModule(resolve CredentialResolver, events EventsResolver, core CoreResol
 		resolve:  resolve,
 		events:   events,
 		core:     core,
+		flows:    flows,
 		agentURL: strings.TrimRight(agentURL, "/"),
 		client:   &http.Client{Transport: transport},
 		convs:    newConvStore(),
@@ -175,6 +180,11 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	// Si el bundle no resuelve, el chat sigue igual sin tools: no se cae el
 	// turno por falta de dominio.
 	deps := m.tenantDeps(c)
+	if deps != nil {
+		// Las skills del flujo (get_project_brief) ubican el estado en
+		// agency_flows por el agente que atiende el request.
+		deps.Agent = workflowSlug(req.Workflow)
+	}
 
 	// Los turnos de artefacto del flujo /agency se resuelven siempre en el
 	// back: el agent-server no conoce los contratos por paso.
@@ -270,6 +280,11 @@ func (m *Module) tenantDeps(c *gin.Context) *toolkit.Deps {
 		Events: eventsHdl.Service(),
 		Core:   core,
 		UserID: utils.UserIDFromContext(c),
+	}
+	if m.flows != nil {
+		if flows, ok := m.flows(c); ok {
+			deps.Flows = flows
+		}
 	}
 	if v, ok := c.Get("username"); ok {
 		if s, ok := v.(string); ok {

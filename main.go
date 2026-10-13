@@ -36,8 +36,8 @@ import (
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
-	"synapta/internal/modules/model"
 	mcpmodule "synapta/internal/modules/mcp"
+	"synapta/internal/modules/model"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
@@ -166,7 +166,7 @@ func main() {
 	registry.Register(skill.NewModule(manager.SkillsFor))
 	registry.Register(push.NewModule(manager.PushFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
-	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, cfg.AgentServerURL))
+	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, manager.FlowsFor, cfg.AgentServerURL))
 
 	// Agency core with modality routes attached.
 	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.

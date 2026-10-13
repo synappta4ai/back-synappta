@@ -46,12 +46,18 @@ type AgencyAPI interface {
 }
 
 // Deps son los servicios del tenant resueltos para la operación actual, más
-// la identidad del usuario que la pide (para el tracking de generaciones).
+// la identidad del usuario que la pide (para el tracking de generaciones)
+// y el agente del flujo /agency que atiende el request.
 type Deps struct {
 	Events   EventsAPI
 	Core     AgencyAPI
+	Flows    FlowsAPI
 	UserID   int64
 	Username string
+	// Agent es el agente del flujo /agency (commercial | real_estate |
+	// cinema); vacío fuera de un turno de flujo. Lo usan las skills
+	// get_project_brief / save_artifact para ubicar agency_flows.
+	Agent string
 }
 
 type depsKey struct{}

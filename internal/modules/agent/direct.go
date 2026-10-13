@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -135,9 +137,6 @@ func (s *convStore) append(key conversationKey, msgs ...chatMsg) {
 func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve, deps *toolkit.Deps) {
 	provider, model, useCred := routeLLM(hdl, req, cred)
 
-	// El experto del flujo /agency define el tono y el conocimiento;
-	// el artefacto sales_angles solo cuando lo pide el front (o la ruta
-	// legada cuyo mensaje menciona ángulos).
 	// Turno de artefacto (paso del flujo /agency): contrato JSON en vez
 	// de chat, con las secciones del .md del paso. La ruta legacy del
 	// sales_angles (mensaje que menciona "ángulo" sin marcar el artefacto)
@@ -147,7 +146,7 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 		kind = artifactSalesAngles
 	}
 	if spec, ok := parseArtifactKind(kind); ok {
-		m.artifactTurn(c, req, hdl, cred, spec)
+		m.artifactTurn(c, req, hdl, cred, deps, spec)
 		return
 	}
 
@@ -185,11 +184,21 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 		// Loop agéntico: el LLM consulta/genera y recién entonces
 		// contesta. Cada tool emite SSE "tool" al front.
 		ctx = toolkit.WithDeps(ctx, deps)
-		answer, err = runToolLoop(ctx, m.client, provider, useCred, model, system, msgs, agentTools(), func(ev toolEvent) {
+		answer, err = runToolLoop(ctx, m.client, provider, useCred, model, system, msgs, toolsFor(req.Workflow, stepFreeChat), chatMaxTokens, func(ev toolEvent) {
 			sseWrite(c, "tool", ev)
 		})
 	}
 	if err != nil {
+		var ask errAskUser
+		if errors.As(err, &ask) {
+			// El asistente pidió cerrar el turno con preguntas.
+			startSSE(c)
+			if !sseWrite(c, "meta", map[string]string{"conversation_id": convID}) {
+				return
+			}
+			sseWrite(c, "questions", map[string]any{"step": stepFreeChat, "kind": "chat", "questions": ask.Questions})
+			return
+		}
 		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
 		return
 	}
@@ -208,13 +217,16 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 	sseWrite(c, "text", map[string]string{"text": answer})
 }
 
-// artifactTurn atiende un turno de artefacto del flujo /agency sin tools:
-// arma el system prompt con las secciones del .md del paso, pide el JSON
-// del contrato (con más tokens que el chat), lo valida contra el contrato
-// y emite el evento "artifact". Si el artefacto pide información al
-// usuario emite "questions" y fin de turno; el paso 1 inmobiliario
-// mantiene además el alias legacy "sales_angles".
-func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve, spec artifactSpec) {
+// artifactTurn atiende un turno de artefacto del flujo /agency: arma el
+// system prompt con las secciones del .md del paso, pide el JSON del
+// contrato (con más tokens que el chat), lo valida contra el contrato y
+// emite el evento "artifact". Con tools disponibles corre el loop
+// agéntico del paso (get_project_brief, ask_user y el generador del
+// paso); el artefacto validado se persiste en agency_flows vía el hook
+// save_artifact. Si el artefacto pide información al usuario emite
+// "questions" y fin de turno; el paso 1 inmobiliario mantiene además el
+// alias legacy "sales_angles".
+func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.Handler, cred *credential.Resolve, deps *toolkit.Deps, spec artifactSpec) {
 	provider, model, useCred := routeLLM(hdl, req, cred)
 
 	system := systemFor(req.Workflow, spec.Step)
@@ -229,8 +241,29 @@ func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.H
 	ctx, cancel := context.WithTimeout(c.Request.Context(), artifactTimeout)
 	defer cancel()
 
-	answer, err := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs, artifactMaxTokens)
+	// Con tools del tenant el paso puede consultar el brief y preguntar;
+	// sin tools, una llamada one-shot con el mismo contrato.
+	answerTurn := func(turn []chatMsg) (string, error) {
+		if deps == nil {
+			return llmAnswer(ctx, m.client, provider, useCred, model, system, turn, artifactMaxTokens)
+		}
+		tctx := toolkit.WithDeps(ctx, deps)
+		return runToolLoop(tctx, m.client, provider, useCred, model, system, turn, toolsFor(req.Workflow, spec.Step), artifactMaxTokens, func(ev toolEvent) {
+			sseWrite(c, "tool", ev)
+		})
+	}
+
+	answer, err := answerTurn(msgs)
 	if err != nil {
+		var ask errAskUser
+		if errors.As(err, &ask) {
+			startSSE(c)
+			if !sseWrite(c, "meta", map[string]string{"conversation_id": convIDFor(req)}) {
+				return
+			}
+			sseWrite(c, "questions", map[string]any{"step": spec.Step, "kind": spec.Kind, "questions": ask.Questions})
+			return
+		}
 		utils.Error(c, http.StatusBadGateway, "llm "+provider+": "+err.Error())
 		return
 	}
@@ -256,7 +289,7 @@ func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.H
 			chatMsg{Role: "assistant", Content: answer},
 			chatMsg{Role: "user", Content: correctionMessage(warns)},
 		)
-		retry, retryErr := llmAnswer(ctx, m.client, provider, useCred, model, system, msgs, artifactMaxTokens)
+		retry, retryErr := answerTurn(msgs)
 		if retryErr != nil {
 			break
 		}
@@ -286,6 +319,10 @@ func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.H
 		appendWarnings(data, warns)
 	}
 
+	// Hook save_artifact (§6.3): el back persiste el artefacto validado en
+	// el flujo del usuario sin depender de que el LLM llame una tool.
+	persistArtifact(ctx, req, deps, spec, data)
+
 	if spec.Kind == artifactSalesAngles {
 		normalizeSalesAngles(data)
 		// Alias legacy: el front actual todavía escucha "sales_angles"
@@ -297,6 +334,30 @@ func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.H
 		"kind": spec.Kind,
 		"data": data,
 	})
+}
+
+// persistArtifact guarda el artefacto validado en agency_flows (state.
+// artifacts[kind]) mergeando con el estado previo del flujo. Un fallo de
+// persistencia no tira el turno: el artefacto ya se validó y se emite.
+func persistArtifact(ctx context.Context, req chatRequest, deps *toolkit.Deps, spec artifactSpec, data map[string]any) {
+	if deps == nil || deps.Flows == nil || deps.UserID == 0 {
+		return
+	}
+	payload := decodePayload(req.Payload)
+	in := toolkit.SaveArtifactIn{
+		Agent:          workflowSlug(req.Workflow),
+		Step:           spec.Step,
+		Kind:           spec.Kind,
+		Artifact:       data,
+		ProjectID:      strField(payload, "project_id"),
+		ConversationID: convIDFor(req),
+	}
+	if brief, ok := payload["brief"].(map[string]any); ok {
+		in.Brief = brief
+	}
+	if err := toolkit.SaveArtifact(ctx, deps, in); err != nil {
+		log.Printf("[agent] save_artifact hook: %v", err)
+	}
 }
 
 // artifactUserMessage arma el mensaje de un turno de artefacto: el

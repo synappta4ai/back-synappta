@@ -13,9 +13,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"synapta/internal/toolkit"
 )
+
+// stepFreeChat es el "paso" del chat libre del asistente (sin artefacto):
+// ve el set histórico completo de herramientas.
+const stepFreeChat = 0
 
 // toolEvent notifica al front el avance de cada invocación (SSE "tool").
 type toolEvent struct {
@@ -250,6 +255,114 @@ func agentTools() []toolDef {
 				return map[string]string{"task_id": in.TaskID, "status": status}, nil
 			},
 		},
+	}
+}
+
+// errAskUser señala que el LLM invocó ask_user para terminar el turno con
+// preguntas al usuario: runToolLoop la propaga sin tratarla como fallo y
+// el caller la traduce al evento SSE "questions".
+type errAskUser struct{ Questions []string }
+
+func (e errAskUser) Error() string {
+	return fmt.Sprintf("%d pregunta(s) para el usuario", len(e.Questions))
+}
+
+// flowTools son las skills nuevas del flujo /agency por paso (§2.5 del
+// plan): get_project_brief (brief + estado del flujo) y ask_user (cierra
+// el turno con preguntas). save_artifact NO es una tool invocable por el
+// modelo: es un hook del back post-validación (direct.go).
+func flowTools() []toolDef {
+	return []toolDef{
+		{
+			Name:        "get_project_brief",
+			Description: "Read the agency flow state of this agent for the current user: the step 0 brief, the artifacts already approved and the linked project. Use it at the start of every artifact step so you never ask again for data that is already there.",
+			Parameters: map[string]any{
+				"type":                 "object",
+				"properties":           map[string]any{},
+				"additionalProperties": false,
+			},
+			Run: func(ctx context.Context, deps *toolkit.Deps, args json.RawMessage, _ func(toolEvent)) (any, error) {
+				var in struct{}
+				if err := unmarshalArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return toolkit.GetProjectBrief(ctx, deps)
+			},
+		},
+		{
+			Name:        "ask_user",
+			Description: "Ask the user short questions when critical information is missing to continue the step. Ends the turn: the questions are shown in the chat and the user answers in the next message. Every question must carry a concrete suggestion the user can accept.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"questions": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "short questions, each with a suggestion (required)",
+					},
+				},
+				"required":             []string{"questions"},
+				"additionalProperties": false,
+			},
+			Run: func(_ context.Context, _ *toolkit.Deps, args json.RawMessage, _ func(toolEvent)) (any, error) {
+				var in struct {
+					Questions []string `json:"questions"`
+				}
+				if err := unmarshalArgs(args, &in); err != nil {
+					return nil, err
+				}
+				qs := make([]string, 0, len(in.Questions))
+				for _, q := range in.Questions {
+					if s := strings.TrimSpace(q); s != "" {
+						qs = append(qs, s)
+					}
+				}
+				if len(qs) == 0 {
+					return nil, fmt.Errorf("questions is required")
+				}
+				return nil, errAskUser{Questions: qs}
+			},
+		},
+	}
+}
+
+// toolsFor devuelve las herramientas visibles para un agente en un paso:
+// el chat libre (paso 0) ve el set completo de siempre; cada paso de
+// artefacto ve solo las skills que su contrato necesita — en análisis solo
+// se analiza (sin generate_*), el storyboard usa generate_image y las
+// escenas generate_video (§2.5 del plan). Hoy la sublista es la misma para
+// los tres agentes: la diferencia entre agentes está en los system prompts
+// y en los contratos de artefacto, no en el código de las skills.
+func toolsFor(_ string, step int) []toolDef {
+	index := make(map[string]toolDef)
+	for _, t := range append(agentTools(), flowTools()...) {
+		index[t.Name] = t
+	}
+	names := stepTools(step)
+	out := make([]toolDef, 0, len(names))
+	for _, n := range names {
+		if t, ok := index[n]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// stepTools es la lista de skills (en orden) de cada paso.
+func stepTools(step int) []string {
+	switch step {
+	case 1:
+		// Análisis: leer el brief, anotar datos y preguntar si falta algo.
+		return []string{"get_project_brief", "update_project", "ask_user"}
+	case 2:
+		// Storyboard: la hoja se genera con imagen.
+		return []string{"get_project_brief", "update_project", "ask_user", "list_models", "generate_image", "list_generations", "cancel_task"}
+	case 3:
+		// Escenas: el clip se genera con video.
+		return []string{"get_project_brief", "update_project", "ask_user", "list_models", "generate_video", "list_generations", "cancel_task"}
+	default:
+		// Chat libre del asistente (paso 0): set histórico completo.
+		return []string{"list_projects", "create_project", "update_project", "list_models", "generate_video", "generate_image", "list_generations", "cancel_task"}
 	}
 }
 

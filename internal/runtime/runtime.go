@@ -32,6 +32,7 @@ import (
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
 	"synapta/internal/tenancy"
+	"synapta/internal/toolkit"
 	"synapta/internal/worker"
 )
 
@@ -58,6 +59,10 @@ type Bundle struct {
 	Push        *push.Handler
 	Credentials *credential.Handler
 	Agency      *agency.Handler
+
+	// Flows persiste el estado del flujo /agency por (usuario, agente)
+	// sobre agency_flows (schema del tenant).
+	Flows toolkit.FlowsAPI
 
 	agencyCore *agency.Core // for the reconciler and modality resolvers
 }
@@ -202,6 +207,12 @@ func (m *Manager) AgencyCoreFor(c *gin.Context) (*agency.Core, bool) {
 	return b.agencyCore, ok
 }
 
+// FlowsFor returns the agency flow store for the request's tenant.
+func (m *Manager) FlowsFor(c *gin.Context) (toolkit.FlowsAPI, bool) {
+	b, ok := m.Resolve(c)
+	return b.Flows, ok
+}
+
 // build constructs the full service graph for one tenant over its own pool.
 func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	pool, err := m.reg.Pool(t.Slug)
@@ -275,6 +286,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		Push:        push.NewHandler(pushSvc),
 		Credentials: credential.NewHandler(credStore),
 		Agency:      agency.NewHandler(core),
+		Flows:       toolkit.NewPGFlows(pool),
 		agencyCore:  core,
 	}, nil
 }
