@@ -64,6 +64,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 			admin.GET("/models", m.WorkerModels)
 			admin.POST("/models/:key/download", m.WorkerDownloadModel)
 			admin.POST("/models/:key/cancel", m.WorkerCancelDownload)
+			admin.DELETE("/models", m.WorkerDeleteAllModels)
 			admin.DELETE("/models/:key", m.WorkerDeleteModel)
 		}
 	}
@@ -204,6 +205,52 @@ func (m *Module) WorkerDeleteModel(c *gin.Context) {
 	utils.Success(c, toModelOperation(resp))
 }
 
+// BulkDeleteResult summarizes a DELETE /api/v1/worker/models call.
+type BulkDeleteResult struct {
+	Deleted []string `json:"deleted"`
+	// Failed maps model keys that kept their weights to the reason.
+	Failed     map[string]string `json:"failed"`
+	FreedBytes int64             `json:"freed_bytes"`
+}
+
+// WorkerDeleteAllModels handles DELETE /api/v1/worker/models — the
+// "uninstall everything" option: removes every downloaded weight from the
+// worker disk. Models that cannot be deleted (download in progress, no
+// disk weights) are reported in Failed without aborting the rest.
+func (m *Module) WorkerDeleteAllModels(c *gin.Context) {
+	client, addr, ok := workerClientOnly(c)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	models, err := ListLive(ctx, addr)
+	if err != nil {
+		utils.InternalError(c, workerMessage(err))
+		return
+	}
+	result := BulkDeleteResult{Deleted: []string{}, Failed: map[string]string{}}
+	for _, model := range models {
+		if model.Type != TypeDownloaded || model.Downloaded == nil {
+			continue
+		}
+		if model.Downloaded.SizeBytes == 0 && !model.Downloaded.Downloading && model.Downloaded.DownloadError == "" {
+			continue // nothing on disk for this entry
+		}
+		if _, derr := client.DeleteModel(ctx, addr, model.Name); derr != nil {
+			st, _ := status.FromError(derr)
+			msg := strings.TrimSpace(st.Message())
+			if msg == "" {
+				msg = derr.Error()
+			}
+			result.Failed[model.Name] = msg
+			continue
+		}
+		result.Deleted = append(result.Deleted, model.Name)
+		result.FreedBytes += model.Downloaded.SizeBytes
+	}
+	utils.Success(c, result)
+}
+
 // operateOnWeights starts or cancels a background weight download.
 func (m *Module) operateOnWeights(c *gin.Context, op string, cancel bool) {
 	key, client, addr, ok := workerWriteTarget(c)
@@ -295,26 +342,38 @@ func modelKeyParam(c *gin.Context) (string, bool) {
 	return key, true
 }
 
-// workerWriteTarget resolves the model key, wired gRPC client and configured
-// address for management writes. Reads degrade gracefully elsewhere, but a
-// write with no worker to receive it must fail explicitly.
-func workerWriteTarget(c *gin.Context) (string, interface {
+// weightWriter is the narrow gRPC surface the management writes need.
+type weightWriter interface {
 	DownloadModel(ctx context.Context, addr, key string, cancel bool) (*inferencev1.ModelOperationResponse, error)
 	DeleteModel(ctx context.Context, addr, key string) (*inferencev1.ModelOperationResponse, error)
-}, string, bool,
-) {
-	key, ok := modelKeyParam(c)
-	if !ok {
-		return "", nil, "", false
-	}
+}
+
+// workerClientOnly resolves the wired gRPC client and configured address
+// for management writes. Reads degrade gracefully elsewhere, but a write
+// with no worker to receive it must fail explicitly.
+func workerClientOnly(c *gin.Context) (weightWriter, string, bool) {
 	client := workerClientOrNil()
 	if client == nil {
 		utils.InternalError(c, "inference worker client not wired")
-		return "", nil, "", false
+		return nil, "", false
 	}
 	addr := workerAddr()
 	if addr == "" {
 		utils.BadRequest(c, "inference worker not configured (BM_WORKER_ADDR)")
+		return nil, "", false
+	}
+	return client, addr, true
+}
+
+// workerWriteTarget resolves the model key, wired gRPC client and configured
+// address for single-model management writes.
+func workerWriteTarget(c *gin.Context) (string, weightWriter, string, bool) {
+	key, ok := modelKeyParam(c)
+	if !ok {
+		return "", nil, "", false
+	}
+	client, addr, ok := workerClientOnly(c)
+	if !ok {
 		return "", nil, "", false
 	}
 	return key, client, addr, true

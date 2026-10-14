@@ -210,6 +210,18 @@
         }
       }
     },
+    "/api/v1/worker/models": {
+      "delete": {
+        "tags": ["Models"],
+        "summary": "Delete all model weights",
+        "description": "Tenant admin only. Removes every downloaded weight from worker disk (uninstall everything). Per-model failures are reported without aborting the rest.",
+        "operationId": "deleteAllWorkerModels",
+        "responses": {
+          "200": { "description": "Bulk delete summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseBulkDelete" } } } },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
     "/api/v1/worker/models/{key}/download": {
       "post": {
         "tags": ["Models"],
@@ -1487,6 +1499,22 @@
           "success": { "type": "boolean" },
           "message": { "type": "string" },
           "data": { "$ref": "#/components/schemas/ModelOperation" }
+        }
+      },
+      "BulkDeleteResult": {
+        "type": "object",
+        "properties": {
+          "deleted": { "type": "array", "items": { "type": "string" } },
+          "failed": { "type": "object", "additionalProperties": { "type": "string" } },
+          "freed_bytes": { "type": "integer" }
+        }
+      },
+      "ApiResponseBulkDelete": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/BulkDeleteResult" }
         }
       },
       "ApiResponseWorkerStatus": {

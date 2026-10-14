@@ -534,6 +534,36 @@ func TestWorkerDeleteModel(t *testing.T) {
 	}
 }
 
+func TestWorkerDeleteAllModels(t *testing.T) {
+	m, _ := setup(t)
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	m.WorkerDeleteAllModels(c)
+
+	var env struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Deleted    []string          `json:"deleted"`
+			Failed     map[string]string `json:"failed"`
+			FreedBytes int64             `json:"freed_bytes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v\n%s", err, w.Body.String())
+	}
+	if w.Code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if len(env.Data.Failed) != 0 {
+		t.Fatalf("unexpected failures: %+v", env.Data.Failed)
+	}
+	// SD-1.5 (420 bytes on disk) and Broken (error entry) are deleted;
+	// models with nothing on disk are skipped, not "deleted".
+	if len(env.Data.Deleted) != 2 || env.Data.FreedBytes != 420 {
+		t.Fatalf("bulk delete: %+v", env.Data)
+	}
+}
+
 func TestWorkerWriteRejectsEmptyKey(t *testing.T) {
 	m, _ := setup(t)
 
