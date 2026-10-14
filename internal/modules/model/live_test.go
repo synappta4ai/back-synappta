@@ -11,6 +11,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/modules/workerbridge"
+	"synapta/internal/tenancy"
 	"synapta/internal/worker"
 	inferencev1 "synapta/internal/worker/proto"
 
@@ -147,6 +149,106 @@ func setup(t *testing.T) (m *Module, addr string) {
 	SetWorkerClient(worker.NewClient())
 	SetWorkerAddr(addr)
 	return NewModule(allUsableResolver()), addr
+}
+
+// fakeBridgeSource reuses ONE concrete type: atomic.Value panics if stores
+// mix dynamic types, so every bridge test shares this struct.
+type fakeBridgeSource struct {
+	models []workerbridge.WorkerModel
+	err    error
+}
+
+func (f fakeBridgeSource) SnapshotsForTenant(context.Context, int64) ([]workerbridge.WorkerModel, error) {
+	return f.models, f.err
+}
+
+func withTenant(c *gin.Context, id int64) {
+	c.Request = c.Request.WithContext(
+		tenancy.Context(c.Request.Context(), &tenancy.Tenant{ID: id, Slug: "t", Active: true}))
+}
+
+func setBridge(t *testing.T, f fakeBridgeSource) {
+	t.Helper()
+	SetBridgeSource(f)
+	t.Cleanup(func() { SetBridgeSource(fakeBridgeSource{}) })
+}
+
+func bridgeModels() []workerbridge.WorkerModel {
+	return []workerbridge.WorkerModel{
+		{Key: "Wan2.1-T2V-1.3B", Label: "Wan 2.1", Mode: "video", Engine: "diffusers",
+			Pipeline: "wan", Repo: "Wan-AI/x", Steps: 30, VRAMGb: 6, Family: "wan",
+			Available: true},
+		{Key: "SD-1.5", Label: "SD 1.5", Mode: "image", Engine: "diffusers",
+			Pipeline: "sd15", Family: "sd", Available: true},
+	}
+}
+
+func killCentral(t *testing.T) {
+	t.Helper()
+	SetWorkerClient(worker.NewClient())
+	SetWorkerAddr("127.0.0.1:1") // discard: refused fast, no network
+	t.Cleanup(func() { SetWorkerAddr("") })
+}
+
+func TestWorkerModelsFallsBackToBridge(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{models: bridgeModels()})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	// Same deterministic order as ListLive: modality (image < video), then name.
+	if len(env.Data) != 2 || env.Data[0].Name != "SD-1.5" || env.Data[1].Name != "Wan2.1-T2V-1.3B" {
+		t.Fatalf("expected bridge snapshots sorted, got %+v", env.Data)
+	}
+	if env.Data[0].Type != TypeDownloaded || !env.Data[0].Downloaded.Available {
+		t.Fatalf("expected read-only available entries, got %+v", env.Data[0])
+	}
+}
+
+func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusInternalServerError || env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	if !strings.Contains(env.Message, "inference worker unavailable") {
+		t.Fatalf("message=%q", env.Message)
+	}
+}
+
+func TestWorkerModelsPrefersCentral(t *testing.T) {
+	m, _ := setup(t)
+	setBridge(t, fakeBridgeSource{models: bridgeModels()})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	// Central-only entry (Broken weights) proves central won over bridge.
+	found := false
+	for _, md := range env.Data {
+		if md.Name == "Broken" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected central catalog, got %+v", env.Data)
+	}
 }
 
 func TestListTypeDownloaded(t *testing.T) {

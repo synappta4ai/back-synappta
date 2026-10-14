@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"synapta/internal/tenancy"
 	"synapta/internal/utils"
 	inferencev1 "synapta/internal/worker/proto"
 )
@@ -169,9 +170,21 @@ func (m *Module) WorkerStatus(c *gin.Context) {
 // every worker catalog entry with availability, download progress and on-disk
 // size. Unavailable entries are included on purpose: this is where an admin
 // downloads them, retries failures, or deletes weights.
+//
+// When the central worker is unreachable, tenants with online bridge GPUs
+// get those snapshots instead (read-only: no weight state) rather than a
+// 500 — the GPUs already reported everything this view needs to list.
 func (m *Module) WorkerModels(c *gin.Context) {
 	models, err := ListLive(c.Request.Context(), workerAddr())
 	if err != nil {
+		if t := tenancy.FromContext(c.Request.Context()); t != nil {
+			if bridge, berr := BridgeModelsForTenant(c.Request.Context(), t.ID); berr == nil && len(bridge) > 0 {
+				log.Printf("[model] worker/models from bridge snapshots (tenant %d, central down: %v)",
+					t.ID, err)
+				utils.Success(c, bridge)
+				return
+			}
+		}
 		utils.InternalError(c, workerMessage(err))
 		return
 	}

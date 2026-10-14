@@ -130,6 +130,7 @@ func main() {
 	// downloaded side of the model catalog is simply absent.
 	model.SetWorkerClient(worker.NewClient())
 	model.SetWorkerAddr(cfg.WorkerAddr)
+	model.SetBridgeSource(wbStore)
 
 	// ─── Router ───────────────────────────────────────────────
 	if cfg.IsProduction() {

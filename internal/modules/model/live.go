@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/worker"
 	inferencev1 "synapta/internal/worker/proto"
 )
@@ -60,6 +61,82 @@ func workerClientOrNil() *worker.Client {
 		return v
 	}
 	return nil
+}
+
+// BridgeSnapshots lists online bridge workers' model snapshots for a tenant.
+// *workerbridge.Store implements it; tests use a fake. Snapshots carry the
+// catalog (key/label/mode/engine/…), never weight state: availability comes
+// from the report, download progress and on-disk size are unknown.
+type BridgeSnapshots interface {
+	SnapshotsForTenant(ctx context.Context, tenantID int64) ([]workerbridge.WorkerModel, error)
+}
+
+// bridgeSource is the snapshot source injected by main. Reads are nil-safe
+// even if never wired (central-only mode, tests).
+var bridgeSource atomic.Value // BridgeSnapshots
+
+// SetBridgeSource wires the bridge snapshot fallback. Called once at startup.
+func SetBridgeSource(s BridgeSnapshots) { bridgeSource.Store(s) }
+
+func bridgeSourceOrNil() BridgeSnapshots {
+	if v, ok := bridgeSource.Load().(BridgeSnapshots); ok {
+		return v
+	}
+	return nil
+}
+
+// BridgeModelsForTenant maps online bridge snapshots into management entries
+// (same shape as ListLive, without weight state). It returns nil without an
+// error when there is simply nothing to show: no source wired, no online
+// workers, or an empty merged catalog.
+func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error) {
+	src := bridgeSourceOrNil()
+	if src == nil {
+		return nil, nil
+	}
+	snaps, err := src.SnapshotsForTenant(ctx, tenantID)
+	if err != nil || len(snaps) == 0 {
+		return nil, err
+	}
+	out := make([]Model, 0, len(snaps))
+	for _, m := range snaps {
+		pct := float32(0)
+		if m.Available {
+			pct = 100
+		}
+		out = append(out, Model{
+			Name:        m.Key,
+			DisplayName: m.Label,
+			Modality:    workerModeToModality(m.Mode),
+			Type:        TypeDownloaded,
+			Downloaded: &DownloadedModel{
+				Mode:            m.Mode,
+				Engine:          m.Engine,
+				Pipeline:        m.Pipeline,
+				Repo:            m.Repo,
+				Steps:           int32(m.Steps),
+				VRAMGb:          int32(m.VRAMGb),
+				Family:          m.Family,
+				Available:       m.Available,
+				Downloading:     false,
+				DownloadPercent: pct,
+				SizeBytes:       0,
+				Notes:           m.Notes,
+			},
+		})
+	}
+	// Same deterministic order as ListLive: modality, family, name.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Modality != out[j].Modality {
+			return out[i].Modality < out[j].Modality
+		}
+		fi, fj := out[i].Downloaded.Family, out[j].Downloaded.Family
+		if fi != fj {
+			return fi < fj
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
 }
 
 // WorkerError describes a failed live read from the worker.
