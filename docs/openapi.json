@@ -162,8 +162,8 @@
     "/api/v1/models": {
       "get": {
         "tags": ["Models"],
-        "summary": "List models (API + live downloaded)",
-        "description": "Merged catalog: 'api' models (static, external providers) and 'downloaded' models (read live from the inference worker; absent when the worker is unreachable — header X-Worker-Status: unreachable). Nothing is cached.",
+        "summary": "List usable models (API + live downloaded)",
+        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. A dead worker degrades to API-only (header X-Worker-Status: unreachable). Nothing is cached.",
         "operationId": "listModels",
         "parameters": [
           { "name": "modality", "in": "query", "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },
@@ -192,10 +192,65 @@
       "get": {
         "tags": ["Models"],
         "summary": "Live inference worker status",
-        "description": "Reads worker telemetry and catalog live on every call (no cache). Reports reachability, device and model count. connected=false when the worker is unreachable.",
+        "description": "Reads worker telemetry and catalog live on every call (no cache). Reports reachability, device and usable model count. connected=false when the worker is unreachable.",
         "operationId": "workerStatus",
         "responses": {
           "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseWorkerStatus" } } } }
+        }
+      }
+    },
+    "/api/v1/worker/models": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List worker models for management",
+        "description": "Tenant admin only. Full live worker catalog, including unavailable models, download progress and on-disk size. Use it for download/delete management in /gpu.",
+        "operationId": "listWorkerModels",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModels" } } } }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}/download": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Start a model download",
+        "description": "Tenant admin only. Starts a background weight download on the worker and returns its current operation state. Poll GET /api/v1/worker/models for progress.",
+        "operationId": "downloadWorkerModel",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": { "description": "Download started", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "409": { "description": "Conflicting weight operation" },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}/cancel": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Cancel a model download",
+        "description": "Tenant admin only. Aborts an in-progress background weight download on the worker.",
+        "operationId": "cancelWorkerModelDownload",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": { "description": "Download cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}": {
+      "delete": {
+        "tags": ["Models"],
+        "summary": "Delete model weights",
+        "description": "Tenant admin only. Removes a model's weights from worker disk.",
+        "operationId": "deleteWorkerModel",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Weights deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "409": { "description": "Cannot delete while another weight operation runs" },
+          "503": { "description": "Worker unreachable" }
         }
       }
     },
@@ -1390,6 +1445,10 @@
           "vram_gb": { "type": "integer" },
           "family": { "type": "string" },
           "available": { "type": "boolean", "description": "false when the worker lists the model but cannot run it" },
+          "downloading": { "type": "boolean", "description": "true while a background weight download is running" },
+          "download_percent": { "type": "number", "description": "Live 0-100 download progress" },
+          "size_bytes": { "type": "integer", "description": "On-disk weight size when downloaded" },
+          "download_error": { "type": "string", "description": "Last download failure, when present" },
           "notes": { "type": "string" }
         }
       },
@@ -1408,7 +1467,26 @@
           "connected": { "type": "boolean" },
           "device_name": { "type": "string" },
           "cuda_available": { "type": "boolean" },
-          "model_count": { "type": "integer" }
+          "model_count": { "type": "integer", "description": "Usable models reported by the worker" }
+        }
+      },
+      "ModelOperation": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "state": { "type": "string", "enum": ["idle", "downloading", "ready", "failed", "deleted", "cancelled"] },
+          "progress": { "type": "number" },
+          "bytes_downloaded": { "type": "integer" },
+          "total_bytes": { "type": "integer" },
+          "error": { "type": "string" }
+        }
+      },
+      "ApiResponseModelOperation": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/ModelOperation" }
         }
       },
       "ApiResponseWorkerStatus": {

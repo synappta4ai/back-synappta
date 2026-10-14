@@ -380,6 +380,27 @@ func (h *Handler) Resolve(provider string) (*Resolve, error) {
 	return h.store.Get(provider)
 }
 
+// generationProviders are the catalog API providers shown in /models: a model
+// is listed only when its provider has a stored authentication secret.
+var generationProviders = []string{
+	ProviderBytePlus, ProviderGemini, ProviderAnthropic, ProviderHiggsfield,
+}
+
+// UsableProviders reports which generation providers can actually run.
+func (h *Handler) UsableProviders() (map[string]bool, error) {
+	usable := make(map[string]bool, len(generationProviders))
+	for _, provider := range generationProviders {
+		res, err := h.store.Get(provider)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil && res.AuthKey() != "" {
+			usable[provider] = true
+		}
+	}
+	return usable, nil
+}
+
 // List handles GET /credentials
 func (h *Handler) List(c *gin.Context) {
 	items, err := h.store.List()

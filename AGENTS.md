@@ -24,6 +24,10 @@ The catalog (`internal/modules/model`) has two model types:
 
 Key rules when touching this area:
 
+- Public listings (`GET /api/v1/models*`) serve usable models only: API
+  models with a tenant credential plus worker models with `available: true`.
+  `GET /api/v1/worker/models` is the admin management view and keeps
+  unavailable entries with download progress and disk size.
 - `GET /api/v1/models?type=downloaded` and `GET /api/v1/worker/status` must
   always hit the worker live (`internal/modules/model/live.go`); do not add
   caching, memoization or fallback fixtures there.

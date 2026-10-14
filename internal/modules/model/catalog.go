@@ -104,8 +104,17 @@ type DownloadedModel struct {
 	// Family groups related models (sd, sdxl, wan, ...).
 	Family string `json:"family,omitempty"`
 	// Available: false when the worker lists the model but cannot run it
-	// (e.g. V1 bridge volume not mounted).
+	// (missing provider configuration, weights not downloaded, or an
+	// unmounted external volume).
 	Available bool `json:"available"`
+	// Downloading reports an in-progress background weights download.
+	Downloading bool `json:"downloading"`
+	// DownloadPercent is the live 0-100 progress of that download.
+	DownloadPercent float32 `json:"download_percent"`
+	// SizeBytes is the on-disk weight size when downloaded (0 otherwise).
+	SizeBytes int64 `json:"size_bytes"`
+	// DownloadError carries the last download failure, if any.
+	DownloadError string `json:"download_error,omitempty"`
 	// Notes from the worker catalog.
 	Notes string `json:"notes,omitempty"`
 }

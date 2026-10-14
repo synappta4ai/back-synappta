@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"synapta/internal/worker"
+	inferencev1 "synapta/internal/worker/proto"
 )
 
 // ErrWorkerUnreachable is returned when BM_WORKER_ADDR is unset or the worker
@@ -77,7 +78,9 @@ type WorkerStatus struct {
 }
 
 // ListLive returns the worker's full catalog mapped into catalog entries with
-// Type=TypeDownloaded. The result is built fresh on every call — zero caching.
+// Type=TypeDownloaded, including unavailable entries. It is the management
+// view used by /gpu: generation listings must use ListUsable instead. The
+// result is built fresh on every call — zero caching.
 func ListLive(ctx context.Context, addr string) ([]Model, error) {
 	c := workerClientOrNil()
 	if c == nil {
@@ -87,30 +90,8 @@ func ListLive(ctx context.Context, addr string) ([]Model, error) {
 	if err != nil {
 		return nil, &WorkerError{Err: err}
 	}
+	out := mapLiveModels(resp.Models)
 
-	out := make([]Model, 0, len(resp.Models))
-	for _, m := range resp.Models {
-		if m == nil {
-			continue
-		}
-		out = append(out, Model{
-			Name:        m.Key,
-			DisplayName: m.Label,
-			Modality:    workerModeToModality(m.Mode),
-			Type:        TypeDownloaded,
-			Downloaded: &DownloadedModel{
-				Mode:      m.Mode,
-				Engine:    m.Engine,
-				Pipeline:  m.Pipeline,
-				Repo:      m.Repo,
-				Steps:     m.Steps,
-				VRAMGb:    m.VramGb,
-				Family:    m.Family,
-				Available: m.Available,
-				Notes:     m.Notes,
-			},
-		})
-	}
 	// Deterministic order for UIs: modality, then family, then name.
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Modality != out[j].Modality {
@@ -125,14 +106,40 @@ func ListLive(ctx context.Context, addr string) ([]Model, error) {
 	return out, nil
 }
 
+// ListUsable returns only the downloaded models the worker can actually run.
+// Unavailable entries (missing credentials, weights not present, failed
+// downloads, unmounted volumes) stay visible to /gpu management through
+// ListLive, but they must never appear as generation choices.
+func ListUsable(ctx context.Context, addr string) ([]Model, error) {
+	models, err := ListLive(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	return FilterAvailable(models), nil
+}
+
+// FilterAvailable drops downloaded models the worker reports as unavailable.
+// API models are returned unchanged: credential filtering happens at the HTTP
+// layer, where the tenant-scoped credential handler is available.
+func FilterAvailable(models []Model) []Model {
+	out := make([]Model, 0, len(models))
+	for _, m := range models {
+		if m.Type == TypeDownloaded && (m.Downloaded == nil || !m.Downloaded.Available) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 // ListLiveFiltered applies the type/modality filters to the right source:
-// "api" → static catalog, "downloaded" → live worker read.
+// "api" → static catalog, "downloaded" → live usable worker models.
 func ListLiveFiltered(ctx context.Context, addr, typeFilter, modality string) ([]Model, error) {
 	switch ModelType(strings.ToLower(typeFilter)) {
 	case TypeAPI:
 		return List(Modality(modality)), nil
 	case TypeDownloaded:
-		models, err := ListLive(ctx, addr)
+		models, err := ListUsable(ctx, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -161,7 +168,7 @@ func WorkerStatusNow(ctx context.Context, addr string) (*WorkerStatus, error) {
 	// but the catalog call may still fail (worker restart mid-request, etc.).
 	// cuda_available and the model count both come from it.
 	if models, merr := c.ListModels(ctx, addr); merr == nil {
-		count, cuda = len(models.Models), models.CudaAvailable
+		count, cuda = len(FilterAvailable(mapLiveModels(models.Models))), models.CudaAvailable
 	} else {
 		log.Printf("[model] live model count after telemetry ok: %v", merr)
 	}
@@ -172,6 +179,40 @@ func WorkerStatusNow(ctx context.Context, addr string) (*WorkerStatus, error) {
 		CudaAvailable: cuda,
 		ModelCount:    count,
 	}, nil
+}
+
+// mapLiveModels converts worker ModelInfo entries into catalog entries.
+// Nil entries are skipped; unavailable entries are preserved here so /gpu can
+// manage them. Callers that serve generation choices must filter afterwards.
+func mapLiveModels(in []*inferencev1.ModelInfo) []Model {
+	out := make([]Model, 0, len(in))
+	for _, m := range in {
+		if m == nil {
+			continue
+		}
+		out = append(out, Model{
+			Name:        m.Key,
+			DisplayName: m.Label,
+			Modality:    workerModeToModality(m.Mode),
+			Type:        TypeDownloaded,
+			Downloaded: &DownloadedModel{
+				Mode:            m.Mode,
+				Engine:          m.Engine,
+				Pipeline:        m.Pipeline,
+				Repo:            m.Repo,
+				Steps:           m.Steps,
+				VRAMGb:          m.VramGb,
+				Family:          m.Family,
+				Available:       m.Available,
+				Downloading:     m.Downloading,
+				DownloadPercent: m.DownloadPercent,
+				SizeBytes:       m.SizeBytes,
+				DownloadError:   m.DownloadError,
+				Notes:           m.Notes,
+			},
+		})
+	}
+	return out
 }
 
 // filterByModality returns entries whose Modality matches modality; an empty

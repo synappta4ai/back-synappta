@@ -164,7 +164,13 @@ func main() {
 	tenantUsersHdl := tenant.NewTenantUsersHandler(sysDB)
 	tenant.SetTenantUsersHandler(tenantUsersHdl)
 	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner, reg, cfg.EncryptionKey))))
-	registry.Register(model.NewModule())
+	registry.Register(model.NewModule(func(c *gin.Context) (model.CredentialLister, bool) {
+		hdl, ok := manager.CredentialsFor(c)
+		if !ok || hdl == nil {
+			return nil, false
+		}
+		return hdl, true
+	}))
 
 	// Tenant-scoped modules resolve their handler per request.
 	registry.Register(event.NewModule(manager.EventsFor))
@@ -275,7 +281,7 @@ func main() {
 
 	stop := make(chan struct{})
 	go agency.ReconcileLoop(manager.EachCore, stop) // recovers orphaned tasks per tenant
-	go workerbridge.ReconcileLoop(wbStore, stop)   // marca failed jobs de GPUs que murieron
+	go workerbridge.ReconcileLoop(wbStore, stop)    // marca failed jobs de GPUs que murieron
 
 	go func() {
 		log.Printf("[main] synapta listening on :%s (env=%s)", cfg.Port, cfg.Env)

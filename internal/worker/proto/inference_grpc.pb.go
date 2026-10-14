@@ -25,6 +25,9 @@ const (
 	InferenceService_EnhancePrompt_FullMethodName    = "/maestro.inference.v1.InferenceService/EnhancePrompt"
 	InferenceService_GetGpuTelemetry_FullMethodName  = "/maestro.inference.v1.InferenceService/GetGpuTelemetry"
 	InferenceService_ListModels_FullMethodName       = "/maestro.inference.v1.InferenceService/ListModels"
+	InferenceService_DownloadModel_FullMethodName    = "/maestro.inference.v1.InferenceService/DownloadModel"
+	InferenceService_DeleteModel_FullMethodName      = "/maestro.inference.v1.InferenceService/DeleteModel"
+	InferenceService_GetModelState_FullMethodName    = "/maestro.inference.v1.InferenceService/GetModelState"
 )
 
 // InferenceServiceClient is the client API for InferenceService service.
@@ -43,6 +46,14 @@ type InferenceServiceClient interface {
 	GetGpuTelemetry(ctx context.Context, in *GpuTelemetryRequest, opts ...grpc.CallOption) (*GpuTelemetryResponse, error)
 	// Catálogo de modelos disponibles (motores, VRAM, disponibilidad)
 	ListModels(ctx context.Context, in *ListModelsRequest, opts ...grpc.CallOption) (*ListModelsResponse, error)
+	// Gestión de pesos: descarga en segundo plano (el progreso se lee con
+	// GetModelState o en el campo download_* de ModelInfo de ListModels).
+	// cancel=true aborta la descarga en curso de esa clave.
+	DownloadModel(ctx context.Context, in *DownloadModelRequest, opts ...grpc.CallOption) (*ModelOperationResponse, error)
+	// Borrado de los pesos en disco de un modelo (libera el disco)
+	DeleteModel(ctx context.Context, in *DeleteModelRequest, opts ...grpc.CallOption) (*ModelOperationResponse, error)
+	// Disponibilidad: estado de descarga de un modelo (clave vacía = todos)
+	GetModelState(ctx context.Context, in *GetModelStateRequest, opts ...grpc.CallOption) (*GetModelStateResponse, error)
 }
 
 type inferenceServiceClient struct {
@@ -122,6 +133,36 @@ func (c *inferenceServiceClient) ListModels(ctx context.Context, in *ListModelsR
 	return out, nil
 }
 
+func (c *inferenceServiceClient) DownloadModel(ctx context.Context, in *DownloadModelRequest, opts ...grpc.CallOption) (*ModelOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelOperationResponse)
+	err := c.cc.Invoke(ctx, InferenceService_DownloadModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *inferenceServiceClient) DeleteModel(ctx context.Context, in *DeleteModelRequest, opts ...grpc.CallOption) (*ModelOperationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ModelOperationResponse)
+	err := c.cc.Invoke(ctx, InferenceService_DeleteModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *inferenceServiceClient) GetModelState(ctx context.Context, in *GetModelStateRequest, opts ...grpc.CallOption) (*GetModelStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelStateResponse)
+	err := c.cc.Invoke(ctx, InferenceService_GetModelState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InferenceServiceServer is the server API for InferenceService service.
 // All implementations must embed UnimplementedInferenceServiceServer
 // for forward compatibility.
@@ -138,6 +179,14 @@ type InferenceServiceServer interface {
 	GetGpuTelemetry(context.Context, *GpuTelemetryRequest) (*GpuTelemetryResponse, error)
 	// Catálogo de modelos disponibles (motores, VRAM, disponibilidad)
 	ListModels(context.Context, *ListModelsRequest) (*ListModelsResponse, error)
+	// Gestión de pesos: descarga en segundo plano (el progreso se lee con
+	// GetModelState o en el campo download_* de ModelInfo de ListModels).
+	// cancel=true aborta la descarga en curso de esa clave.
+	DownloadModel(context.Context, *DownloadModelRequest) (*ModelOperationResponse, error)
+	// Borrado de los pesos en disco de un modelo (libera el disco)
+	DeleteModel(context.Context, *DeleteModelRequest) (*ModelOperationResponse, error)
+	// Disponibilidad: estado de descarga de un modelo (clave vacía = todos)
+	GetModelState(context.Context, *GetModelStateRequest) (*GetModelStateResponse, error)
 	mustEmbedUnimplementedInferenceServiceServer()
 }
 
@@ -165,6 +214,15 @@ func (UnimplementedInferenceServiceServer) GetGpuTelemetry(context.Context, *Gpu
 }
 func (UnimplementedInferenceServiceServer) ListModels(context.Context, *ListModelsRequest) (*ListModelsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListModels not implemented")
+}
+func (UnimplementedInferenceServiceServer) DownloadModel(context.Context, *DownloadModelRequest) (*ModelOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DownloadModel not implemented")
+}
+func (UnimplementedInferenceServiceServer) DeleteModel(context.Context, *DeleteModelRequest) (*ModelOperationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteModel not implemented")
+}
+func (UnimplementedInferenceServiceServer) GetModelState(context.Context, *GetModelStateRequest) (*GetModelStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelState not implemented")
 }
 func (UnimplementedInferenceServiceServer) mustEmbedUnimplementedInferenceServiceServer() {}
 func (UnimplementedInferenceServiceServer) testEmbeddedByValue()                          {}
@@ -288,6 +346,60 @@ func _InferenceService_ListModels_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _InferenceService_DownloadModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DownloadModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InferenceServiceServer).DownloadModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InferenceService_DownloadModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InferenceServiceServer).DownloadModel(ctx, req.(*DownloadModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InferenceService_DeleteModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InferenceServiceServer).DeleteModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InferenceService_DeleteModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InferenceServiceServer).DeleteModel(ctx, req.(*DeleteModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InferenceService_GetModelState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InferenceServiceServer).GetModelState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InferenceService_GetModelState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InferenceServiceServer).GetModelState(ctx, req.(*GetModelStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // InferenceService_ServiceDesc is the grpc.ServiceDesc for InferenceService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -314,6 +426,18 @@ var InferenceService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListModels",
 			Handler:    _InferenceService_ListModels_Handler,
+		},
+		{
+			MethodName: "DownloadModel",
+			Handler:    _InferenceService_DownloadModel_Handler,
+		},
+		{
+			MethodName: "DeleteModel",
+			Handler:    _InferenceService_DeleteModel_Handler,
+		},
+		{
+			MethodName: "GetModelState",
+			Handler:    _InferenceService_GetModelState_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

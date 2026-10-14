@@ -124,10 +124,15 @@ del hogar. Módulo: `internal/modules/workerbridge`.
 
 ```
 POST /api/v1/auth/login                     # token con tenant_id
-GET  /api/v1/models                         # catálogo combinado (?type=api|downloaded, ?modality=)
-                                            #   "downloaded" se lee EN VIVO del worker: si no responde,
-                                            #   no aparece (header X-Worker-Status: unreachable)
-GET  /api/v1/worker/status                  # estado en vivo del worker (device, cuda, n° de modelos)
+GET  /api/v1/models                         # solo modelos utilizables (?type=api|downloaded, ?modality=)
+                                            #   api: únicamente con credencial del tenant; downloaded:
+                                            #   únicamente disponibles en el worker. Sin worker, solo api
+                                            #   (header X-Worker-Status: unreachable)
+GET  /api/v1/worker/status                  # estado en vivo del worker (device, cuda, n° de modelos utilizables)
+GET  /api/v1/worker/models                  # gestión admin: catálogo completo con progreso y tamaño
+POST /api/v1/worker/models/:key/download    # gestión admin: iniciar descarga de pesos
+POST /api/v1/worker/models/:key/cancel      # gestión admin: cancelar descarga en curso
+DELETE /api/v1/worker/models/:key           # gestión admin: eliminar pesos del disco
 PUT  /api/v1/credentials                    # credenciales del tenant (cifradas) — solo modelos api
 
 POST /api/v1/files/upload                   # dedup por SHA-256: contenido idéntico activo
@@ -159,12 +164,18 @@ GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant
 { "name": "gemini-nano-banana", "modality": "image", "type": "api",
   "credential_provider": "gemini", "base_url": "https://…", "display_name": "Gemini Nano Banana", … }
 
-// GET /api/v1/models?type=downloaded  (en vivo del worker)
+// GET /api/v1/models?type=downloaded  (solo disponibles, en vivo del worker)
 { "name": "Wan2.1-T2V-1.3B", "modality": "video", "type": "downloaded",
   "display_name": "Wan 2.1 T2V 1.3B (video ligero)",
   "downloaded": { "mode": "video", "engine": "diffusers", "pipeline": "wan",
                   "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "steps": 30,
-                  "vram_gb": 6, "family": "wan", "available": true } }
+                  "vram_gb": 6, "family": "wan", "available": true,
+                  "downloading": false, "download_percent": 100, "size_bytes": 123456 } }
+
+// GET /api/v1/worker/models  (gestión admin: incluye no disponibles)
+{ "name": "Wan2.1-T2V-1.3B", "modality": "video", "type": "downloaded",
+  "downloaded": { "available": false, "downloading": true, "download_percent": 42.5,
+                  "size_bytes": 420, "download_error": "weights not downloaded" } }
 ```
 
 ## Costos del proveedor (spend)
