@@ -7,12 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"synapta/config"
 	"synapta/internal/modules/agency"
+	"synapta/internal/modules/model"
 	"synapta/internal/modules/workerbridge"
 	"synapta/internal/worker"
 
@@ -26,11 +29,25 @@ type fakeStreamWorker struct {
 	inferencev1.UnimplementedInferenceServiceServer
 	outputDir string
 	holdOpen  chan struct{} // non-nil: streams stay open until closed
+
+	mu       sync.Mutex
+	lastMode string // último mode recibido (asserts de modalidad)
+}
+
+// mode reporta el último mode pedido por el generator.
+func (f *fakeStreamWorker) mode() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMode
 }
 
 func (f *fakeStreamWorker) GenerateMedia(req *inferencev1.MediaGenerationRequest,
 	srv inferencev1.InferenceService_GenerateMediaServer,
 ) error {
+	f.mu.Lock()
+	f.lastMode = req.Mode
+	f.mu.Unlock()
+
 	artifact := filepath.Join(f.outputDir, req.JobId+".mp4")
 	if err := os.WriteFile(artifact, []byte("fake-mp4-bytes"), 0o644); err != nil {
 		return err
@@ -126,13 +143,24 @@ func TestDownloadedGenerateImageMode(t *testing.T) {
 	f := &fakeStreamWorker{outputDir: t.TempDir()}
 	g := NewDownloadedGenerator(worker.NewClient(), startStreamWorker(t, f), ".")
 
-	// SD-1.5 is an API-catalog name, so LookupModel resolves it with modality
-	// image: the generator must send mode="image" to the worker.
-	res, err := g.Generate(genRequest("SD-1.5"))
+	// La modalidad la resuelve el core y viaja en el request: el generator
+	// debe despachar mode="image" al worker (no el default de video).
+	req := genRequest("SD-1.5")
+	req.Modality = model.ModalityImage
+	res, err := g.Generate(req)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
+	// El stream corre en una goroutine: el mode llega al worker enseguida
+	// pero no antes de que Generate retorne.
 	deadline := time.Now().Add(5 * time.Second)
+	for f.mode() == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.mode(); got != "image" {
+		t.Fatalf("worker received mode=%q, want image", got)
+	}
+
 	for time.Now().Before(deadline) {
 		st, _ := g.GetStatus(res.TaskID, "", "", "")
 		if st.Status == "succeeded" || st.Status == "failed" {
@@ -158,14 +186,49 @@ func TestDownloadedCancelTask(t *testing.T) {
 	}
 }
 
-// fakeBridgeQueue implements BridgeQueue for the bridge-mode paths: only the
-// online check and the snapshots matter for Validate.
+// fakeBridgeQueue implements BridgeQueue for the bridge-mode paths: the online
+// check and the snapshots drive Validate; spy registra lo encolado (el pin y
+// el payload) para los tests de despacho.
 type fakeBridgeQueue struct {
 	online bool
 	models []workerbridge.WorkerModel
+	spy    *bridgeSpy
 }
 
-func (f fakeBridgeQueue) Enqueue(context.Context, int64, string, json.RawMessage) error {
+// bridgeSpy acumula los encolados; el puntero sobrevive a las copias por
+// valor del fake.
+type bridgeSpy struct {
+	mu       sync.Mutex
+	enqueued []bridgeEnqueue
+}
+
+type bridgeEnqueue struct {
+	TenantID int64
+	TaskID   string
+	WorkerID string
+	Payload  json.RawMessage
+}
+
+func (s *bridgeSpy) add(e bridgeEnqueue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enqueued = append(s.enqueued, e)
+}
+
+func (s *bridgeSpy) last(t *testing.T) bridgeEnqueue {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.enqueued) == 0 {
+		t.Fatal("no job was enqueued")
+	}
+	return s.enqueued[len(s.enqueued)-1]
+}
+
+func (f fakeBridgeQueue) Enqueue(_ context.Context, tenantID int64, taskID, workerID string, payload json.RawMessage) error {
+	if f.spy != nil {
+		f.spy.add(bridgeEnqueue{TenantID: tenantID, TaskID: taskID, WorkerID: workerID, Payload: payload})
+	}
 	return nil
 }
 
@@ -228,6 +291,92 @@ func TestDownloadedValidateFailsWithoutWorker(t *testing.T) {
 		Content: []agency.ContentItem{{Type: "text", Text: "p"}},
 	}); err == nil {
 		t.Fatal("expected validation failure with empty worker addr")
+	}
+}
+
+// El job de una GPU emparejada queda fijado a la máquina que declara el
+// modelo: con dos GPUs en el tenant, la que no tiene los pesos no debe
+// tomarlo (fallaría dentro del worker). La modalidad resuelta viaja en el
+// payload (una imagen no puede despacharse como video).
+func TestDownloadedGenerateBridgePinsJobToWorkerWithWeights(t *testing.T) {
+	spy := &bridgeSpy{}
+	q := fakeBridgeQueue{online: true, spy: spy, models: []workerbridge.WorkerModel{
+		{Key: "SDXL-Turbo", Mode: "image", Engine: "diffusers", Pipeline: "sdxl",
+			Available: true, WorkerID: "worker-a", WorkerName: "PC-Casa"},
+		{Key: "Wan2.1-T2V-1.3B", Mode: "video", Engine: "diffusers", Pipeline: "wan",
+			Available: true, WorkerID: "worker-b", WorkerName: "Notebook"},
+	}}
+	g := bridgeGenerator(t, q)
+
+	req := genRequest("SDXL-Turbo")
+	req.Modality = model.ModalityImage
+	res, err := g.Generate(req)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if res.Status != config.STATUS_RUNNING {
+		t.Fatalf("status = %q, want running", res.Status)
+	}
+
+	got := spy.last(t)
+	if got.WorkerID != "worker-a" {
+		t.Fatalf("job pinned to %q, want worker-a (the GPU with the weights)", got.WorkerID)
+	}
+	if got.TaskID != res.TaskID || got.TenantID != 1 {
+		t.Fatalf("enqueued %+v, want task %s for tenant 1", got, res.TaskID)
+	}
+	var payload struct {
+		Mode      string `json:"mode"`
+		ModelName string `json:"modelName"`
+		NumFrames int    `json:"numFrames"`
+	}
+	if err := json.Unmarshal(got.Payload, &payload); err != nil {
+		t.Fatalf("payload not JSON: %v (%s)", err, got.Payload)
+	}
+	if payload.Mode != "image" || payload.ModelName != "SDXL-Turbo" {
+		t.Fatalf("payload mode/model = %q/%q, want image/SDXL-Turbo", payload.Mode, payload.ModelName)
+	}
+	if payload.NumFrames != 0 {
+		t.Fatalf("image job carried numFrames=%d, want 0", payload.NumFrames)
+	}
+}
+
+func TestDownloadedGenerateBridgeVideoKeepsFrames(t *testing.T) {
+	spy := &bridgeSpy{}
+	g := bridgeGenerator(t, fakeBridgeQueue{online: true, spy: spy, models: []workerbridge.WorkerModel{
+		{Key: "Wan2.1-T2V-1.3B", Mode: "video", Available: true, WorkerID: "worker-b"},
+	}})
+
+	req := genRequest("Wan2.1-T2V-1.3B")
+	req.Modality = model.ModalityVideo
+	if _, err := g.Generate(req); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var payload struct {
+		Mode      string `json:"mode"`
+		NumFrames int    `json:"numFrames"`
+	}
+	if err := json.Unmarshal(spy.last(t).Payload, &payload); err != nil {
+		t.Fatalf("payload not JSON: %v", err)
+	}
+	if payload.Mode != "video" || payload.NumFrames == 0 {
+		t.Fatalf("video payload mode/frames = %q/%d", payload.Mode, payload.NumFrames)
+	}
+}
+
+// Sin GPU que declare el modelo, el job se encola abierto (""): la validación
+// ya corrió antes y un pin inventado no acercaría el trabajo a ninguna parte.
+func TestDownloadedGenerateBridgeLeavesJobOpenWithoutWorkerIdentity(t *testing.T) {
+	spy := &bridgeSpy{}
+	g := bridgeGenerator(t, fakeBridgeQueue{online: true, spy: spy, models: []workerbridge.WorkerModel{
+		{Key: "Wan2.1-T2V-1.3B", Mode: "video", Available: true},
+	}})
+
+	if _, err := g.Generate(genRequest("Wan2.1-T2V-1.3B")); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if got := spy.last(t); got.WorkerID != "" {
+		t.Fatalf("job pinned to %q, want open", got.WorkerID)
 	}
 }
 

@@ -143,6 +143,19 @@ func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error)
 	return out, nil
 }
 
+// UsableBridgeModelsForTenant is the generation-side view of the bridge
+// catalog: only the entries a paired GPU can run right now (weights on disk).
+// The management view (/worker/models) must keep showing the entries without
+// weights so an admin can download them, but a generation choice that cannot
+// run would only fail after the user picked it.
+func UsableBridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error) {
+	models, err := BridgeModelsForTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return FilterAvailable(models), nil
+}
+
 // WorkerError describes a failed live read from the worker.
 type WorkerError struct{ Err error }
 
@@ -211,23 +224,6 @@ func FilterAvailable(models []Model) []Model {
 		out = append(out, m)
 	}
 	return out
-}
-
-// ListLiveFiltered applies the type/modality filters to the right source:
-// "api" → static catalog, "downloaded" → live usable worker models.
-func ListLiveFiltered(ctx context.Context, addr, typeFilter, modality string) ([]Model, error) {
-	switch ModelType(strings.ToLower(typeFilter)) {
-	case TypeAPI:
-		return List(Modality(modality)), nil
-	case TypeDownloaded:
-		models, err := ListUsable(ctx, addr)
-		if err != nil {
-			return nil, err
-		}
-		return filterByModality(models, modality)
-	default:
-		return nil, fmt.Errorf("invalid type: %q", typeFilter)
-	}
 }
 
 // WorkerStatusNow returns the live worker status for the HTTP handler.
@@ -314,6 +310,11 @@ func filterByModality(models []Model, modality string) ([]Model, error) {
 	}
 	return out, nil
 }
+
+// ModalityForWorkerMode es el mapeo público de workerModeToModality: lo usan
+// los consumidores de los snapshots del bridge (el resolver del runtime), que
+// mapean a modalidades igual que el catálogo vivo del worker central.
+func ModalityForWorkerMode(mode string) Modality { return workerModeToModality(mode) }
 
 // workerModeToModality maps the worker's mode strings to Synapta modalities.
 // video/image/audio map 1:1. tts has no Synapta modality yet: it maps to ""

@@ -11,8 +11,10 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +30,7 @@ import (
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
+	"synapta/internal/modules/model"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
@@ -145,6 +148,35 @@ func (m *Manager) FileForSlug(c *gin.Context) (*file.Handler, bool) {
 		return nil, false
 	}
 	return b.Files, true
+}
+
+// bridgeModelResolver arma el resolver de modelos del bridge para un tenant:
+// busca el nombre en los snapshots de sus GPUs emparejadas (la única fuente
+// viva cuando no hay worker central) y devuelve la modalidad resuelta, que el
+// generator necesita para no despachar una imagen como video.
+func bridgeModelResolver(store *workerbridge.Store, tenantID int64) agency.BridgeModelResolver {
+	return func(ctx context.Context, name string) (*agency.BridgeModelRef, error) {
+		models, err := store.SnapshotsForTenant(ctx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range models {
+			if !strings.EqualFold(m.Key, name) {
+				continue
+			}
+			return &agency.BridgeModelRef{
+				Name:        m.Key,
+				Label:       m.Label,
+				Modality:    model.ModalityForWorkerMode(m.Mode),
+				WorkerID:    m.WorkerID,
+				WorkerName:  m.WorkerName,
+				Available:   m.Available,
+				Downloading: m.Downloading,
+				SizeBytes:   m.SizeBytes,
+			}, nil
+		}
+		return nil, nil // el catálogo de las GPUs no declara ese modelo
+	}
 }
 
 // EachCore runs fn over every cached tenant core (reconciler sweeps).
@@ -282,6 +314,11 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir)
 	if m.workerBridgeStore != nil && m.cfg.WorkerAddr == "" {
 		dlGen.SetBridge(m.workerBridgeStore, t.ID)
+		// Sin worker central, los snapshots de las GPUs emparejadas son la
+		// única fuente viva de modelos "downloaded": el core los resuelve
+		// para generar (modalidad incluida) en vez de responder "model not
+		// found" a todo modelo que sólo vive en la máquina del usuario.
+		core.SetBridgeModels(bridgeModelResolver(m.workerBridgeStore, t.ID))
 	}
 	core.RegisterGenerator(dlGen)
 

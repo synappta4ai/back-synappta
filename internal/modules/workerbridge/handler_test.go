@@ -223,13 +223,20 @@ func (f *fakeStore) AttachArtifact(_ context.Context, workerID, taskID, name, u 
 // pasar cualquier cosa y el tenant middleware inyecta un tenant fijo.
 func testRouter(t *testing.T, f *fakeStore) *gin.Engine {
 	t.Helper()
+	return testRouterFor(t, f, 1)
+}
+
+// testRouterFor monta el module sobre cualquier BridgeStore (el fake o el
+// store real contra Postgres) fijando el tenant de los requests admin.
+func testRouterFor(t *testing.T, store BridgeStore, tenantID int64) *gin.Engine {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
-	m := NewModule(f)
+	m := NewModule(store)
 	r := gin.New()
 	v1 := r.Group("/api/v1")
 	pass := func(c *gin.Context) { c.Next() }
 	m.Register(v1, pass, func(c *gin.Context) {
-		ctx := tenancy.Context(c.Request.Context(), &tenancy.Tenant{ID: 1, Slug: "test", Active: true})
+		ctx := tenancy.Context(c.Request.Context(), &tenancy.Tenant{ID: tenantID, Slug: "test", Active: true})
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}, pass)

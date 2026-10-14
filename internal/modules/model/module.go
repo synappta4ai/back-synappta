@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -33,9 +34,10 @@ type CredentialResolver func(c *gin.Context) (CredentialLister, bool)
 // The public catalog has two sources:
 //   - "api" models: static entries defined in catalog.go, filtered by the
 //     tenant's stored provider credentials.
-//   - "downloaded" models: served live by the brain-master inference worker
-//     (gRPC), filtered by the worker's availability. Nothing is cached:
-//     every request re-reads the worker.
+//   - "downloaded" models: served live by the workers that can run them —
+//     the back's own inference worker (gRPC) and the GPUs tenants paired
+//     through the bridge — filtered by the availability each one reports.
+//     Nothing is cached: every request re-reads both sources.
 //
 // The /worker/models management routes are the full worker view (including
 // unavailable entries, download progress and on-disk size) with download,
@@ -99,19 +101,15 @@ func (m *Module) List(c *gin.Context) {
 		return
 	}
 
-	// Merged view: usable API models + whatever usable models the worker
-	// reports now. A dead worker degrades to API-only, never to invented
-	// downloaded entries.
+	// Merged view: usable API models + whatever usable models the workers
+	// report now (central gRPC and/or paired GPUs). A silent worker
+	// degrades to API-only, never to invented downloaded entries.
 	models, handled := m.usableAPIModels(c, Modality(modality))
 	if handled {
 		return
 	}
-	live, lerr := ListUsable(c.Request.Context(), workerAddr())
-	if lerr != nil {
-		logWorkerError(c, lerr) // API models are still served
-	} else {
-		models = append(models, filterByModalityOrAll(live, modality)...)
-	}
+	live, _ := m.liveUsable(c)
+	models = append(models, filterByModalityOrAll(live, modality)...)
 	utils.Success(c, models)
 }
 
@@ -141,13 +139,80 @@ func (m *Module) ListByModality(c *gin.Context) {
 	if handled {
 		return
 	}
-	live, lerr := ListUsable(c.Request.Context(), workerAddr())
-	if lerr != nil {
-		logWorkerError(c, lerr)
-	} else {
-		models = append(models, filterByModalityOrAll(live, modality)...)
-	}
+	live, _ := m.liveUsable(c)
+	models = append(models, filterByModalityOrAll(live, modality)...)
 	utils.Success(c, models)
+}
+
+// liveUsable returns the downloaded models a tenant can run right now, merged
+// from the two dispatch paths: the back's own worker (live gRPC over
+// BM_WORKER_ADDR) and the GPUs the tenant paired through the bridge. Both
+// reads are live and uncached; whichever side fails contributes nothing and
+// its error is returned so a caller listing ONLY downloaded models can still
+// answer 500 when the catalog could not be read at all. A bridge-only tenant
+// therefore gets its GPU catalog, and a central-only tenant is unaffected.
+//
+// The first error is the central worker's; bridge failures are logged (and
+// reported only when the central answered) because an unwired snapshot
+// source is the normal state on central-only deployments.
+func (m *Module) liveUsable(c *gin.Context) ([]Model, error) {
+	ctx := c.Request.Context()
+	central, cerr := ListUsable(ctx, workerAddr())
+	var bridge []Model
+	if t := tenancy.FromContext(ctx); t != nil {
+		models, berr := UsableBridgeModelsForTenant(ctx, t.ID)
+		if berr != nil {
+			log.Printf("[model] bridge catalog for tenant %d: %v", t.ID, berr)
+		} else {
+			bridge = models
+		}
+	}
+	models := mergeByName(central, bridge)
+	// Only complain about the central worker when it actually cost us
+	// entries: with GPUs serving the same catalog the listing is intact.
+	if cerr != nil && len(bridge) == 0 {
+		logWorkerError(c, cerr)
+		return models, cerr
+	}
+	return models, nil
+}
+
+// mergeByName concatenates catalogs keeping one entry per model name (first
+// occurrence wins, compared like the other catalog lookups) and returns them
+// in the same deterministic order as ListLive: modality, family, name. The
+// central worker comes first, so when a GPU and the central worker both have
+// the same weights the entry with weight telemetry wins — on both dispatch
+// paths the model key is the same, so either one dispatches correctly.
+func mergeByName(lists ...[]Model) []Model {
+	out := make([]Model, 0)
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, m := range list {
+			key := strings.ToLower(m.Name)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Modality != out[j].Modality {
+			return out[i].Modality < out[j].Modality
+		}
+		fi, fj := "", ""
+		if out[i].Downloaded != nil {
+			fi = out[i].Downloaded.Family
+		}
+		if out[j].Downloaded != nil {
+			fj = out[j].Downloaded.Family
+		}
+		if fi != fj {
+			return fi < fj
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 // WorkerStatus handles GET /api/v1/worker/status — live reachability and GPU
@@ -295,12 +360,15 @@ func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Mode
 		}
 		return models, false
 	}
-	models, err := ListLiveFiltered(c.Request.Context(), workerAddr(), typeFilter, modality)
-	if err != nil {
+	// "downloaded" is the union of both dispatch paths (central worker +
+	// paired GPUs). Failing the request is only honest when neither could
+	// answer; an empty catalog from a reachable source is a valid answer.
+	models, err := m.liveUsable(c)
+	if err != nil && len(models) == 0 {
 		utils.InternalError(c, workerMessage(err))
 		return nil, true
 	}
-	return models, false
+	return filterByModalityOrAll(models, modality), false
 }
 
 // usableAPIModels returns the static catalog entries whose provider has a

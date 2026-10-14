@@ -66,3 +66,63 @@ func LookupModel(name string) *modelEntry {
 	}
 	return nil
 }
+
+// BridgeModelRef describe un modelo que sólo sirve una GPU emparejada del
+// tenant (camino bridge: la máquina del usuario, detrás de su NAT). No lleva
+// credenciales ni ruta HTTP: el trabajo se encola y lo ejecuta esa GPU.
+type BridgeModelRef struct {
+	Name     string
+	Label    string
+	Modality model.Modality
+	// WorkerID identifica la GPU que declara el modelo: es a quien se fija el
+	// job cuando varias máquinas del tenant están emparejadas.
+	WorkerID   string
+	WorkerName string
+	// Available: la GPU tiene los pesos en disco. Un modelo declarado pero
+	// sin pesos se resuelve igual (y Validate explica que hay que bajarlo)
+	// en vez de aparecer como "modelo inexistente".
+	Available   bool
+	Downloading bool
+	SizeBytes   int64
+}
+
+// BridgeModelResolver busca un modelo en las GPUs emparejadas del tenant.
+//
+// Un Core existe por tenant, así que el scope ya está fijado en el resolver y
+// la firma sólo lleva el nombre. Devuelve (nil, nil) cuando el catálogo de las
+// GPUs no declara ese modelo: no es un error, simplemente no está ahí.
+type BridgeModelResolver func(ctx context.Context, name string) (*BridgeModelRef, error)
+
+// SetBridgeModels habilita la resolución de modelos servidos por GPUs
+// emparejadas. Sin esto (deploy con worker central) el catálogo vivo por gRPC
+// sigue siendo la única fuente de modelos "downloaded".
+func (s *Core) SetBridgeModels(resolve BridgeModelResolver) { s.bridgeModels = resolve }
+
+// lookupModel resuelve un modelo de generación: primero el catálogo API y el
+// worker central (LookupModel) y, si ese no lo conoce, las GPUs emparejadas
+// del tenant. Sin este segundo paso un modelo que sólo existe en la GPU del
+// usuario moría en "model not found" antes de llegar al generator (y su
+// modalidad —image vs video— se perdía).
+func (s *Core) lookupModel(name string) *modelRef {
+	if m := LookupModel(name); m != nil {
+		return m
+	}
+	if s.bridgeModels == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+	defer cancel()
+	ref, err := s.bridgeModels(ctx, name)
+	if err != nil {
+		log.Printf("[agency] bridge model lookup for %q failed: %v", name, err)
+		return nil
+	}
+	if ref == nil {
+		return nil
+	}
+	return &modelEntry{
+		Name:     ref.Name,
+		Modality: ref.Modality,
+		Type:     model.TypeDownloaded,
+	}
+}

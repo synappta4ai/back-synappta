@@ -71,6 +71,10 @@ type Core struct {
 	genAssetSt   *GeneratedAssetStore
 	genSaver     GenerationSaver
 	pushNotifier PushNotifier
+	// bridgeModels resuelve modelos servidos por las GPUs emparejadas del
+	// tenant (nil en deploys con worker central, donde el catálogo vivo por
+	// gRPC es la única fuente "downloaded").
+	bridgeModels BridgeModelResolver
 	mu           sync.RWMutex
 }
 
@@ -266,8 +270,9 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}()
 
-	// Look up model in the code catalog
-	m := LookupModel(req.Model)
+	// Look up model in the code catalog (API + worker central + GPUs
+	// emparejadas del tenant).
+	m := s.lookupModel(req.Model)
 	if m == nil {
 		errLog = fmt.Sprintf("model not found: %s", req.Model)
 		return nil, fmt.Errorf("model not found: %s", req.Model)
@@ -307,6 +312,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	// Convert to generator request
 	genReq = &GeneratorRequest{
 		Model:         m.Name,
+		Modality:      m.Modality,
 		Content:       resolvedContent,
 		Ratio:         req.Ratio,
 		Duration:      int(req.Duration),
@@ -558,7 +564,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		}
 	}
 
-	m := LookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName)
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
 	}
@@ -753,7 +759,7 @@ func (s *Core) CancelTask(taskID string) error {
 		return fmt.Errorf("unknown task: %s", taskID)
 	}
 
-	m := LookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName)
 	if m == nil {
 		return fmt.Errorf("model for task %s not found", taskID)
 	}
@@ -780,7 +786,7 @@ func (s *Core) CancelTask(taskID string) error {
 
 // PreviewPayload builds the AI API payload without sending it or saving logs.
 func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, error) {
-	m := LookupModel(req.Model)
+	m := s.lookupModel(req.Model)
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
@@ -866,7 +872,7 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		return sr, nil
 	}
 
-	m := LookupModel(logEntry.ModelName)
+	m := s.lookupModel(logEntry.ModelName)
 	if m == nil {
 		return &StatusResult{Status: logEntry.Status, Error: "model not found for task " + logEntry.TaskID}, nil
 	}

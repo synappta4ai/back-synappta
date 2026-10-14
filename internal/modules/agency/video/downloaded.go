@@ -44,7 +44,9 @@ const streamTimeout = 6 * time.Hour
 // el back encola el trabajo y la GPU del usuario lo reclama por HTTP.
 // workerbridge.Store la implementa; los tests usan un fake.
 type BridgeQueue interface {
-	Enqueue(ctx context.Context, tenantID int64, taskID string, payload json.RawMessage) error
+	// Enqueue encola el trabajo. workerID fija la GPU destino cuando se sabe
+	// cuál tiene los pesos ("" = lo puede tomar cualquier GPU del tenant).
+	Enqueue(ctx context.Context, tenantID int64, taskID, workerID string, payload json.RawMessage) error
 	JobByTaskID(ctx context.Context, tenantID int64, taskID string) (*workerbridge.Job, error)
 	RequestCancel(ctx context.Context, tenantID int64, taskID string) error
 	HasOnlineWorker(ctx context.Context, tenantID int64) (bool, error)
@@ -168,11 +170,13 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		return nil, fmt.Errorf("downloaded models need a text prompt")
 	}
 
-	// Mode follows the model's live modality (image vs video): downloaded
-	// models of both kinds are served through this generator.
-	mode := "video"
-	if m := agency.LookupModel(req.Model); m != nil && m.Modality != "" {
-		mode = string(m.Modality)
+	// Mode follows the model's resolved modality (image vs video): downloaded
+	// models of both kinds are served through this generator. El core la
+	// resolvió en el catálogo (incluidos los snapshots del bridge), así que
+	// acá no se vuelve a consultar: en modo bridge no hay catálogo gRPC vivo.
+	mode := string(req.Modality)
+	if mode == "" {
+		mode = "video"
 	}
 
 	// The worker's engines read width/height; map the agency ratio onto
@@ -227,11 +231,13 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 		defer cancel()
-		if err := g.bridge.Enqueue(ctx, g.tenantID, jobID, payload); err != nil {
+		target := g.bridgeTarget(ctx, req.Model)
+		if err := g.bridge.Enqueue(ctx, g.tenantID, jobID, target, payload); err != nil {
 			g.store.fail(jobID, fmt.Sprintf("enqueue: %v", err))
 			return nil, fmt.Errorf("enqueue job for GPU worker: %w", err)
 		}
-		log.Printf("[downloaded] job %s enqueued for bridge (model=%s tenant=%d)", jobID, req.Model, g.tenantID)
+		log.Printf("[downloaded] job %s enqueued for bridge (model=%s tenant=%d worker=%s)",
+			jobID, req.Model, g.tenantID, shortWorker(target))
 		return &agency.GeneratorResult{
 			TaskID: jobID,
 			Model:  req.Model,
@@ -261,6 +267,36 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		Status: config.STATUS_RUNNING,
 		Raw:    map[string]interface{}{"job_id": jobID, "engine": "inference-worker", "model": req.Model},
 	}, nil
+}
+
+// bridgeTarget devuelve la GPU que declara el modelo (la que tiene —o está
+// bajando— los pesos). Con varias máquinas emparejadas el job debe fijarse a
+// esa: si lo tomara otra, fallaría al no encontrar el modelo. "" significa
+// "cualquier GPU del tenant", que es la única opción honesta cuando el
+// snapshot no identifica a nadie.
+func (g *DownloadedGenerator) bridgeTarget(ctx context.Context, modelName string) string {
+	snapshots, err := g.bridge.SnapshotsForTenant(ctx, g.tenantID)
+	if err != nil {
+		log.Printf("[downloaded] snapshots for pin (model=%s tenant=%d): %v", modelName, g.tenantID, err)
+		return ""
+	}
+	for _, s := range snapshots {
+		if strings.EqualFold(s.Key, modelName) {
+			return s.WorkerID
+		}
+	}
+	return ""
+}
+
+// shortWorker recorta un worker id para los logs (vacío → "any").
+func shortWorker(id string) string {
+	if id == "" {
+		return "any"
+	}
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // streamJob consumes one GenerateMedia stream and mirrors every event into

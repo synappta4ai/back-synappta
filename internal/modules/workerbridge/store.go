@@ -393,18 +393,24 @@ func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string
 // Enqueue agrega un trabajo a la cola del tenant. task_id es el id del
 // generator (syn_*), único por tenant: re-encolar el mismo task reemplaza
 // el row (idempotente ante reintentos del reconciler).
-func (s *Store) Enqueue(ctx context.Context, tenantID int64, taskID string, payload json.RawMessage) error {
+//
+// workerID fija la GPU destino (la que declara el modelo con pesos): un job
+// fijado sólo lo puede reclamar esa máquina. "" deja el job abierto a
+// cualquier GPU del tenant.
+func (s *Store) Enqueue(ctx context.Context, tenantID int64, taskID, workerID string, payload json.RawMessage) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO worker_jobs (tenant_id, task_id, payload)
-		VALUES ($1, $2, $3::jsonb)
+		INSERT INTO worker_jobs (tenant_id, task_id, worker_id, payload)
+		VALUES ($1, $2, NULLIF($3, '')::uuid, $4::jsonb)
 		ON CONFLICT (task_id) DO UPDATE
 		SET payload = EXCLUDED.payload, status = 'queued',
-		    updated_at = NOW()`,
-		tenantID, taskID, string(payload))
+		    worker_id = EXCLUDED.worker_id, updated_at = NOW()`,
+		tenantID, taskID, workerID, string(payload))
 	return err
 }
 
-// Claim entrega el próximo job encolado al worker que lo pide.
+// Claim entrega el próximo job encolado al worker que lo pide. Sólo toma
+// jobs sin dueño o fijados a ESE worker: un job fijado a la GPU que tiene los
+// pesos no puede caer en otra máquina del tenant (fallaría sin el modelo).
 //
 // FOR UPDATE SKIP LOCKED es el patrón correcto para colas en Postgres: dos
 // workers que reclamen a la vez nunca ven la misma fila y no se bloquean
@@ -417,6 +423,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, tenantID int64) (*Jo
 		WHERE id = (
 			SELECT id FROM worker_jobs
 			WHERE tenant_id = $2 AND status = 'queued'
+			  AND (worker_id IS NULL OR worker_id = $1::uuid)
 			ORDER BY created_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -536,8 +543,15 @@ type WorkerModel struct {
 // SnapshotsForTenant mergea los catálogos de las GPUs online del tenant.
 // Es la fuente del catálogo "downloaded" en modo bridge: sin workers vivos,
 // la lista sale vacía (nunca se inventan modelos sin GPU). Cada modelo sale
-// con la identidad de la GPU que lo reportó (la primera online gana), que es
-// la máquina a la que se le pide la descarga cuando falta y no está ahí.
+// con la identidad de la GPU que lo reportó, que es la máquina a la que se le
+// pide la descarga cuando falta y a la que se fija el trabajo al generar.
+//
+// Un mismo modelo puede estar declarado por varias máquinas del tenant. Gana
+// la entrada más útil para el usuario, no la primera que llega: primero la que
+// TIENE los pesos (si no, el modelo quedaba oculto por una GPU que sólo lo
+// declara, y generar fallaba con "todavía no lo bajó"), después la que los
+// está bajando (es la que puede completar la descarga) y, entre iguales, la
+// primera por antigüedad — orden estable entre heartbeats.
 func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]WorkerModel, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id::text, name, version, models::text FROM worker_registry
@@ -547,7 +561,7 @@ func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]Worke
 		return nil, err
 	}
 	defer rows.Close()
-	seen := map[string]bool{}
+	index := map[string]int{} // key (lower) → posición en out
 	out := []WorkerModel{}
 	for rows.Next() {
 		var id, name, version, raw string
@@ -559,19 +573,50 @@ func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]Worke
 			continue // snapshot corrupto de un worker: se ignora, no rompe la lista
 		}
 		for _, m := range models {
-			if m.Key == "" || seen[strings.ToLower(m.Key)] {
+			if m.Key == "" {
 				continue
 			}
-			seen[strings.ToLower(m.Key)] = true
 			m.WorkerID, m.WorkerName, m.WorkerVersion = id, name, version
-			out = append(out, m)
+			key := strings.ToLower(m.Key)
+			pos, seen := index[key]
+			if !seen {
+				index[key] = len(out)
+				out = append(out, m)
+				continue
+			}
+			if snapshotScore(m) > snapshotScore(out[pos]) {
+				out[pos] = m // reemplaza al del worker anterior, conservando el orden
+			}
 		}
 	}
 	return out, rows.Err()
 }
 
-// FailOrphan marca un job running cuyo worker murió (heartbeat vencido) como
-// failed: nada queda "running" para siempre. Lo usa el reconciler.
+// snapshotScore prioriza, entre las máquinas que declaran el mismo modelo, la
+// que realmente puede usarlo: pesos en disco > descarga en curso > indicios de
+// haber intentado bajarlo > sólo declarado.
+func snapshotScore(m WorkerModel) int {
+	switch {
+	case m.Available:
+		return 3
+	case m.Downloading:
+		return 2
+	case m.SizeBytes > 0 || m.DownloadError != "":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// FailOrphans marca como failed los jobs que quedaron sin quien los ejecute:
+// nada queda "running" para siempre. Lo usa el reconciler.
+//
+// Dos casos, ambos por heartbeat vencido (75 s):
+//   - running: el worker murió a mitad de la generación.
+//   - queued: ninguna GPU del tenant puede tomarlo — la máquina a la que está
+//     fijado se desconectó antes del claim (o se revocó: la FK lo deja sin
+//     dueño y no queda ninguna GPU viva). La gracia de 2 minutos evita fallar
+//     un job que está por reclamarse (claim long-poll 25 s + heartbeat 20 s).
 func (s *Store) FailOrphans(ctx context.Context) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE worker_jobs SET status = 'failed',
@@ -584,7 +629,26 @@ func (s *Store) FailOrphans(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	total, _ := res.RowsAffected()
+
+	// Queued sin ejecutor posible: el mensaje nombra la causa real (la GPU que
+	// tenía el modelo no llegó a tomarlo), no un genérico "worker offline".
+	res, err = s.db.ExecContext(ctx, `
+		UPDATE worker_jobs SET status = 'failed',
+		       error_message = 'the GPU that has this model went offline before taking the job',
+		       updated_at = NOW()
+		WHERE status = 'queued'
+		  AND updated_at < NOW() - INTERVAL '2 minutes'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM worker_registry w
+		      WHERE w.tenant_id = worker_jobs.tenant_id
+		        AND w.last_heartbeat > NOW() - INTERVAL '75 seconds'
+		        AND (worker_jobs.worker_id IS NULL OR w.id = worker_jobs.worker_id))`)
+	if err != nil {
+		return total, err
+	}
+	n, _ := res.RowsAffected()
+	return total + n, nil
 }
 
 // ─── Scan helpers ──────────────────────────────────────────────
@@ -628,12 +692,20 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 
 func scanJob(row rowScanner) (*Job, error) {
 	j := &Job{}
-	err := row.Scan(&j.ID, &j.TenantID, &j.TaskID, &j.WorkerID, &j.Payload,
+	// payload::text vuelve como string del driver: database/sql no sabe
+	// escanearlo en *json.RawMessage ("unsupported Scan"), así que se convierte
+	// a mano. Este detalle rompía TODOS los claims: el worker recibía un error
+	// de scan en vez de un trabajo.
+	var payloadJSON *string
+	err := row.Scan(&j.ID, &j.TenantID, &j.TaskID, &j.WorkerID, &payloadJSON,
 		&j.Status, &j.Progress, &j.StreamStatus, &j.ErrorMessage,
 		&j.ArtifactName, &j.ArtifactURL, &j.CancelRequested,
 		&j.CreatedAt, &j.UpdatedAt)
 	if err != nil {
 		return nil, err
+	}
+	if payloadJSON != nil {
+		j.Payload = json.RawMessage(*payloadJSON)
 	}
 	return j, nil
 }

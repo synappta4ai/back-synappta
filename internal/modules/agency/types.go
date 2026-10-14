@@ -11,6 +11,8 @@ package agency
 import (
 	"fmt"
 	"strings"
+
+	"synapta/internal/modules/model"
 )
 
 // ─── Unified payload types ──────────────────────────────────────
@@ -122,7 +124,12 @@ type VideoMetadata struct {
 
 // GeneratorRequest is the unified request payload for the generator pipeline.
 type GeneratorRequest struct {
-	Model         string
+	Model string
+	// Modality is the resolved catalog modality of Model (image | video | …).
+	// El generator de modelos descargados la usa para despachar el modo
+	// correcto al worker: sin ella una imagen de una GPU emparejada viajaba
+	// como video.
+	Modality      model.Modality
 	Content       []ContentItem
 	Ratio         string
 	Duration      int

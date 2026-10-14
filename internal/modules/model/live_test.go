@@ -408,6 +408,141 @@ func TestListFilterByModalityDownloaded(t *testing.T) {
 	}
 }
 
+// bridgeCatalog: lo que reporta una GPU emparejada (con la identidad que
+// agrega SnapshotsForTenant, que es a quien se le pide la descarga).
+func bridgeCatalog() []workerbridge.WorkerModel {
+	return []workerbridge.WorkerModel{
+		{Key: "SDXL-Turbo", Label: "SDXL Turbo", Mode: "image", Engine: "diffusers",
+			Pipeline: "sdxl", Repo: "stabilityai/sdxl-turbo", Steps: 1, Family: "sdxl",
+			Available: true, SizeBytes: 6_900_000_000,
+			WorkerID: "w-gpu", WorkerName: "PC-Casa", WorkerVersion: "0.2.5"},
+		{Key: "Wan2.1-T2V-1.3B", Label: "Wan 2.1", Mode: "video", Engine: "diffusers",
+			Pipeline: "wan", Repo: "Wan-AI/x", Steps: 30, VRAMGb: 6, Family: "wan",
+			Available: true, WorkerID: "w-gpu", WorkerName: "PC-Casa"},
+		{Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
+			Pipeline: "flux", Family: "flux", Available: false, WorkerID: "w-gpu", WorkerName: "PC-Casa"},
+	}
+}
+
+// Las GPUs emparejadas son una fuente de modelos "downloaded" más: en modo
+// bridge (worker central caído o inexistente) el listado de generación debe
+// mostrar lo que las máquinas del tenant pueden correr, y nada más.
+func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
+
+	c, w := testCtx(t, "/api/v1/models?type=downloaded")
+	withTenant(c, 7)
+	m.List(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	if len(env.Data) != 2 || env.Data[0].Name != "SDXL-Turbo" || env.Data[1].Name != "Wan2.1-T2V-1.3B" {
+		t.Fatalf("bridge listing = %+v", env.Data)
+	}
+	for _, got := range env.Data {
+		if got.Type != TypeDownloaded || got.Downloaded == nil || !got.Downloaded.Available {
+			t.Fatalf("entry is not runnable: %+v", got)
+		}
+		if got.WorkerID != "w-gpu" || got.WorkerName != "PC-Casa" {
+			t.Fatalf("entry lost its GPU origin: %+v", got)
+		}
+	}
+}
+
+// El listado público no ofrece elegir un modelo cuyos pesos no están en la
+// GPU: /worker/models sí lo muestra (ahí se descarga).
+func TestListTypeDownloadedHidesBridgeModelWithoutWeights(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
+
+	c, w := testCtx(t, "/api/v1/models?type=downloaded")
+	withTenant(c, 7)
+	m.List(c)
+	if body := w.Body.String(); strings.Contains(body, "FLUX.1-dev") {
+		t.Fatalf("model without weights leaked into the generation catalog: %s", body)
+	}
+}
+
+// Con el worker central vivo y la GPU reportando el mismo modelo, la entrada
+// no se duplica: gana la del worker (tiene telemetría de pesos y es el camino
+// que despacha hoy).
+func TestListMergedDedupesModelsOfBothPaths(t *testing.T) {
+	m, _ := setup(t)
+	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{
+		{Key: "SD-1.5", Mode: "image", Family: "sd", Available: true,
+			WorkerID: "w-gpu", WorkerName: "PC-Casa"},
+		{Key: "SDXL-Turbo", Mode: "image", Family: "sdxl", Available: true,
+			WorkerID: "w-gpu", WorkerName: "PC-Casa"},
+	}})
+
+	c, w := testCtx(t, "/api/v1/models?type=downloaded")
+	withTenant(c, 7)
+	m.List(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	// Central: SD-1.5 (downloading), Wan, Chatterbox. Bridge aporta SDXL-Turbo.
+	if len(env.Data) != 4 {
+		t.Fatalf("merged listing = %+v", env.Data)
+	}
+	sd := workerModelByName(t, env.Data, "SD-1.5")
+	if sd.WorkerID != "" || sd.Downloaded == nil || !sd.Downloaded.Downloading {
+		t.Fatalf("central entry was shadowed by the GPU snapshot: %+v", sd)
+	}
+}
+
+// Filtro por modalidad en la vista fusionada: el modelo de la GPU responde al
+// modality que las listas de generación piden.
+func TestListByModalityIncludesBridgeModel(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
+
+	c, w := testCtx(t, "/api/v1/models/image")
+	c.Params = gin.Params{{Key: "modality", Value: "image"}}
+	withTenant(c, 7)
+	m.ListByModality(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	// El catálogo API (con las credenciales del tenant) sigue en la lista; lo
+	// que importa es que el modelo de la GPU aparezca entre las opciones de
+	// esa modalidad, resuelto como downloaded y disponible.
+	found := false
+	for _, got := range env.Data {
+		if got.Modality != ModalityImage {
+			t.Fatalf("non-image entry in the image listing: %+v", got)
+		}
+		if got.Name == "SDXL-Turbo" {
+			found = got.Type == TypeDownloaded && got.Downloaded != nil && got.Downloaded.Available
+		}
+	}
+	if !found {
+		t.Fatalf("bridge image model missing from the image listing: %+v", env.Data)
+	}
+}
+
+// Sin ninguna fuente viva, type=downloaded sigue respondiendo 500 (no un
+// listado vacío silencioso): el caller pidió explícitamente esa fuente.
+func TestListTypeDownloaded500WithoutAnySource(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{})
+
+	c, w := testCtx(t, "/api/v1/models?type=downloaded")
+	withTenant(c, 7)
+	m.List(c)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestListInvalidType(t *testing.T) {
 	m, _ := setup(t)
 
