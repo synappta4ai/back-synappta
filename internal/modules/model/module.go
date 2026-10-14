@@ -174,6 +174,11 @@ func (m *Module) WorkerStatus(c *gin.Context) {
 // When the central worker is unreachable, tenants with online bridge GPUs
 // get those snapshots instead (read-only: no weight state) rather than a
 // 500 — the GPUs already reported everything this view needs to list.
+// WorkerSourceHeader tells UIs which backend served the management view:
+// "central" (weight state included, operations allowed) or "bridge"
+// (read-only snapshots, operations must stay hidden). It is CORS-exposed.
+const WorkerSourceHeader = "X-Worker-Source"
+
 func (m *Module) WorkerModels(c *gin.Context) {
 	models, err := ListLive(c.Request.Context(), workerAddr())
 	if err != nil {
@@ -181,6 +186,7 @@ func (m *Module) WorkerModels(c *gin.Context) {
 			if bridge, berr := BridgeModelsForTenant(c.Request.Context(), t.ID); berr == nil && len(bridge) > 0 {
 				log.Printf("[model] worker/models from bridge snapshots (tenant %d, central down: %v)",
 					t.ID, err)
+				c.Header(WorkerSourceHeader, "bridge")
 				utils.Success(c, bridge)
 				return
 			}
@@ -188,6 +194,7 @@ func (m *Module) WorkerModels(c *gin.Context) {
 		utils.InternalError(c, workerMessage(err))
 		return
 	}
+	c.Header(WorkerSourceHeader, "central")
 	if models == nil {
 		models = []Model{}
 	}

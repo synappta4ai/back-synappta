@@ -203,6 +203,9 @@ func TestWorkerModelsFallsBackToBridge(t *testing.T) {
 		t.Fatalf("status=%d body=%s", code, w.Body.String())
 	}
 	// Same deterministic order as ListLive: modality (image < video), then name.
+	if w.Header().Get("X-Worker-Source") != "bridge" {
+		t.Fatalf("expected X-Worker-Source: bridge, got %q", w.Header().Get("X-Worker-Source"))
+	}
 	if len(env.Data) != 2 || env.Data[0].Name != "SD-1.5" || env.Data[1].Name != "Wan2.1-T2V-1.3B" {
 		t.Fatalf("expected bridge snapshots sorted, got %+v", env.Data)
 	}
@@ -238,6 +241,9 @@ func TestWorkerModelsPrefersCentral(t *testing.T) {
 	env, code := decode(t, w)
 	if code != http.StatusOK || !env.Success {
 		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	if w.Header().Get("X-Worker-Source") != "central" {
+		t.Fatalf("expected X-Worker-Source: central, got %q", w.Header().Get("X-Worker-Source"))
 	}
 	// Central-only entry (Broken weights) proves central won over bridge.
 	found := false

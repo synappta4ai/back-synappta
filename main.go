@@ -148,7 +148,7 @@ func main() {
 		AllowOrigins:     origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Tenant-Slug", "X-Request-ID"},
-		ExposeHeaders:    []string{"X-Request-ID"},
+		ExposeHeaders:    []string{"X-Request-ID", "X-Worker-Source"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}
