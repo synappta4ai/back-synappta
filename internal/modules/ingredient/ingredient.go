@@ -348,10 +348,14 @@ type Service struct {
 	store    *Store
 	baseURL  string
 	enricher FileEnricher
+	// tenantSlug names the tenant in public serve URLs
+	// (/api/v1/t/:slug/files/:id/serve): <img> tags cannot send JWTs, so
+	// file URLs handed to browsers must be public (same as file.Service).
+	tenantSlug string
 }
 
-func NewService(store *Store, baseURL string) *Service {
-	return &Service{store: store, baseURL: baseURL}
+func NewService(store *Store, baseURL, tenantSlug string) *Service {
+	return &Service{store: store, baseURL: baseURL, tenantSlug: tenantSlug}
 }
 
 // SetFileEnricher attaches the asset-sync enrichment callback (wired in main).
@@ -359,8 +363,8 @@ func (s *Service) SetFileEnricher(fn FileEnricher) { s.enricher = fn }
 
 func (s *Service) enrichFileURLs(files []IngredientFile) {
 	for i := range files {
-		files[i].URL = s.baseURL + "/api/v1/files/" + files[i].FileID + "/serve"
-		files[i].ThumbnailURL = s.baseURL + "/api/v1/files/" + files[i].FileID + "/thumbnail"
+		files[i].URL = s.baseURL + "/api/v1/t/" + s.tenantSlug + "/files/" + files[i].FileID + "/serve"
+		files[i].ThumbnailURL = s.baseURL + "/api/v1/t/" + s.tenantSlug + "/files/" + files[i].FileID + "/thumbnail"
 	}
 	if s.enricher != nil {
 		s.enricher(files)

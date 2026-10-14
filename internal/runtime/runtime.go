@@ -271,7 +271,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug)
 	credStore := credential.NewStore(pool, m.cfg.EncryptionKey)
 	eventSvc := event.NewService(event.NewStore(pool))
-	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL)
+	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL, t.Slug)
 	assignmentSvc := assignment.NewService(assignment.NewStore(pool))
 	presetSvc := preset.NewService(preset.NewStore(pool))
 	skillSvc := skill.NewService(skill.NewStore(pool))
