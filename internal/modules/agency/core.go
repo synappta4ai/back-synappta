@@ -480,6 +480,18 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		userName = fmt.Sprintf("u%d", req.UserID)
 	}
 	terminal := result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED
+	// Keep the submit outputs on the record so terminal-at-submit (sync)
+	// generators answer polls from storage instead of re-hitting the
+	// provider (whose GetStatus may be a no-op with empty outputs).
+	storedResult := &StatusResult{
+		Status: result.Status,
+		Raw:    result.Raw,
+	}
+	if len(outputs) > 0 {
+		storedResult.VideoURL = outputs[0].URL
+		storedResult.LocalURL = outputs[0].LocalURL
+		storedResult.ImageURL = outputs[0].URL
+	}
 	s.mu.Lock()
 	s.tasks[result.TaskID] = &TaskRecord{
 		TaskID: result.TaskID,
@@ -495,10 +507,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		UserID:       req.UserID,
 		PushNotified: terminal,
 		ResourceType: req.ResourceType,
-		Result: &StatusResult{
-			Status: result.Status,
-			Raw:    result.Raw,
-		},
+		Result:       storedResult,
 	}
 	s.mu.Unlock()
 

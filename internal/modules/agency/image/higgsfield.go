@@ -135,8 +135,11 @@ func (g *HiggsfieldImageGenerator) GetStatus(taskID, apiKey, baseURL, endpoint s
 	if status == config.STATUS_SUCCESS {
 		outputs := collectImageOutputs(result)
 		if len(outputs) == 0 {
+			// A completed job without a usable image URL is a failure, not
+			// a success: failed is terminal everywhere (pollers, refunds,
+			// logs) while a custom status would poll forever with no output.
 			return &agency.GeneratorResult{
-				TaskID: taskID, Model: "higgsfield", Status: "succeeded_no_url",
+				TaskID: taskID, Model: "higgsfield", Status: config.STATUS_FAILED,
 				Outputs: []agency.OutputResource{}, Raw: result,
 				Error: "Job completed but no image URL was found in the response.",
 			}, nil
