@@ -2,15 +2,18 @@ package agencyvideo
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 
 	"synapta/internal/modules/agency"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/worker"
 
 	inferencev1 "synapta/internal/worker/proto"
@@ -152,6 +155,69 @@ func TestDownloadedCancelTask(t *testing.T) {
 	res, _ := g.Generate(genRequest("Wan2.1-T2V-1.3B"))
 	if err := g.CancelTask(res.TaskID, "", "", ""); err != nil {
 		t.Fatalf("CancelTask: %v", err)
+	}
+}
+
+// fakeBridgeQueue implements BridgeQueue for the bridge-mode paths: only the
+// online check and the snapshots matter for Validate.
+type fakeBridgeQueue struct {
+	online bool
+	models []workerbridge.WorkerModel
+}
+
+func (f fakeBridgeQueue) Enqueue(context.Context, int64, string, json.RawMessage) error {
+	return nil
+}
+
+func (f fakeBridgeQueue) JobByTaskID(context.Context, int64, string) (*workerbridge.Job, error) {
+	return nil, nil
+}
+
+func (f fakeBridgeQueue) RequestCancel(context.Context, int64, string) error { return nil }
+
+func (f fakeBridgeQueue) HasOnlineWorker(context.Context, int64) (bool, error) {
+	return f.online, nil
+}
+
+func (f fakeBridgeQueue) SnapshotsForTenant(context.Context, int64) ([]workerbridge.WorkerModel, error) {
+	return f.models, nil
+}
+
+func bridgeGenerator(t *testing.T, q fakeBridgeQueue) *DownloadedGenerator {
+	t.Helper()
+	g := NewDownloadedGenerator(worker.NewClient(), "", t.TempDir())
+	g.SetBridge(q, 1)
+	return g
+}
+
+// Un modelo declarado por la GPU pero sin pesos no debe encolarse: el job
+// fallaría dentro del worker; el aviso correcto es descargarlo antes.
+func TestDownloadedValidateBridgeRejectsModelWithoutWeights(t *testing.T) {
+	g := bridgeGenerator(t, fakeBridgeQueue{online: true, models: []workerbridge.WorkerModel{
+		{Key: "Wan2.1-T2V-1.3B", Available: false, SizeBytes: 1_200},
+	}})
+	err := g.Validate(genRequest("Wan2.1-T2V-1.3B"))
+	if err == nil || !strings.Contains(err.Error(), "no bajó") {
+		t.Fatalf("expected missing-weights error, got %v", err)
+	}
+}
+
+func TestDownloadedValidateBridgeAcceptsDownloadedModel(t *testing.T) {
+	g := bridgeGenerator(t, fakeBridgeQueue{online: true, models: []workerbridge.WorkerModel{
+		{Key: "Wan2.1-T2V-1.3B", Available: true, SizeBytes: 28_935_661_355},
+	}})
+	if err := g.Validate(genRequest("Wan2.1-T2V-1.3B")); err != nil {
+		t.Fatalf("expected valid request, got %v", err)
+	}
+}
+
+func TestDownloadedValidateBridgeRejectsModelNotInSnapshot(t *testing.T) {
+	g := bridgeGenerator(t, fakeBridgeQueue{online: true, models: []workerbridge.WorkerModel{
+		{Key: "SD-1.5", Available: true},
+	}})
+	err := g.Validate(genRequest("Wan2.1-T2V-1.3B"))
+	if err == nil || !strings.Contains(err.Error(), "no tiene el modelo") {
+		t.Fatalf("expected unknown-model error, got %v", err)
 	}
 }
 

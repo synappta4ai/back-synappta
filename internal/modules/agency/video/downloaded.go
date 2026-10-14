@@ -132,9 +132,17 @@ func (g *DownloadedGenerator) Validate(req *agency.GeneratorRequest) error {
 			return fmt.Errorf("worker registry unavailable: %w", err)
 		}
 		for _, s := range snapshots {
-			if strings.EqualFold(s.Key, req.Model) {
+			if !strings.EqualFold(s.Key, req.Model) {
+				continue
+			}
+			if s.Available {
 				return nil
 			}
+			// El catálogo de la GPU declara el modelo pero no tiene los pesos:
+			// encolar el job lo haría fallar tarde; se avisa ahora y con la
+			// acción concreta (descargarlo desde el panel).
+			return fmt.Errorf("la GPU conectada no bajó %q todavía: "+
+				"descargalo en Tu GPU → Modelos del worker", req.Model)
 		}
 		return fmt.Errorf("la GPU conectada no tiene el modelo %q", req.Model)
 	}
