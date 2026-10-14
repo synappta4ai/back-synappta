@@ -307,6 +307,87 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	return ids, rows.Err()
 }
 
+// ─── Descargas de modelos (panel → worker) ─────────────────────
+
+// RequestDownload encola la descarga de un modelo para el worker: el admin
+// la pide y el agente la recoge en el próximo heartbeat. Idempotente por
+// clave (re-pedir no duplica) y siempre con scope de tenant.
+func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" || len(key) > 128 {
+		return fmt.Errorf("invalid model key %q", key)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_downloads = (
+			SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb)
+			FROM (
+				SELECT jsonb_array_elements_text(requested_downloads) AS v
+				UNION SELECT $3
+			) s
+		), updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`,
+		workerID, tenantID, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
+// PendingDownloads lista las descargas pedidas aún no confirmadas.
+func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string, error) {
+	var raw string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(requested_downloads, '[]'::jsonb)::text FROM worker_registry WHERE id = $1`,
+		workerID).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	out := []string{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return []string{}, nil // columna corrupta: no bloquear el heartbeat
+	}
+	return out, nil
+}
+
+// AckDownloads saca de la cola las descargas que el worker ya tomó.
+func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string) error {
+	clean := []string{}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		clean = append(clean, k)
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	args := make([]interface{}, 0, len(clean)+1)
+	args = append(args, workerID)
+	holders := make([]string, 0, len(clean))
+	for i, k := range clean {
+		holders = append(holders, fmt.Sprintf("$%d", i+2))
+		args = append(args, k)
+	}
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE worker_registry
+		SET requested_downloads = (
+			SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
+			FROM jsonb_array_elements_text(requested_downloads) AS v
+			WHERE v NOT IN (%s)
+		), updated_at = NOW()
+		WHERE id = $1`, strings.Join(holders, ",")), args...)
+	return err
+}
+
 // ─── Cola de jobs ──────────────────────────────────────────────
 
 // Enqueue agrega un trabajo a la cola del tenant. task_id es el id del

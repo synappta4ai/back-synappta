@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,9 @@ type BridgeStore interface {
 	ListWorkers(ctx context.Context, tenantID int64) ([]Worker, error)
 	CreatePairingCode(ctx context.Context, tenantID, createdBy int64) (string, time.Time, error)
 	DeleteWorker(ctx context.Context, tenantID int64, workerID string) error
+	RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error
+	PendingDownloads(ctx context.Context, workerID string) ([]string, error)
+	AckDownloads(ctx context.Context, workerID string, keys []string) error
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, models json.RawMessage) (*Worker, string, error)
@@ -62,6 +66,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		admin.GET("/workers", m.AdminListWorkers)
 		admin.POST("/pairing-code", m.AdminPairingCode)
 		admin.DELETE("/workers/:id", m.AdminRevokeWorker)
+		admin.POST("/workers/:id/models/:key/download", m.AdminRequestDownload)
 	}
 
 	w := rg.Group("/internal/workers")
@@ -240,11 +245,13 @@ type heartbeatRequest struct {
 	VRAMFreeMB int             `json:"vram_free_mb"`
 	JobsActive int             `json:"jobs_active"`
 	Models     json.RawMessage `json:"models"`
+	// Descargas que el agente ya tomó: el back las saca de la cola.
+	CompletedDownloads []string `json:"completed_downloads"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
 // + cancelaciones pendientes (viajan en la respuesta para que el agente
-// local aborte su generación en curso).
+// local aborte su generación en curso) + descargas pedidas desde el panel.
 func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	w := workerFrom(c)
 	var req heartbeatRequest
@@ -258,7 +265,46 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	if cancelIDs == nil {
 		cancelIDs = []string{}
 	}
-	utils.Success(c, gin.H{"cancel_task_ids": cancelIDs})
+	if len(req.CompletedDownloads) > 0 {
+		if aerr := m.store.AckDownloads(c.Request.Context(), w.ID, req.CompletedDownloads); aerr != nil {
+			log.Printf("[workerbridge] ack downloads %s: %v", shortID(w.ID), aerr)
+		}
+	}
+	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
+	if perr != nil {
+		log.Printf("[workerbridge] pending downloads %s: %v", shortID(w.ID), perr)
+		pending = []string{}
+	}
+	utils.Success(c, gin.H{"cancel_task_ids": cancelIDs, "requested_models": pending})
+}
+
+// AdminRequestDownload handles POST /api/v1/gpu/workers/:id/models/:key/download —
+// el admin encola la descarga de un modelo en esa GPU; el agente la recoge
+// en el próximo heartbeat y reporta el progreso en su snapshot.
+func (m *Module) AdminRequestDownload(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" || len(key) > 128 {
+		utils.BadRequest(c, "invalid model key")
+		return
+	}
+	if err := m.store.RequestDownload(c.Request.Context(), t.ID, id, key); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Created(c, gin.H{"worker_id": id, "model_key": key})
 }
 
 // WorkerClaim handles POST /api/v1/internal/workers/claim — long-poll de la

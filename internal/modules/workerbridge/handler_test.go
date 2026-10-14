@@ -31,6 +31,7 @@ type fakeStore struct {
 	claimErr  error
 	claims    int
 	heartbeats []string // task ids devueltos como cancelación
+	requested  map[string][]string // workerID → descargas pedidas
 }
 
 type codeRow struct {
@@ -128,6 +129,55 @@ func (f *fakeStore) Heartbeat(_ context.Context, workerID string,
 	_ string, _ string, _, _ int, _ json.RawMessage,
 ) ([]string, error) {
 	return f.heartbeats, nil
+}
+
+func (f *fakeStore) RequestDownload(_ context.Context, tenantID int64, workerID, key string) error {
+	found := false
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrWorkerAuth
+	}
+	if f.requested == nil {
+		f.requested = map[string][]string{}
+	}
+	for _, k := range f.requested[workerID] {
+		if k == key {
+			return nil // idempotente
+		}
+	}
+	f.requested[workerID] = append(f.requested[workerID], key)
+	return nil
+}
+
+func (f *fakeStore) PendingDownloads(_ context.Context, workerID string) ([]string, error) {
+	out := append([]string{}, f.requested[workerID]...)
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AckDownloads(_ context.Context, workerID string, keys []string) error {
+	keep := []string{}
+	drop := map[string]bool{}
+	for _, k := range keys {
+		drop[k] = true
+	}
+	for _, k := range f.requested[workerID] {
+		if !drop[k] {
+			keep = append(keep, k)
+		}
+	}
+	if f.requested == nil {
+		f.requested = map[string][]string{}
+	}
+	f.requested[workerID] = keep
+	return nil
 }
 
 func (f *fakeStore) Claim(_ context.Context, workerID string, tenantID int64) (*Job, error) {
@@ -450,6 +500,49 @@ func TestRevokeWorkerKillsToken(t *testing.T) {
 	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token, gin.H{})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked token must be 401, got %d", w.Code)
+	}
+}
+
+// ─── Descargas pedidas desde el panel ──────────────────────────
+
+func TestAdminRequestDownloadQueuesAndDelivers(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.1", 8000, 7000, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Admin encola la descarga (idempotente: dos pedidos, una entrada).
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/models/Wan2.1-T2V-1.3B/download"
+	for i := 0; i < 2; i++ {
+		w := doJSON(t, r, http.MethodPost, path, "", nil)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("request download = %d body=%s", w.Code, w.Body.String())
+		}
+	}
+	if len(f.requested[wkr.ID]) != 1 {
+		t.Fatalf("expected 1 queued download, got %v", f.requested[wkr.ID])
+	}
+
+	// Worker de otro tenant no se ve.
+	if w := doJSON(t, r, http.MethodPost,
+		"/api/v1/gpu/workers/00000000-0000-0000-0000-000000000000/models/X/download",
+		"", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("foreign worker = %d, want 404", w.Code)
+	}
+
+	// El heartbeat la entrega y confirma el ack en el siguiente.
+	w := doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_downloads": []string{}})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Wan2.1-T2V-1.3B") {
+		t.Fatalf("heartbeat should deliver requested_models: %s", w.Body.String())
+	}
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_downloads": []string{"Wan2.1-T2V-1.3B"}})
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "Wan2.1-T2V-1.3B") {
+		t.Fatalf("ack must clear the queue: %s", w.Body.String())
 	}
 }
 
