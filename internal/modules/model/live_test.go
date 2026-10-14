@@ -214,6 +214,48 @@ func TestWorkerModelsFallsBackToBridge(t *testing.T) {
 	}
 }
 
+// La vista bridge le da al panel lo que necesita para descargar: a qué GPU
+// pedirle el modelo y el estado real de pesos (el agente lo leyó de su gRPC
+// local). Sin esto el panel mostraba todo "Disponible" y sin botón.
+func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
+		Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
+		Pipeline: "flux", Family: "flux", VRAMGb: 24,
+		Available: false, Downloading: true, DownloadPercent: 17.5,
+		SizeBytes: 9_014_119_167, DownloadError: "net down",
+		WorkerID: "w-1", WorkerName: "PC-Casa", WorkerVersion: "0.2.5",
+	}}})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success || len(env.Data) != 1 {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	got := env.Data[0]
+	if got.WorkerID != "w-1" || got.WorkerName != "PC-Casa" || got.WorkerVersion != "0.2.5" {
+		t.Fatalf("worker identity lost: %+v", got)
+	}
+	d := got.Downloaded
+	if d == nil || d.Available || !d.Downloading || d.DownloadPercent != 17.5 ||
+		d.SizeBytes != 9_014_119_167 || d.DownloadError != "net down" {
+		t.Fatalf("weight telemetry lost: %+v", d)
+	}
+	// Los nombres JSON que consume el panel (rutas de descarga por GPU).
+	body := w.Body.String()
+	for _, want := range []string{
+		`"worker_id":"w-1"`, `"worker_name":"PC-Casa"`,
+		`"downloading":true`, `"size_bytes":9014119167`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %s in %s", want, body)
+		}
+	}
+}
+
 func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
 	m := NewModule(allUsableResolver())
 	killCentral(t)

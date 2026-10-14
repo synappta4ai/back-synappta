@@ -501,6 +501,12 @@ func (s *Store) HasOnlineWorker(ctx context.Context, tenantID int64) (bool, erro
 }
 
 // WorkerModel es un modelo reportado por un worker (snapshot de su catálogo).
+//
+// El estado de pesos (available/downloading/download_percent/size_bytes) lo
+// lee el agente de su gRPC local: viaja tal cual para que el panel sepa qué
+// está realmente en disco y qué falta descargar. WorkerID/Name/Version no
+// vienen en el JSON del agente: los agrega SnapshotsForTenant con la fila del
+// registry que reportó el modelo, que es a quien se le pide la descarga.
 type WorkerModel struct {
 	Key       string `json:"key"`
 	Label     string `json:"label"`
@@ -513,14 +519,28 @@ type WorkerModel struct {
 	Family    string `json:"family"`
 	Available bool   `json:"available"`
 	Notes     string `json:"notes"`
+	// Downloading: hay una descarga de pesos en curso para esta clave.
+	Downloading bool `json:"downloading,omitempty"`
+	// DownloadPercent: 0-100 del progreso de esa descarga.
+	DownloadPercent float32 `json:"download_percent,omitempty"`
+	// SizeBytes: tamaño de los pesos en disco (parcial mientras baja).
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+	// DownloadError: último fallo de descarga, si hubo.
+	DownloadError string `json:"download_error,omitempty"`
+	// Identidad de la GPU que reportó el modelo (la completa el store).
+	WorkerID      string `json:"worker_id,omitempty"`
+	WorkerName    string `json:"worker_name,omitempty"`
+	WorkerVersion string `json:"worker_version,omitempty"`
 }
 
 // SnapshotsForTenant mergea los catálogos de las GPUs online del tenant.
 // Es la fuente del catálogo "downloaded" en modo bridge: sin workers vivos,
-// la lista sale vacía (nunca se inventan modelos sin GPU).
+// la lista sale vacía (nunca se inventan modelos sin GPU). Cada modelo sale
+// con la identidad de la GPU que lo reportó (la primera online gana), que es
+// la máquina a la que se le pide la descarga cuando falta y no está ahí.
 func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]WorkerModel, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT models::text FROM worker_registry
+		SELECT id::text, name, version, models::text FROM worker_registry
 		WHERE tenant_id = $1 AND last_heartbeat > NOW() - INTERVAL '75 seconds'
 		ORDER BY created_at`, tenantID)
 	if err != nil {
@@ -530,8 +550,8 @@ func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]Worke
 	seen := map[string]bool{}
 	out := []WorkerModel{}
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var id, name, version, raw string
+		if err := rows.Scan(&id, &name, &version, &raw); err != nil {
 			return nil, err
 		}
 		var models []WorkerModel
@@ -543,6 +563,7 @@ func (s *Store) SnapshotsForTenant(ctx context.Context, tenantID int64) ([]Worke
 				continue
 			}
 			seen[strings.ToLower(m.Key)] = true
+			m.WorkerID, m.WorkerName, m.WorkerVersion = id, name, version
 			out = append(out, m)
 		}
 	}

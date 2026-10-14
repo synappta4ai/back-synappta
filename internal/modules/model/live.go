@@ -65,8 +65,9 @@ func workerClientOrNil() *worker.Client {
 
 // BridgeSnapshots lists online bridge workers' model snapshots for a tenant.
 // *workerbridge.Store implements it; tests use a fake. Snapshots carry the
-// catalog (key/label/mode/engine/…), never weight state: availability comes
-// from the report, download progress and on-disk size are unknown.
+// catalog (key/label/mode/engine/…), the weight state the agent read from its
+// local gRPC, and the identity of the GPU that reported it: the panel needs
+// both to show honest availability and to route a download to that machine.
 type BridgeSnapshots interface {
 	SnapshotsForTenant(ctx context.Context, tenantID int64) ([]workerbridge.WorkerModel, error)
 }
@@ -86,9 +87,12 @@ func bridgeSourceOrNil() BridgeSnapshots {
 }
 
 // BridgeModelsForTenant maps online bridge snapshots into management entries
-// (same shape as ListLive, without weight state). It returns nil without an
-// error when there is simply nothing to show: no source wired, no online
-// workers, or an empty merged catalog.
+// (same shape as ListLive) plus the identity of the GPU that reported each
+// one. Availability and download telemetry come from the snapshot as-is: the
+// agent reads them from its local gRPC, and guessing them here (the old
+// "available ⇒ 100%" shortcut) painted weights that were not on disk as
+// ready. It returns nil without an error when there is simply nothing to
+// show: no source wired, no online workers, or an empty merged catalog.
 func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error) {
 	src := bridgeSourceOrNil()
 	if src == nil {
@@ -100,15 +104,14 @@ func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error)
 	}
 	out := make([]Model, 0, len(snaps))
 	for _, m := range snaps {
-		pct := float32(0)
-		if m.Available {
-			pct = 100
-		}
 		out = append(out, Model{
-			Name:        m.Key,
-			DisplayName: m.Label,
-			Modality:    workerModeToModality(m.Mode),
-			Type:        TypeDownloaded,
+			Name:          m.Key,
+			DisplayName:   m.Label,
+			Modality:      workerModeToModality(m.Mode),
+			Type:          TypeDownloaded,
+			WorkerID:      m.WorkerID,
+			WorkerName:    m.WorkerName,
+			WorkerVersion: m.WorkerVersion,
 			Downloaded: &DownloadedModel{
 				Mode:            m.Mode,
 				Engine:          m.Engine,
@@ -118,9 +121,10 @@ func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error)
 				VRAMGb:          int32(m.VRAMGb),
 				Family:          m.Family,
 				Available:       m.Available,
-				Downloading:     false,
-				DownloadPercent: pct,
-				SizeBytes:       0,
+				Downloading:     m.Downloading,
+				DownloadPercent: m.DownloadPercent,
+				SizeBytes:       m.SizeBytes,
+				DownloadError:   m.DownloadError,
 				Notes:           m.Notes,
 			},
 		})

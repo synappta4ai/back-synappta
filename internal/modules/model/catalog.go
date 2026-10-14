@@ -83,6 +83,16 @@ type Model struct {
 	DisplayName string `json:"display_name"`
 	// Defaults the UI can offer (ratios, resolutions, durations).
 	Defaults Defaults `json:"defaults"`
+	// WorkerID identifies the paired GPU that reported this entry when the
+	// catalog comes from bridge snapshots. Empty for central/live entries:
+	// there the worker is the back's own, addressed by BM_WORKER_ADDR.
+	WorkerID string `json:"worker_id,omitempty"`
+	// WorkerName is that GPU's display name, so the UI can say where a
+	// download will run.
+	WorkerName string `json:"worker_name,omitempty"`
+	// WorkerVersion is the bridge agent version behind the snapshot: the UI
+	// can spot a stale agent still reporting an old catalog.
+	WorkerVersion string `json:"worker_version,omitempty"`
 }
 
 // DownloadedModel describes a model whose weights run on the brain-master
