@@ -32,6 +32,7 @@ import (
 	"synapta/internal/modules/agent"
 	"synapta/internal/modules/assignment"
 	"synapta/internal/modules/auth"
+	"synapta/internal/modules/consent"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
@@ -162,6 +163,7 @@ func main() {
 	// ─── Modules ──────────────────────────────────────────────
 	registry := modules.NewRegistry()
 	registry.Register(auth.NewModule(auth.NewHandler(authSvc)))
+	registry.Register(consent.NewModule(consent.NewHandler(consent.NewService(consent.NewStore(sysDB)))))
 	tenantUsersHdl := tenant.NewTenantUsersHandler(sysDB)
 	tenant.SetTenantUsersHandler(tenantUsersHdl)
 	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner, reg, cfg.EncryptionKey))))
