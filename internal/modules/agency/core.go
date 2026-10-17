@@ -714,8 +714,9 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		Outputs: []OutputResource{},
 	}
 
-	// Prefer the server-owned copy of the video over the expiring signed
-	// provider URL so playback survives provider URL expiry.
+	// Prefer the server-owned copy of the output over the expiring signed
+	// provider URL so playback/render survives provider URL expiry. Label the
+	// resource by its real kind (image vs video) instead of assuming video.
 	localURL := sr.LocalURL
 	providerURL := sr.VideoURL
 	if localURL == "" {
@@ -725,7 +726,7 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		resp.Outputs = append(resp.Outputs, OutputResource{
 			URL:      s.absoluteOutputURL(localURL),
 			LocalURL: localURL,
-			Type:     "video",
+			Type:     mediaKindForURL(localURL),
 		})
 	}
 	if sr.ImageURL != "" && sr.ImageURL != sr.VideoURL && sr.ImageURL != localURL {
