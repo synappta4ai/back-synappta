@@ -300,8 +300,12 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
-	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	// Image Higgsfield FIRST: its Match is narrow (soul/ideogram/recraft) while
+	// the video one claims any "higgsfield-*", so registering video first would
+	// shadow the image models (Soul 2 et al.) and route them to the video
+	// generator.
 	core.RegisterGenerator(agencyimage.NewHiggsfieldImageGenerator())
+	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API
