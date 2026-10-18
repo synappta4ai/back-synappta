@@ -1,0 +1,28 @@
+// Faro receiver: Listen for OTLP (OpenTelemetry Protocol) data from the frontend
+otelcol.receiver.otlp "faro" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  output {
+    logs = [loki.write.local_loki.receiver]
+    metrics = [prometheus.remote_write.local_prometheus.receiver]
+  }
+}
+
+// Loki: Send logs to the Loki service
+loki.write "local_loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+// Prometheus: Send metrics to the Prometheus service
+prometheus.remote_write "local_prometheus" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
