@@ -1,22 +1,21 @@
-// 1. Recibir datos OTLP (Faro)
-otelcol.receiver.otlp "faro" {
+// 1. Receptor de Logs OTLP (Faro) directo a Loki
+loki.source.otlp "faro_logs" {
   http {
     endpoint = "0.0.0.0:4318"
   }
   grpc {
     endpoint = "0.0.0.0:4317"
   }
-
-  output {
-    metrics = [prometheus.remote_write.local_prometheus.receiver]
-    logs    = [otelcol.processor.logs.faro_to_loki.input]
-  }
+  forward_to = [loki.write.local_loki.receiver]
 }
 
-// 2. Convertir Logs de OTLP a formato de Loki
-otelcol.processor.logs "faro_to_loki" {
+// 2. Receptor de Métricas OTLP (Faro)
+otelcol.receiver.otlp "faro_metrics" {
+  http {
+    endpoint = "0.0.0.0:4319" // Cambiado a 4319 para evitar conflicto con el receptor de logs
+  }
   output {
-    logs = [loki.write.local_loki.receiver]
+    metrics = [prometheus.remote_write.local_prometheus.receiver]
   }
 }
 
