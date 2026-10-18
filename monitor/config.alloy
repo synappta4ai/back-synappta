@@ -8,29 +8,31 @@ otelcol.receiver.otlp "faro" {
   }
 
   output {
-    metrics = [prometheus.remote_write.local_prometheus.receiver]
+    metrics = [otelcol.exporter.prometheus.faro_metrics.input]
+    logs    = [otelcol.exporter.loki.faro_logs.input]
   }
 }
 
-// 2. Convertir métricas OTLP a Prometheus Remote Write
+// 2. Puente para Métricas: OTLP -> Prometheus
+otelcol.exporter.prometheus "faro_metrics" {
+  forward_to = [prometheus.remote_write.local_prometheus.receiver]
+}
+
+// 3. Puente para Logs: OTLP -> Loki
+otelcol.exporter.loki "faro_logs" {
+  forward_to = [loki.write.local_loki.receiver]
+}
+
+// 4. Destino Final: Prometheus
 prometheus.remote_write "local_prometheus" {
   endpoint {
     url = "http://prometheus:9090/api/v1/write"
   }
 }
 
-// 3. Para los LOGS: 
-// Dado que otelcol.receiver.otlp no puede enviar directamente a loki.write,
-// utilizaremos la integración de Alloy que permite recibir logs de Faro 
-// y enviarlos a Loki mediante un pipeline de logs simple.
-
+// 5. Destino Final: Loki
 loki.write "local_loki" {
   endpoint {
     url = "http://loki:3100/loki/api/v1/push"
   }
 }
-
-// Nota: Alloy requiere que los logs de OTLP pasen por un pipeline de logs.
-// Para evitar errores de capsule, configuramos el receptor de Faro 
-// solo para métricas y dejamos que los logs fluyan por el canal estándar si está disponible,
-// o simplificamos la configuración para evitar el crash.
