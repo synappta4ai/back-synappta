@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"synapta/config"
 	"synapta/internal/db"
