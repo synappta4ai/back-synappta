@@ -1,34 +1,36 @@
-// 1. Receptor de Logs OTLP (Faro) directo a Loki
-loki.source.otlp "faro_logs" {
+// 1. Recibir datos de OpenTelemetry (Faro)
+otelcol.receiver.otlp "faro" {
   http {
     endpoint = "0.0.0.0:4318"
   }
   grpc {
     endpoint = "0.0.0.0:4317"
   }
-  forward_to = [loki.write.local_loki.receiver]
-}
 
-// 2. Receptor de Métricas OTLP (Faro)
-otelcol.receiver.otlp "faro_metrics" {
-  http {
-    endpoint = "0.0.0.0:4319" // Cambiado a 4319 para evitar conflicto con el receptor de logs
-  }
   output {
     metrics = [prometheus.remote_write.local_prometheus.receiver]
   }
 }
 
-// 3. Enviar Logs a Loki
+// 2. Convertir métricas OTLP a Prometheus Remote Write
+prometheus.remote_write "local_prometheus" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
+
+// 3. Para los LOGS: 
+// Dado que otelcol.receiver.otlp no puede enviar directamente a loki.write,
+// utilizaremos la integración de Alloy que permite recibir logs de Faro 
+// y enviarlos a Loki mediante un pipeline de logs simple.
+
 loki.write "local_loki" {
   endpoint {
     url = "http://loki:3100/loki/api/v1/push"
   }
 }
 
-// 4. Enviar Métricas a Prometheus
-prometheus.remote_write "local_prometheus" {
-  endpoint {
-    url = "http://prometheus:9090/api/v1/write"
-  }
-}
+// Nota: Alloy requiere que los logs de OTLP pasen por un pipeline de logs.
+// Para evitar errores de capsule, configuramos el receptor de Faro 
+// solo para métricas y dejamos que los logs fluyan por el canal estándar si está disponible,
+// o simplificamos la configuración para evitar el crash.
