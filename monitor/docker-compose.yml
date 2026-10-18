@@ -24,7 +24,7 @@ services:
 
   # Faro Collector: Recibe eventos del frontend y los manda a Loki
   faro-collector:
-    image: grafana/faro-collector:latest
+    image: grafana/alloy:latest
     container_name: synapta-faro-collector
     ports:
       - "4318:4318"
