@@ -55,6 +55,16 @@ func main() {
 	// Load .env (development convenience; production uses real env vars).
 	_ = godotenv.Load()
 
+	// Initialize GlitchTip (Sentry)
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:              \"https://d0fd0b5c743d417fa2b3ed553b4d56f@glitchtip.synappta.cloud/2\",
+		TracesSampleRate: 0.01,
+	})
+	if err != nil {
+		log.Fatalf(\"[main] sentry.Init: %s\", err)
+	}
+	defer sentry.Flush(2 * time.Second)
+
 	cfg := config.Load()
 
 	if cfg.IsProduction() {
