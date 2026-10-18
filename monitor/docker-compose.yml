@@ -33,15 +33,17 @@ services:
       - monitoring
 
   # Faro Collector: Recibe eventos del frontend y los manda a Loki
-  faro-collector:
-    image: grafana/alloy:latest
-    container_name: synapta-faro-collector
-    ports:
-      - "4318:4318"
-    environment:
-      - LOKI_URL=http://loki:3100/loki/api/v1/push
-    networks:
-      - monitoring
+  # REMOVED: Moved to independent deployment for Dokploy domain mapping
+  # faro-collector:
+  #   image: grafana/alloy:latest
+  #   container_name: synapta-faro-collector
+  #   ports:
+  #     - "4318:4318"
+  #   environment:
+  #     - LOKI_URL=http://loki:3100/loki/api/v1/push
+  #   networks:
+  #     - monitoring
+
 
   # Grafana: El panel de visualización
   grafana:

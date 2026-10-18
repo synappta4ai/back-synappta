@@ -1,0 +1,14 @@
+services:
+  faro-collector:
+    image: grafana/alloy:latest
+    container_name: synapta-faro-collector
+    ports:
+      - "4318:4318"
+    environment:
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    external: true
