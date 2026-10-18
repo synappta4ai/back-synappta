@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Prometheus: Recolecta métricas del backend
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: synapta-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - monitoring
+
+  # Loki: Almacena logs del backend y eventos de Faro (frontend)
+  loki:
+    image: grafana/loki:latest
+    container_name: synapta-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
+
+  # Faro Collector: Recibe eventos del frontend y los manda a Loki
+  faro-collector:
+    image: grafana/faro-collector:latest
+    container_name: synapta-faro-collector
+    ports:
+      - "4318:4318"
+    environment:
+      - LOKI_URL=http://loki:3100/loki/api/v1/push
+    networks:
+      - monitoring
+
+  # Grafana: El panel de visualización
+  grafana:
+    image: grafana/grafana:latest
+    container_name: synapta-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+      - loki
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  grafana-storage:

@@ -139,6 +139,7 @@ func main() {
 	}
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery(), requestID())
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// CORS (explicit origins; fail-fast config guarantees non-empty in prod).
 	origins := strings.Split(getEnvDefault("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:3000"), ",")
