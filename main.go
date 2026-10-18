@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -56,14 +57,19 @@ func main() {
 	_ = godotenv.Load()
 
 	// Initialize GlitchTip (Sentry)
-	err := sentry.Init(sentry.ClientOptions{
-		Dsn:              \"https://d0fd0b5c743d417fa2b3ed553b4d56f@glitchtip.synappta.cloud/2\",
-		TracesSampleRate: 0.01,
-	})
-	if err != nil {
-		log.Fatalf(\"[main] sentry.Init: %s\", err)
+	glitchtipDSN := getEnvDefault("GLITCHTIP_DSN", getEnvDefault("SENTRY_DSN", ""))
+	if glitchtipDSN != "" && glitchtipDSN != "off" && glitchtipDSN != "false" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn:              glitchtipDSN,
+			TracesSampleRate: 0.01,
+			Environment:      getEnvDefault("APP_ENV", "development"),
+		})
+		if err != nil {
+			log.Printf("[main] sentry.Init warning: %v", err)
+		} else {
+			defer sentry.Flush(2 * time.Second)
+		}
 	}
-	defer sentry.Flush(2 * time.Second)
 
 	cfg := config.Load()
 
@@ -153,7 +159,7 @@ func main() {
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// CORS (explicit origins; fail-fast config guarantees non-empty in prod).
-	origins := strings.Split(getEnvDefault("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:3000"), ",")
+	origins := strings.Split(getEnvDefault("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:4200"), ",")
 	for i := range origins {
 		origins[i] = strings.TrimSpace(origins[i])
 	}
@@ -320,7 +326,9 @@ func main() {
 	}
 	reg.CloseAll()
 	log.Println("[main] bye")
-} // requestID middleware tags each request with an X-Request-ID.
+}
+
+// requestID middleware tags each request with an X-Request-ID.
 func requestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
