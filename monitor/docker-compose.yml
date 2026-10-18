@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Prometheus: Recolecta métricas del backend
   prometheus:
@@ -7,8 +5,20 @@ services:
     container_name: synapta-prometheus
     ports:
       - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "global:
+          scrape_interval: 15s
+
+        scrape_configs:
+          - job_name: 'synapta-backend'
+            static_configs:
+              - targets: ['host.docker.internal:8099']" > /etc/prometheus/prometheus.yml
+        /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
     networks:
       - monitoring
 
