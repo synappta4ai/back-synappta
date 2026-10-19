@@ -67,13 +67,24 @@ func main() {
 		if err != nil {
 			log.Printf("[main] sentry.Init warning: %v", err)
 		} else {
+			log.Printf("[main] GlitchTip (Sentry) initialized successfully")
 			defer sentry.Flush(2 * time.Second)
+
+			// Enviar evento de prueba inicial y hacer flush inmediato para verificar en GlitchTip
+			eventID := sentry.CaptureMessage("Synapta backend started (GlitchTip integration test)")
+			sentry.Flush(2 * time.Second)
+			log.Printf("[main] GlitchTip test event sent, event_id: %v", eventID)
 		}
 	}
 
 	cfg := config.Load()
 
-	if cfg.IsProduction() {
+	// Mode for Gin:
+	// 1. Respeta la variable de entorno GIN_MODE (ej. GIN_MODE=release en .env)
+	// 2. Si no está definida, pasa a ReleaseMode si está en producción
+	if ginMode := os.Getenv("GIN_MODE"); ginMode != "" {
+		gin.SetMode(ginMode)
+	} else if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
@@ -151,11 +162,20 @@ func main() {
 	model.SetBridgeSource(wbStore)
 
 	// ─── Router ───────────────────────────────────────────────
-	if cfg.IsProduction() {
-		gin.SetMode(gin.ReleaseMode)
-	}
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery(), requestID())
+	router.Use(gin.Logger(), requestID())
+	// GlitchTip / Sentry panic recovery
+	router.Use(func(c *gin.Context) {
+		defer func() {
+			if rvr := recover(); rvr != nil {
+				sentry.CurrentHub().Recover(rvr)
+				sentry.Flush(2 * time.Second)
+				panic(rvr) // delega a gin.Recovery para responder HTTP 500
+			}
+		}()
+		c.Next()
+	})
+	router.Use(gin.Recovery())
 	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// CORS (explicit origins; fail-fast config guarantees non-empty in prod).
@@ -277,6 +297,20 @@ func main() {
 	})
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"service": "synapta", "status": "ok"})
+	})
+
+	// ─── GlitchTip / Sentry test endpoints ────────────────────
+	router.GET("/debug/sentry-test", func(c *gin.Context) {
+		eventID := sentry.CaptureMessage("Prueba manual de GlitchTip desde /debug/sentry-test")
+		sentry.Flush(2 * time.Second)
+		c.JSON(http.StatusOK, gin.H{
+			"status":   "sent",
+			"event_id": eventID,
+			"message":  "Evento enviado a GlitchTip correctamente",
+		})
+	})
+	router.GET("/debug/sentry-panic", func(c *gin.Context) {
+		panic("Prueba de panic capturado por GlitchTip desde /debug/sentry-panic")
 	})
 
 	// ─── Generated outputs (own server URL) ───────────────────
