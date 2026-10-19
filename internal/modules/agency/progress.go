@@ -150,9 +150,11 @@ func (s *Core) trackVideoMetadata(taskID string, createdAt time.Time, resourceTy
 	}
 }
 
-// ensureLocalVideo downloads the provider's video output into the server's
-// outputs directory (once) so the front can fetch it from our own domain
-// instead of the expiring signed provider URL.
+// ensureLocalVideo downloads the provider output into the server's outputs
+// directory (once) so the front can fetch it from our own domain instead of
+// the expiring signed provider URL. The filename follows the resource kind
+// (video/image/audio) so async image models are not stored as bogus .mp4
+// files under outputs/video.
 func (s *Core) ensureLocalVideo(taskID string, result *GeneratorResult) {
 	if result == nil || len(result.Outputs) == 0 {
 		return
@@ -162,14 +164,64 @@ func (s *Core) ensureLocalVideo(taskID string, result *GeneratorResult) {
 		return
 	}
 	// Task-stable filename: re-polls of the same task reuse the same file.
-	localName := fmt.Sprintf("video_%s.mp4", taskID)
+	kind := mediaKindForOutput(out)
+	localName := fmt.Sprintf("%s_%s%s", kind, taskID, outputExtension(out.URL, kind))
 	localURL, err := utils.SaveURLOutput(out.URL, localName)
 	if err != nil {
 		log.Printf("[outputs] download failed for task %s: %v", taskID, err)
 		return
 	}
 	out.LocalURL = localURL
-	log.Printf("[outputs] video stored locally for task %s: %s", taskID, localURL)
+	log.Printf("[outputs] %s stored locally for task %s: %s", kind, taskID, localURL)
+}
+
+// mediaKindForOutput classifies an output as image/audio/video from its
+// declared type, falling back to the source URL's extension.
+func mediaKindForOutput(out *OutputResource) string {
+	switch out.Type {
+	case utils.MediaTypeImage, utils.MediaTypeAudio, utils.MediaTypeVideo:
+		return out.Type
+	}
+	return mediaKindForURL(out.URL)
+}
+
+// mediaKindForURL classifies a URL by extension; unknown defaults to video.
+func mediaKindForURL(rawURL string) string {
+	switch utils.DetectMediaType(stripURLQuery(rawURL)) {
+	case utils.MediaTypeImage:
+		return utils.MediaTypeImage
+	case utils.MediaTypeAudio:
+		return utils.MediaTypeAudio
+	default:
+		return utils.MediaTypeVideo
+	}
+}
+
+// outputExtension picks a stored file's extension: the source URL's own
+// extension when it looks like one, else the kind's default.
+func outputExtension(rawURL, kind string) string {
+	clean := stripURLQuery(rawURL)
+	if i := strings.LastIndex(clean, "."); i != -1 && len(clean)-i <= 5 {
+		if ext := strings.ToLower(clean[i:]); utils.DetectMediaType("x"+ext) != utils.MediaTypeOther {
+			return ext
+		}
+	}
+	switch kind {
+	case utils.MediaTypeImage:
+		return ".png"
+	case utils.MediaTypeAudio:
+		return ".mp3"
+	default:
+		return ".mp4"
+	}
+}
+
+// stripURLQuery drops the query/fragment so extension detection is stable.
+func stripURLQuery(rawURL string) string {
+	if i := strings.IndexAny(rawURL, "?#"); i != -1 {
+		return rawURL[:i]
+	}
+	return rawURL
 }
 
 // absoluteOutputURL converts a stored relative output path into an absolute,

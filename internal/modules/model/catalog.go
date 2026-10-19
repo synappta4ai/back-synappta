@@ -191,7 +191,9 @@ var catalog = []Model{
 		DisplayName: "Soul 2",
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
-			Resolutions: []string{"2K", "4K"},
+			// The standard tier only accepts 720p/1080p (the provider rejects
+			// 2K/4K here with "resolution: '2K' is not one of [...]").
+			Resolutions: []string{"720p", "1080p"},
 		},
 	},
 	{

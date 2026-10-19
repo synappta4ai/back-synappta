@@ -38,9 +38,12 @@ var HiggsfieldStatuses = map[string]string{
 }
 
 // Resolutions accepted per family (catalog defaults drive the UI; these
-// backstop the API validation with a clear error).
+// backstop the API validation with a clear error). Soul 2's standard tier
+// only accepts the video-style 720p/1080p; ideogram/recraft use the 1K/2K/4K
+// tiers.
 var higgsfieldImageResolutions = map[string]bool{
 	"1k": true, "1K": true, "2k": true, "2K": true, "4k": true, "4K": true,
+	"720p": true, "1080p": true,
 }
 
 // HiggsfieldImageGenerator runs async image generation through Higgsfield.
@@ -83,7 +86,7 @@ func (g *HiggsfieldImageGenerator) Validate(req *agency.GeneratorRequest) error 
 		errs.Add("duration", "not supported for image generation")
 	}
 	if req.Resolution != "" && !higgsfieldImageResolutions[req.Resolution] {
-		errs.Add("resolution", "must be one of: 1k, 2K, 4K")
+		errs.Add("resolution", "must be one of: 720p, 1080p, 1K, 2K, 4K")
 	}
 	if errs.HasErrors() {
 		return errs
