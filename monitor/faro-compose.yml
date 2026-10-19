@@ -1,0 +1,17 @@
+services:
+  # Faro Collector: Recibe eventos del frontend y los manda a Loki
+  faro-collector:
+    image: grafana/alloy:latest
+    container_name: synapta-faro-collector
+    ports:
+      - "4318:4318"
+      - "4317:4317"
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy
+    command: run --server.http.listen-addr=0.0.0.0:12345 /etc/alloy/config.alloy
+    networks:
+      - monitoring
+
+networks:
+  monitoring:
+    external: true

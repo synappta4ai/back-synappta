@@ -16,10 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"synapta/config"
 	"synapta/internal/db"
@@ -54,9 +56,36 @@ func main() {
 	// Load .env (development convenience; production uses real env vars).
 	_ = godotenv.Load()
 
+	// Initialize GlitchTip (Sentry)
+	glitchtipDSN := getEnvDefault("GLITCHTIP_DSN", getEnvDefault("SENTRY_DSN", ""))
+	if glitchtipDSN != "" && glitchtipDSN != "off" && glitchtipDSN != "false" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn:              glitchtipDSN,
+			Debug:            getEnvDefault("APP_ENV", "development") != "production",
+			TracesSampleRate: 1.0,
+			Environment:      getEnvDefault("APP_ENV", "development"),
+		})
+		if err != nil {
+			log.Printf("[main] sentry.Init warning: %v", err)
+		} else {
+			log.Printf("[main] GlitchTip (Sentry) initialized successfully")
+			defer sentry.Flush(2 * time.Second)
+
+			// Enviar evento de prueba inicial y hacer flush inmediato para verificar en GlitchTip
+			eventID := sentry.CaptureMessage("Synapta backend started (GlitchTip integration test)")
+			sentry.Flush(2 * time.Second)
+			log.Printf("[main] GlitchTip test event sent, event_id: %v", eventID)
+		}
+	}
+
 	cfg := config.Load()
 
-	if cfg.IsProduction() {
+	// Mode for Gin:
+	// 1. Respeta la variable de entorno GIN_MODE (ej. GIN_MODE=release en .env)
+	// 2. Si no está definida, pasa a ReleaseMode si está en producción
+	if ginMode := os.Getenv("GIN_MODE"); ginMode != "" {
+		gin.SetMode(ginMode)
+	} else if cfg.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
@@ -134,14 +163,24 @@ func main() {
 	model.SetBridgeSource(wbStore)
 
 	// ─── Router ───────────────────────────────────────────────
-	if cfg.IsProduction() {
-		gin.SetMode(gin.ReleaseMode)
-	}
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery(), requestID())
+	router.Use(gin.Logger(), requestID())
+	// GlitchTip / Sentry panic recovery
+	router.Use(func(c *gin.Context) {
+		defer func() {
+			if rvr := recover(); rvr != nil {
+				sentry.CurrentHub().Recover(rvr)
+				sentry.Flush(2 * time.Second)
+				panic(rvr) // delega a gin.Recovery para responder HTTP 500
+			}
+		}()
+		c.Next()
+	})
+	router.Use(gin.Recovery())
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// CORS (explicit origins; fail-fast config guarantees non-empty in prod).
-	origins := strings.Split(getEnvDefault("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:3000"), ",")
+	origins := strings.Split(getEnvDefault("CORS_ALLOW_ORIGINS", "http://localhost:5173,http://localhost:4200"), ",")
 	for i := range origins {
 		origins[i] = strings.TrimSpace(origins[i])
 	}
@@ -261,6 +300,30 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"service": "synapta", "status": "ok"})
 	})
 
+	// ─── GlitchTip / Sentry test endpoints ────────────────────
+	router.GET("/debug/sentry-test", func(c *gin.Context) {
+		hub := sentry.CurrentHub()
+		if hub == nil || hub.Client() == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"status":  "error",
+				"error":   "Sentry client no está inicializado (revisa GLITCHTIP_DSN)",
+				"dsn_set": glitchtipDSN != "",
+			})
+			return
+		}
+		eventID := sentry.CaptureMessage("Prueba manual de GlitchTip desde /debug/sentry-test")
+		flushed := sentry.Flush(2 * time.Second)
+		c.JSON(http.StatusOK, gin.H{
+			"status":   "sent",
+			"event_id": eventID,
+			"flushed":  flushed,
+			"message":  "Evento despachado a GlitchTip (si no aparece en el panel, verifica que el DSN sea válido en GlitchTip)",
+		})
+	})
+	router.GET("/debug/sentry-panic", func(c *gin.Context) {
+		panic("Prueba de panic capturado por GlitchTip desde /debug/sentry-panic")
+	})
+
 	// ─── Generated outputs (own server URL) ───────────────────
 	// Locally stored generation outputs are served here; the front plays them
 	// from our domain instead of the expiring signed provider URLs.
@@ -308,7 +371,9 @@ func main() {
 	}
 	reg.CloseAll()
 	log.Println("[main] bye")
-} // requestID middleware tags each request with an X-Request-ID.
+}
+
+// requestID middleware tags each request with an X-Request-ID.
 func requestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")

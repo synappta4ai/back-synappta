@@ -1,0 +1,69 @@
+services:
+  # Prometheus: Recolecta métricas del backend
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: synapta-prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "global:
+          scrape_interval: 15s
+
+        scrape_configs:
+          - job_name: 'synapta-backend'
+            static_configs:
+              - targets: ['back-dev.synappta.cloud:8099']" > /etc/prometheus/prometheus.yml
+        /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
+    networks:
+      - monitoring
+
+  # Loki: Almacena logs del backend y eventos de Faro (frontend)
+  loki:
+    image: grafana/loki:latest
+    container_name: synapta-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - monitoring
+
+  # Faro Collector: Recibe eventos del frontend y los manda a Loki
+  # REMOVED: Moved to independent deployment for Dokploy domain mapping
+  # faro-collector:
+  #   image: grafana/alloy:latest
+  #   container_name: synapta-faro-collector
+  #   ports:
+  #     - "4318:4318"
+  #   environment:
+  #     - LOKI_URL=http://loki:3100/loki/api/v1/push
+  #   networks:
+  #     - monitoring
+
+
+  # Grafana: El panel de visualización
+  grafana:
+    image: grafana/grafana:latest
+    container_name: synapta-grafana
+    ports:
+      - "3199:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+      - loki
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  grafana-storage:
