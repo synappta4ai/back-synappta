@@ -61,7 +61,8 @@ func main() {
 	if glitchtipDSN != "" && glitchtipDSN != "off" && glitchtipDSN != "false" {
 		err := sentry.Init(sentry.ClientOptions{
 			Dsn:              glitchtipDSN,
-			TracesSampleRate: 0.01,
+			Debug:            getEnvDefault("APP_ENV", "development") != "production",
+			TracesSampleRate: 1.0,
 			Environment:      getEnvDefault("APP_ENV", "development"),
 		})
 		if err != nil {
@@ -301,12 +302,22 @@ func main() {
 
 	// ─── GlitchTip / Sentry test endpoints ────────────────────
 	router.GET("/debug/sentry-test", func(c *gin.Context) {
+		hub := sentry.CurrentHub()
+		if hub == nil || hub.Client() == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"status":  "error",
+				"error":   "Sentry client no está inicializado (revisa GLITCHTIP_DSN)",
+				"dsn_set": glitchtipDSN != "",
+			})
+			return
+		}
 		eventID := sentry.CaptureMessage("Prueba manual de GlitchTip desde /debug/sentry-test")
-		sentry.Flush(2 * time.Second)
+		flushed := sentry.Flush(2 * time.Second)
 		c.JSON(http.StatusOK, gin.H{
 			"status":   "sent",
 			"event_id": eventID,
-			"message":  "Evento enviado a GlitchTip correctamente",
+			"flushed":  flushed,
+			"message":  "Evento despachado a GlitchTip (si no aparece en el panel, verifica que el DSN sea válido en GlitchTip)",
 		})
 	})
 	router.GET("/debug/sentry-panic", func(c *gin.Context) {
