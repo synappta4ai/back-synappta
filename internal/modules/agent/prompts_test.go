@@ -79,6 +79,18 @@ func TestSystemForEmbeddedDocs(t *testing.T) {
 		t.Error("inmobiliaria no debería tener MÓDULO DE ACTUACIÓN")
 	}
 
+	// El paso 1 comercial reutiliza las fotos ya subidas por su tag.
+	commercialStep1 := systemFor(workflowCommercial, 1)
+	for _, want := range []string{
+		"Usa primero lo ya subido",
+		"Solo pide lo que falta",
+		"\"tag\": \"@nombre\"",
+	} {
+		if !strings.Contains(commercialStep1, want) {
+			t.Errorf("comercial paso 1 sin %q", want)
+		}
+	}
+
 	// Cada paso de un agente es distinto.
 	s1, s2 := systemFor(workflowRealEstate, 1), systemFor(workflowRealEstate, 2)
 	if s1 == s2 {

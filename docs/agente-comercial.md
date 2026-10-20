@@ -94,7 +94,7 @@ Brief: "En la mesa, ella se agobia por el silencio. Él espera con paciencia."
   "contexto": "brief, guion del spot y texto extraído de archivos",
   "cantidad_prompts": 3,
   "registro": "comercial | cine",
-  "referencias_subidas": [{"archivo": "", "descripcion": "", "funcion": "personaje | producto | locacion | utileria | pose | estilo | sin_definir"}]
+  "referencias_subidas": [{"archivo": "", "tag": "@nombre", "descripcion": "", "funcion": "personaje | producto | locacion | utileria | pose | estilo | sin_definir"}]
 }
 ```
 
@@ -105,12 +105,16 @@ Brief: "En la mesa, ella se agobia por el silencio. Él espera con paciencia."
 4. Elige el modo de cámara que mejor encaje (ver "Modos" abajo) y el registro.
 5. Si la escena incluye diálogo, escríbelo en español neutro, corto y natural. Si el guion trae una línea larga, resúmela conservando la intención.
 6. Indica qué imágenes debería subir el usuario para que la escena funcione (personaje, producto, locación, utilería).
+7. **Usa primero lo ya subido.** `referencias_subidas` son archivos que el usuario ya cargó, cada uno con su `tag` (`@nombre`) y su `funcion`. Si la escena usa una de esas imágenes, escribe su `tag` tal cual en `locacion`, en el personaje correspondiente de `personajes` o en `producto_en_escena`. Si la `funcion` de una referencia viene `sin_definir` y la escena depende de ella, pregúntalo (regla 3); si viene definida, no preguntes qué archivo es.
+8. **Solo pide lo que falta.** No repitas en `fotos_sugeridas` un archivo que ya está en `referencias_subidas` (mismo `archivo` o `tag`). Cuando la escena necesite una foto que no está subida, describe en el campo visual (`locacion`, `personajes`, `producto_en_escena`) qué debe verse: el front lo muestra como "(aquí debe ir una foto: …)" para que el usuario la suba y la taguee.
 
 **Reglas del paso:**
 - Una escena = una idea principal, una acción dominante.
 - `resumen_para_usuario`: 2 frases en palabras simples, sin tecnicismos.
 - El eslogan y la locución no van en las acciones; van en `mensaje_marca`.
 - No repitas la misma escena con otras palabras.
+- `referencias_subidas` es la verdad de lo que ya se subió: úsala para no volver a pedir esos archivos y para escribir sus tags en la escena. Un tag inventado no adjunta ninguna imagen al video.
+- En los campos visuales (`locacion`, `personajes`, `producto_en_escena`) escribe el tag de una referencia subida (`@tienda`) o, si no hay archivo, la descripción de la imagen que falta.
 
 **SALIDA (JSON):**
 ```
@@ -145,7 +149,7 @@ Brief: "En la mesa, ella se agobia por el silencio. Él espera con paciencia."
     {
       "para_prompt": "P1",
       "tipo": "personaje | producto | locacion | utileria | pose",
-      "descripcion": "qué imagen subir, en palabras simples",
+      "descripcion": "qué imagen subir (solo si no está ya en referencias_subidas), en palabras simples",
       "motivo": "para qué sirve",
       "prioridad": "imprescindible | recomendada | opcional"
     }
