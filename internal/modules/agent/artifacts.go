@@ -34,6 +34,10 @@ var timeRangeRe = regexp.MustCompile(`(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)\
 // (regla: sin prometer rentabilidad ni plusvalía).
 var financialRe = regexp.MustCompile(`(?i)rentabilid|plusval|garantizad|ganancia asegurada|retorno garantizado`)
 
+// sceneTagRe detecta tags de referencia (`@tienda`) dentro de los campos
+// visuales de un prompt de escena comercial.
+var sceneTagRe = regexp.MustCompile(`(?i)@[a-z0-9][a-z0-9-]*`)
+
 // artifactSpec es el artefacto (kind + paso) que el front pide en un turno.
 type artifactSpec struct {
 	Kind string
@@ -154,7 +158,9 @@ func validateSalesAngles(data, payload map[string]any) []string {
 }
 
 // validateScenePrompts: cantidad exacta de prompts y beats no vacíos en
-// cada uno; en cine exige además la biblia de continuidad.
+// cada uno; en cine exige además la biblia de continuidad. En comercial
+// revisa que los tags `@archivo` de la escena existan en las referencias
+// que el usuario ya subió.
 func validateScenePrompts(data, payload map[string]any, cinema bool) []string {
 	warns := []string{}
 	prompts := objArr(data["prompts"])
@@ -173,6 +179,41 @@ func validateScenePrompts(data, payload map[string]any, cinema bool) []string {
 		biblia, _ := data["biblia_continuidad"].(map[string]any)
 		if len(objArr(biblia["personajes"])) == 0 {
 			warns = append(warns, "falta \"biblia_continuidad.personajes\" (referencia canónica de cada personaje)")
+		}
+	} else {
+		warns = append(warns, unknownSceneTags(prompts, payload)...)
+	}
+	return warns
+}
+
+// unknownSceneTags avisa cuando la escena referencia con `@tag` un archivo
+// que no está en `referencias_subidas` (el front lo inserta desde la foto y
+// un tag inventado no adjunta nada al video). Sin referencias no opina.
+func unknownSceneTags(prompts []map[string]any, payload map[string]any) []string {
+	known := map[string]bool{}
+	for _, ref := range objArr(payload["referencias_subidas"]) {
+		if tag := strings.ToLower(strings.TrimSpace(strField(ref, "tag"))); tag != "" {
+			known[tag] = true
+		}
+	}
+	if len(known) == 0 {
+		return nil
+	}
+	warns := []string{}
+	for i, p := range prompts {
+		text := strings.Join([]string{
+			strField(p, "locacion"),
+			strField(p, "producto_en_escena"),
+			strings.Join(strArr(p["personajes"]), " "),
+		}, " ")
+		seen := map[string]bool{}
+		for _, tag := range sceneTagRe.FindAllString(text, -1) {
+			key := strings.ToLower(tag)
+			if known[key] || seen[key] {
+				continue
+			}
+			seen[key] = true
+			warns = append(warns, fmt.Sprintf("prompt %d usa %s, que no está en \"referencias_subidas\"", i+1, tag))
 		}
 	}
 	return warns

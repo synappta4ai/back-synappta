@@ -339,6 +339,69 @@ func TestValidateStoryboard(t *testing.T) {
 	}
 }
 
+func TestValidateScenePromptTags(t *testing.T) {
+	t.Parallel()
+
+	payload := map[string]any{
+		"cantidad_prompts": float64(1),
+		"referencias_subidas": []any{
+			map[string]any{"archivo": "Tienda.jpg", "tag": "@tienda", "funcion": "locacion"},
+		},
+	}
+	okData := map[string]any{
+		"estado": "ok",
+		"prompts": []any{
+			map[string]any{
+				"titulo":   "La calle a las 7",
+				"locacion": "@tienda",
+				"beats":    []any{map[string]any{"accion_fisica": "abre la puerta"}},
+			},
+		},
+	}
+	spec := artifactSpec{Kind: artifactScenePrompts, Step: 1}
+	if warns := validateArtifact(spec, okData, payload); len(warns) != 0 {
+		t.Errorf("caso ok con advertencias: %v", warns)
+	}
+
+	// Un tag inventado no adjunta ninguna imagen al video.
+	invented := withMap(okData, "prompts", []any{
+		map[string]any{
+			"locacion": "@abuelo",
+			"beats":    []any{map[string]any{"accion_fisica": "saluda"}},
+		},
+	})
+	if warns := validateArtifact(spec, invented, payload); !containsSubstr(warns, "@abuelo") {
+		t.Errorf("advertencias %v sin @abuelo", warns)
+	}
+
+	// Sin referencias subidas no opina sobre los tags.
+	noRefs := validateArtifact(spec, invented, map[string]any{"cantidad_prompts": float64(1)})
+	if len(noRefs) != 0 {
+		t.Errorf("sin referencias no debería advertir: %v", noRefs)
+	}
+
+	if warns := validateArtifact(spec, map[string]any{"estado": "ok"}, payload); !containsSubstr(warns, "prompts") {
+		t.Errorf("advertencias %v sin \"prompts\"", warns)
+	}
+	wrongCount := withMap(okData, "prompts", []any{
+		map[string]any{"beats": []any{map[string]any{"accion_fisica": "x"}}},
+		map[string]any{"beats": []any{map[string]any{"accion_fisica": "y"}}},
+	})
+	if warns := validateArtifact(spec, wrongCount, payload); !containsSubstr(warns, "pediste 1") {
+		t.Errorf("advertencias %v sin conteo", warns)
+	}
+	noBeats := withMap(okData, "prompts", []any{map[string]any{"locacion": "@tienda"}})
+	if warns := validateArtifact(spec, noBeats, payload); !containsSubstr(warns, "beats") {
+		t.Errorf("advertencias %v sin beats", warns)
+	}
+
+	// Cine exige además la biblia de continuidad.
+	cinema := artifactSpec{Kind: artifactSceneAnalysis, Step: 1}
+	if warns := validateArtifact(cinema, okData, payload); !containsSubstr(warns, "biblia_continuidad") {
+		t.Errorf("advertencias %v sin biblia", warns)
+	}
+}
+
 func TestValidateClipPrompt(t *testing.T) {
 	t.Parallel()
 
