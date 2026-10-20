@@ -1,10 +1,12 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"synapta/internal/secretbox"
 	"synapta/internal/storage"
@@ -138,8 +141,8 @@ func (s *Service) StorageConfigRead() (*StorageConfig, error) {
 	}, nil
 }
 
-// SaveStorageConfig validates the bucket (including a live HEAD against it),
-// seals the credentials and persists the row.
+// SaveStorageConfig validates the bucket (writes, reads back and deletes a
+// throwaway object), seals the credentials and persists the row.
 func (s *Service) SaveStorageConfig(req StorageConfigRequest) (*StorageConfig, error) {
 	norm, err := normalizeStorageRequest(req)
 	if err != nil {
@@ -392,32 +395,90 @@ func isPrivateIP(ip net.IP) bool {
 // bucketProbe is a variable so tests can skip the network round-trip.
 var bucketProbe = probeBucket
 
-// probeBucket checks the credentials and the bucket with a signed HEAD before
-// persisting them: a bucket that does not answer would silently break uploads.
+// probePayload is what the probe writes and reads back; its size is tiny on
+// purpose because it travels on every config save.
+var probePayload = []byte("synapta storage probe")
+
+// probeBucket verifies the bucket end to end before persisting the config: it
+// signs a PUT of a throwaway key, reads the object back and deletes it.
+//
+// Reading the bytes back is what catches an endpoint that answers 2xx to
+// everything without storing anything — la consola web de MinIO devuelve su
+// SPA con 200 en cualquier path, así que un HEAD al bucket pasaba la
+// verificación y después cada archivo se perdía en silencio.
 func probeBucket(p *storage.Presigner) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, p.HeadBucketURL(time.Now()), nil)
+	key := ".probe/" + uuid.NewString() + ".txt"
+	defer probeCleanup(p, key)
+
+	if err := probePut(ctx, p, key); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.PresignGet(key, time.Now()), nil)
+	if err != nil {
+		return fmt.Errorf("no se pudo firmar la lectura de prueba: %w", err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("no se pudo leer el objeto de prueba: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("el bucket no devolvió el objeto de prueba (status %d)", res.StatusCode)
+	}
+	got, err := io.ReadAll(io.LimitReader(res.Body, int64(len(probePayload))+1))
+	if err != nil {
+		return fmt.Errorf("no se pudo leer el objeto de prueba: %w", err)
+	}
+	if !bytes.Equal(got, probePayload) {
+		return errors.New("el endpoint no devolvió lo que se acaba de subir: no parece una API S3 (¿el endpoint apunta a la consola web?)")
+	}
+	return nil
+}
+
+// probePut writes the probe object, translating S3's status codes into the
+// messages the admin console shows.
+func probePut(ctx context.Context, p *storage.Presigner, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, p.PresignPut(key, "text/plain", time.Now()), bytes.NewReader(probePayload))
 	if err != nil {
 		return fmt.Errorf("no se pudo firmar la verificación del bucket: %w", err)
 	}
+	req.Header.Set("Content-Type", "text/plain")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("no se pudo conectar con el bucket: %w", err)
 	}
 	defer res.Body.Close()
 
-	switch res.StatusCode {
-	case http.StatusOK:
-		return nil
-	case http.StatusNotFound:
-		return fmt.Errorf("el bucket no existe o no es visible con esas credenciales (404)")
-	case http.StatusForbidden:
-		return fmt.Errorf("el bucket rechazó las credenciales (403)")
-	default:
-		return fmt.Errorf("el bucket respondió %d al verificar el acceso", res.StatusCode)
+	switch {
+	case res.StatusCode == http.StatusForbidden:
+		return errors.New("el bucket rechazó las credenciales (403)")
+	case res.StatusCode == http.StatusNotFound:
+		return errors.New("el bucket no existe o no es visible con esas credenciales (404)")
+	case res.StatusCode/100 != 2:
+		msg, _ := io.ReadAll(io.LimitReader(res.Body, 200))
+		return fmt.Errorf("el bucket respondió %d al escribir la prueba: %s", res.StatusCode, strings.TrimSpace(string(msg)))
 	}
+	return nil
+}
+
+// probeCleanup deletes the probe object. Best effort: a leftover 20-byte
+// object under .probe/ is harmless, an error here would hide the real one.
+func probeCleanup(p *storage.Presigner, key string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.PresignDelete(key, time.Now()), nil)
+	if err != nil {
+		return
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	res.Body.Close()
 }
 
 // maskSecret keeps 4 leading and 4 trailing characters for display.

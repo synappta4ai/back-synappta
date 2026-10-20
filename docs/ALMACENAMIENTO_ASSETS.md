@@ -315,10 +315,19 @@ curl -X PUT http://localhost:8099/api/v1/files/storage \
   }'
 ```
 
-Antes de guardar, el back hace un `HEAD` firmado contra el bucket: si las
-credenciales o el bucket no existen, la configuración no se persiste. Las
-credenciales quedan cifradas con AES-256-GCM (`ENCRYPTION_KEY`) y la API las
-devuelve enmascaradas.
+Antes de guardar, el back verifica el bucket de punta a punta: firma un `PUT`
+de `.probe/<uuid>.txt`, vuelve a leer esos bytes y borra el objeto. Si las
+credenciales o el bucket no existen, o si el endpoint no devuelve lo que se
+acaba de escribir, la configuración no se persiste.
+
+> El `endpoint` tiene que ser la **API S3/MinIO** (p. ej. `https://bucket.host`),
+> no la consola web (`https://console.host`): la consola contesta `200` con su
+> SPA a cualquier path, así que un `HEAD` "pasaba" y después cada archivo se
+> perdía en silencio. Por la misma razón `s3Backend.Put` exige el `ETag` que
+> S3 siempre devuelve al guardar.
+
+Las credenciales quedan cifradas con AES-256-GCM (`ENCRYPTION_KEY`) y la API
+las devuelve enmascaradas.
 
 Validaciones del payload: `bucket` en minúsculas con el formato
 `[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]` (3–63 caracteres, sin `_` ni mayúsculas),

@@ -72,9 +72,13 @@ never depends on one.
   read = any member, secrets masked). Credentials are AES-256-GCM sealed with
   `ENCRYPTION_KEY` via `internal/secretbox`; the logic lives in
   `internal/modules/file/storage_config.go`.
-- Saving validates the payload **and** the bucket: `bucketProbe` does a signed
-  HEAD that must answer 200, so a broken endpoint/credential is never
-  persisted. `enabled=false` keeps the row but reverts the tenant to local.
+- Saving validates the payload **and** the bucket end to end: `bucketProbe`
+  signs a PUT of a throwaway key (`.probe/<uuid>.txt`), reads the bytes back
+  and deletes it, so a broken endpoint/credential is never persisted. A plain
+  HEAD to the bucket is not enough: the MinIO **console** (`console.<host>`)
+  answers 200 with its SPA to every path and would silently swallow uploads.
+  That is also why `s3Backend.Put` requires the `ETag` header S3 always
+  returns. `enabled=false` keeps the row but reverts the tenant to local.
 - `POST /api/v1/files/presign` signs a PUT with the tenant's bucket and
   returns 503 when there is none — the front then uses `POST /files/upload`
   (local disk). Keys: `<tenant>/<category>/<YYYY>/<MM>/<uuid><ext>`, only

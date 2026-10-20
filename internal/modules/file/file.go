@@ -1138,6 +1138,11 @@ func serveOrRedirect(c *gin.Context, path, redirect string, err error) {
 			utils.NotFound(c, err.Error())
 		case err.Error() == "file has been deleted":
 			utils.Gone(c, err.Error())
+		// La fila existe pero el objeto no: pasa cuando el bucket cambió de
+		// endpoint o alguien borró los bytes a mano. Un 404 dice eso mejor que
+		// un 500 (y la miniatura se regenera sola cuando el objeto vuelve).
+		case errors.Is(err, ErrBlobNotFound):
+			utils.NotFound(c, "file bytes not found in storage")
 		case errors.Is(err, ErrStorageConfig), errors.Is(err, ErrStorageDisabled):
 			utils.Error(c, http.StatusServiceUnavailable, err.Error())
 		default:

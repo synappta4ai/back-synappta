@@ -129,6 +129,13 @@ func (b *s3Backend) Put(ctx context.Context, subpath string, data []byte, conten
 		msg, _ := io.ReadAll(io.LimitReader(res.Body, 512))
 		return fmt.Errorf("put %s: status %d (%s)", subpath, res.StatusCode, msg)
 	}
+	// Todo PUT exitoso de S3/MinIO devuelve ETag. Un endpoint que contesta 2xx
+	// sin ETag no guardó el objeto (la consola web de MinIO responde 200 con su
+	// SPA a cualquier path): fallar acá evita perder el archivo en silencio y
+	// que la fila quede apuntando a un objeto inexistente.
+	if res.Header.Get("ETag") == "" {
+		return fmt.Errorf("put %s: el endpoint respondió %d sin ETag (no parece una API S3)", subpath, res.StatusCode)
+	}
 	return nil
 }
 

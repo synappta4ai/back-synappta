@@ -73,6 +73,8 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.objects[key] = fakeObject{data: data, contentType: r.Header.Get("Content-Type")}
 		f.mu.Unlock()
+		// S3/MinIO devuelven ETag en cada PUT exitoso; el backend lo exige.
+		w.Header().Set("ETag", "\""+strconv.Itoa(len(data))+"\"")
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet:
 		f.mu.Lock()
