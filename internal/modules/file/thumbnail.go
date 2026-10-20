@@ -6,6 +6,11 @@ import (
 	"strings"
 
 	"github.com/disintegration/imaging"
+
+	// Registra el decodificador WebP en image.Decode: imaging no lo trae y sin
+	// esto la miniatura de un .webp fallaba (el front quedaba con el ícono
+	// roto y el API respondía 500 al pedirla).
+	_ "golang.org/x/image/webp"
 )
 
 // makeThumbnail renders a 300x300 thumbnail from the uploaded bytes and

@@ -568,6 +568,20 @@ func (s *Service) bucketReaderFor(files []File) *storage.Presigner {
 	return nil
 }
 
+// normalizedMime repairs rows stored as application/octet-stream by older
+// binaries (mime.TypeByExtension has no .mp4 entry on a system without a MIME
+// database): without it the library renders a generated video as a generic
+// file and never asks for its thumbnail. The stored value is left alone.
+func normalizedMime(f *File) string {
+	if f.MimeType != "" && f.MimeType != "application/octet-stream" {
+		return f.MimeType
+	}
+	if ct := mimeForExt("." + strings.ToLower(f.Format)); ct != "" {
+		return ct
+	}
+	return f.MimeType
+}
+
 // readURL is where a client should fetch f from. With a public bucket base the
 // URL points straight at the bucket (zero API traffic per view); otherwise it
 // stays on the tenant-scoped API URL, which streams from disk or redirects to
@@ -617,7 +631,13 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		return nil, fmt.Errorf("file has no extension")
 	}
 
-	mimeType := mime.TypeByExtension(ext)
+	// Tabla propia primero: mime.TypeByExtension no conoce .mp4/.webm/.m4a sin
+	// una base MIME en el sistema y los guardaba como octet-stream (el front
+	// los mostraba como archivo genérico en vez de video).
+	mimeType := mimeForExt(ext)
+	if mimeType == "" {
+		mimeType = mime.TypeByExtension(ext)
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -945,6 +965,7 @@ func (s *Service) DecorateOne(f *File) *File {
 	if f.Backend == "s3" {
 		reader = s.bucketReader()
 	}
+	f.MimeType = normalizedMime(f)
 	f.URL = s.readURL(f, reader, false)
 	if strings.HasPrefix(f.MimeType, "image/") {
 		f.ThumbnailURL = s.readURL(f, reader, true)
@@ -956,6 +977,7 @@ func (s *Service) DecorateOne(f *File) *File {
 func (s *Service) decorate(files []File) []File {
 	reader := s.bucketReaderFor(files)
 	for i := range files {
+		files[i].MimeType = normalizedMime(&files[i])
 		files[i].URL = s.readURL(&files[i], reader, false)
 		if strings.HasPrefix(files[i].MimeType, "image/") {
 			files[i].ThumbnailURL = s.readURL(&files[i], reader, true)
