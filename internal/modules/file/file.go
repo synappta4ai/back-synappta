@@ -4,9 +4,11 @@ package file
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/gif"
@@ -14,6 +16,7 @@ import (
 	"image/png"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,19 +29,23 @@ import (
 	"golang.org/x/image/webp"
 
 	"synapta/internal/middleware"
+	"synapta/internal/storage"
 	"synapta/internal/utils"
 )
 
 // File is one stored file row (tenant schema).
 type File struct {
-	ID        string     `json:"id"`
-	Filename  string     `json:"filename"`
-	Path      string     `json:"path"`
-	Size      int64      `json:"size"`
-	MimeType  string     `json:"mime_type"`
-	Category  string     `json:"category"`
-	Format    string     `json:"format"`
-	Storage   string     `json:"storage"`
+	ID       string `json:"id"`
+	Filename string `json:"filename"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	MimeType string `json:"mime_type"`
+	Category string `json:"category"`
+	Format   string `json:"format"`
+	Storage  string `json:"storage"`
+	// Backend is where the bytes live: "local" (UPLOAD_DIR) or "s3" (the
+	// tenant bucket). Persisted so files keep resolving after config changes.
+	Backend   string     `json:"backend,omitempty"`
 	Duration  float64    `json:"duration"`
 	SHA256    string     `json:"sha256"`
 	Trashed   bool       `json:"trashed"`
@@ -221,13 +228,13 @@ func (s *Store) ValidateImage(data []byte) error {
 
 // ─── DB operations ────────────────────────────────────────────
 
-const fileCols = `id, filename, path, size, mime_type, category, format, storage, duration, sha256, trashed, created_at, updated_at, deleted_at`
+const fileCols = `id, filename, path, size, mime_type, category, format, storage, backend, duration, sha256, trashed, created_at, updated_at, deleted_at`
 
 func scanFile(f *File, scanner interface {
 	Scan(dest ...interface{}) error
 }) error {
 	return scanner.Scan(&f.ID, &f.Filename, &f.Path, &f.Size, &f.MimeType, &f.Category, &f.Format,
-		&f.Storage, &f.Duration, &f.SHA256, &f.Trashed, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt)
+		&f.Storage, &f.Backend, &f.Duration, &f.SHA256, &f.Trashed, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt)
 }
 
 // ─── Event (project) assignment M:N ────────────────────────────
@@ -331,10 +338,10 @@ func (s *Store) IngredientsByFiles(fileIDs []string) (map[string][]FileIngredien
 }
 
 func (s *Store) CreateFile(f *File) error {
-	query := `INSERT INTO files (id, filename, path, size, mime_type, category, format, storage, duration, sha256)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	query := `INSERT INTO files (id, filename, path, size, mime_type, category, format, storage, backend, duration, sha256)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at, updated_at`
-	return s.db.QueryRow(query, f.ID, f.Filename, f.Path, f.Size, f.MimeType, f.Category, f.Format, f.Storage, f.Duration, f.SHA256).
+	return s.db.QueryRow(query, f.ID, f.Filename, f.Path, f.Size, f.MimeType, f.Category, f.Format, f.Storage, f.Backend, f.Duration, f.SHA256).
 		Scan(&f.CreatedAt, &f.UpdatedAt)
 }
 
@@ -509,10 +516,28 @@ type Service struct {
 	// (/t/:slug/files/:id/serve): <img>/<video> tags cannot send JWTs, so
 	// file URLs handed to browsers or external AI APIs must be public.
 	tenantSlug string
+	// encKey decrypts the tenant's storage_config credentials (ENCRYPTION_KEY).
+	encKey []byte
+	// presignerFn overrides the per-tenant bucket lookup (tests). nil means
+	// "read the tenant's storage_config on every call": a tenant without a
+	// bucket keeps storing on local disk and /files/presign answers 503.
+	presignerFn    func() (*storage.Presigner, error)
+	maxUploadBytes int64
+	// allowPrivateEndpoints permits tenant bucket endpoints on loopback/private
+	// addresses (development MinIO). Off in production: the server connects to
+	// the URL the tenant supplies, so private targets would be an SSRF probe.
+	allowPrivateEndpoints bool
 }
 
-func NewService(store *Store, baseURL, tenantSlug string) *Service {
-	return &Service{store: store, baseURL: baseURL, tenantSlug: tenantSlug}
+func NewService(store *Store, baseURL, tenantSlug, encryptionKey string, maxUploadBytes int64, allowPrivateEndpoints bool) *Service {
+	return &Service{
+		store:                 store,
+		baseURL:               baseURL,
+		tenantSlug:            tenantSlug,
+		encKey:                []byte(encryptionKey),
+		maxUploadBytes:        maxUploadBytes,
+		allowPrivateEndpoints: allowPrivateEndpoints,
+	}
 }
 
 // publicFileURL builds a JWT-free serve URL for browsers and external APIs.
@@ -535,6 +560,16 @@ type UploadResult struct {
 }
 
 func (s *Service) Upload(data []byte, filename, category, storage string, force bool) (*UploadResult, error) {
+	if s.maxUploadBytes > 0 && int64(len(data)) > s.maxUploadBytes {
+		return nil, fmt.Errorf("file too large: %d bytes (max %d)", len(data), s.maxUploadBytes)
+	}
+	// La categoría forma parte del path (disco) y de la key (bucket): se valida
+	// antes de tocar nada para que un cliente no pueda salirse de UPLOAD_DIR.
+	category = strings.ToLower(strings.TrimSpace(category))
+	if !validCategoryName(category) {
+		return nil, fmt.Errorf("invalid category %q", category)
+	}
+
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext == "" {
 		return nil, fmt.Errorf("file has no extension")
@@ -570,13 +605,19 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		}
 	}
 
+	// El destino lo decide el tenant: bucket propio si lo configuró, disco
+	// local si no. El contrato con el front es idéntico en ambos casos.
+	backend, err := s.uploadBackend()
+	if err != nil {
+		return nil, err
+	}
+
 	newFilename := uuid.New().String() + ext
 	fullPath := fmt.Sprintf("%s/%s", category, newFilename)
 
 	duration := float64(0)
 	if strings.HasPrefix(mimeType, "video/") {
-		savedPath := filepath.Join(s.store.uploadDir, fullPath)
-		duration = ReadMediaDuration(savedPath)
+		duration = MediaDuration(bytes.NewReader(data), filename)
 	}
 
 	file := &File{
@@ -588,23 +629,29 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		Category: category,
 		Format:   ext[1:],
 		Storage:  storage,
+		Backend:  backend.Name(),
 		Duration: duration,
 		SHA256:   contentHash,
 	}
 
-	if err := s.store.SaveFile(data, fullPath); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+
+	if err := backend.Put(ctx, fullPath, data, mimeType); err != nil {
 		return nil, fmt.Errorf("failed to save file: %w", err)
 	}
 
 	if err := s.store.CreateFile(file); err != nil {
-		s.store.DeleteFile(fullPath)
+		_ = backend.Delete(ctx, fullPath)
 		return nil, fmt.Errorf("failed to create db record: %w", err)
 	}
 
 	var thumbnailURL string
 	if strings.HasPrefix(mimeType, "image/") {
-		if _, err := s.store.GenerateThumbnail(fullPath, 300, 300); err != nil {
-			fmt.Printf("warning: failed to generate thumbnail for %s: %v\n", fullPath, err)
+		if thumb, ct, terr := makeThumbnail(data, ext); terr != nil {
+			fmt.Printf("warning: failed to generate thumbnail for %s: %v\n", fullPath, terr)
+		} else if perr := backend.Put(ctx, thumbnailPath(fullPath), thumb, ct); perr != nil {
+			fmt.Printf("warning: failed to save thumbnail for %s: %v\n", fullPath, perr)
 		} else {
 			thumbnailURL = s.publicFileURL(file.ID, "/thumbnail")
 		}
@@ -625,6 +672,9 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 
 func (s *Service) GetFile(id string) (*File, error) { return s.store.GetFileByID(id) }
 
+// GetServePath returns a local path with the file's bytes, downloading it to
+// the local cache when it lives in the tenant bucket. Internal consumers
+// (agency normalization, providers) keep reading a path, unchanged.
 func (s *Service) GetServePath(id string) (string, error) {
 	f, err := s.store.GetFileByID(id)
 	if err != nil {
@@ -636,21 +686,129 @@ func (s *Service) GetServePath(id string) (string, error) {
 	if f.Trashed {
 		return "", fmt.Errorf("file has been deleted")
 	}
-	return filepath.Join(s.store.uploadDir, f.Path), nil
+	return s.materialize(f)
 }
 
-func (s *Service) GetThumbnailPath(id string) (string, error) {
+// ServeTarget resolves how to serve the file: a local path for disk-backed
+// files, or a presigned URL to redirect to for bucket-backed ones.
+func (s *Service) ServeTarget(id string) (localPath, redirectURL string, err error) {
 	f, err := s.store.GetFileByID(id)
+	if err != nil {
+		return "", "", err
+	}
+	if f == nil {
+		return "", "", fmt.Errorf("file not found")
+	}
+	if f.Trashed {
+		return "", "", fmt.Errorf("file has been deleted")
+	}
+	b, err := s.backend(f.Backend)
+	if err != nil {
+		return "", "", err
+	}
+	if b.Name() == "local" {
+		return filepath.Join(s.store.uploadDir, f.Path), "", nil
+	}
+	url, err := b.ReadURL(context.Background(), f.Path)
+	return "", url, err
+}
+
+// ThumbnailTarget serves the thumbnail from the file's backend, generating and
+// storing it there the first time it is requested.
+func (s *Service) ThumbnailTarget(id string) (localPath, redirectURL string, err error) {
+	f, err := s.store.GetFileByID(id)
+	if err != nil {
+		return "", "", err
+	}
+	if f == nil {
+		return "", "", fmt.Errorf("file not found")
+	}
+	if f.Trashed {
+		return "", "", fmt.Errorf("file has been deleted")
+	}
+	b, err := s.backend(f.Backend)
+	if err != nil {
+		return "", "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+
+	thumbKey := thumbnailPath(f.Path)
+	exists, err := b.Exists(ctx, thumbKey)
+	if err != nil {
+		return "", "", err
+	}
+	if !exists {
+		rc, err := b.Open(ctx, f.Path)
+		if err != nil {
+			return "", "", err
+		}
+		data, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			return "", "", readErr
+		}
+		thumb, ct, err := makeThumbnail(data, filepath.Ext(f.Path))
+		if err != nil {
+			return "", "", err
+		}
+		if err := b.Put(ctx, thumbKey, thumb, ct); err != nil {
+			return "", "", err
+		}
+	}
+
+	if b.Name() == "local" {
+		return filepath.Join(s.store.uploadDir, thumbKey), "", nil
+	}
+	url, err := b.ReadURL(ctx, thumbKey)
+	return "", url, err
+}
+
+// materialize guarantees a local path for the file's bytes. Bucket-backed
+// files are cached under .cache/<path> so repeated reads do not re-download.
+func (s *Service) materialize(f *File) (string, error) {
+	b, err := s.backend(f.Backend)
 	if err != nil {
 		return "", err
 	}
-	if f == nil {
-		return "", fmt.Errorf("file not found")
+	if b.Name() == "local" {
+		return filepath.Join(s.store.uploadDir, f.Path), nil
 	}
-	if f.Trashed {
-		return "", fmt.Errorf("file has been deleted")
+	cachePath := filepath.Join(s.store.uploadDir, ".cache", f.Path)
+	if _, err := os.Stat(cachePath); err == nil {
+		return cachePath, nil
 	}
-	return s.store.GenerateThumbnail(f.Path, 300, 300)
+
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+	rc, err := b.Open(ctx, f.Path)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+		return "", err
+	}
+	tmp := cachePath + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(out, rc); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, cachePath); err != nil {
+		return "", err
+	}
+	return cachePath, nil
 }
 
 func (s *Service) SoftDelete(id string) error {
@@ -663,6 +821,11 @@ func (s *Service) SoftDelete(id string) error {
 	}
 	if f.Trashed {
 		return fmt.Errorf("file already in trash")
+	}
+	// Un archivo en bucket no se renombra: se marca trashed y el objeto queda
+	// en su lugar hasta el borrado definitivo.
+	if f.Backend == "s3" {
+		return s.store.SoftDeleteFile(id)
 	}
 	if err := s.store.MoveFile(f.Path, "trash/"+f.Path); err != nil {
 		return fmt.Errorf("failed to move to trash: %w", err)
@@ -685,6 +848,9 @@ func (s *Service) Restore(id string) error {
 	if !f.Trashed {
 		return fmt.Errorf("file is not in trash")
 	}
+	if f.Backend == "s3" {
+		return s.store.RestoreFile(id)
+	}
 	if err := s.store.MoveFile("trash/"+f.Path, f.Path); err != nil {
 		return fmt.Errorf("failed to restore from trash: %w", err)
 	}
@@ -704,19 +870,25 @@ func (s *Service) HardDelete(id string) error {
 		return fmt.Errorf("file not found")
 	}
 
+	b, err := s.backend(f.Backend)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+
 	subpath := f.Path
-	if f.Trashed {
+	if f.Trashed && b.Name() == "local" {
 		subpath = "trash/" + f.Path
 	}
-	if s.store.FileExists(subpath) {
-		if err := s.store.DeleteFile(subpath); err != nil {
-			return fmt.Errorf("failed to delete file: %w", err)
-		}
+	if err := b.Delete(ctx, subpath); err != nil {
+		return fmt.Errorf("failed to delete file: %w", err)
 	}
-	thumbSubpath := "thumbnails/" + f.Path
-	if s.store.FileExists(thumbSubpath) {
-		_ = s.store.DeleteFile(thumbSubpath)
+	_ = b.Delete(ctx, thumbnailPath(f.Path))
+	if b.Name() == "local" {
+		_ = b.Delete(ctx, "trash/"+thumbnailPath(f.Path))
 	}
+	_ = os.Remove(filepath.Join(s.store.uploadDir, ".cache", f.Path))
 	return s.store.HardDeleteFile(id)
 }
 
@@ -825,11 +997,12 @@ func (s *Service) PurgeExpiredTemp() error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
 	for _, f := range files {
-		s.store.DeleteFile(f.Path)
-		thumbSubpath := "thumbnails/" + f.Path
-		if s.store.FileExists(thumbSubpath) {
-			_ = s.store.DeleteFile(thumbSubpath)
+		if b, err := s.backend(f.Backend); err == nil {
+			_ = b.Delete(ctx, f.Path)
+			_ = b.Delete(ctx, thumbnailPath(f.Path))
 		}
 		s.store.HardDeleteFile(f.ID)
 	}
@@ -858,8 +1031,9 @@ type Handler struct {
 
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
-// Upload handles POST /files/upload (multipart: file, category, storage)
-// Upload handles POST /files/upload
+// Upload handles POST /files/upload (multipart: file, category, storage).
+// The bytes always arrive here and the tenant's storage config decides where
+// they land (local disk or its bucket): the front never talks to the bucket.
 //
 // Form fields:
 //   - file      (required): the multipart file
@@ -890,9 +1064,21 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 	defer f.Close()
 
-	data := make([]byte, file.Size)
-	if _, err := f.Read(data); err != nil {
+	// Se lee completo en memoria (una sola pasada, sin truncar) con el limite
+	// de MAX_UPLOAD_BYTES: un archivo demasiado grande se rechaza antes de
+	// escribir nada, en cualquiera de los dos backends.
+	var reader io.Reader = f
+	if h.svc.maxUploadBytes > 0 {
+		reader = io.LimitReader(f, h.svc.maxUploadBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
 		utils.InternalError(c, "failed to read file data")
+		return
+	}
+	if h.svc.maxUploadBytes > 0 && int64(len(data)) > h.svc.maxUploadBytes {
+		utils.Error(c, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("file too large: max %d bytes", h.svc.maxUploadBytes))
 		return
 	}
 
@@ -931,28 +1117,36 @@ func (h *Handler) GetFile(c *gin.Context) {
 	utils.Success(c, h.svc.DecorateOne(f))
 }
 
-// ServeFile handles GET /files/:id/serve
+// ServeFile handles GET /files/:id/serve. Disk-backed files stream from
+// UPLOAD_DIR; bucket-backed ones redirect to a presigned GET so the bucket
+// serves range requests and bandwidth (same public URL for both).
 func (h *Handler) ServeFile(c *gin.Context) {
-	path, err := h.svc.GetServePath(c.Param("id"))
-	serveOrError(c, path, err)
+	path, redirect, err := h.svc.ServeTarget(c.Param("id"))
+	serveOrRedirect(c, path, redirect, err)
 }
 
 // ServeThumbnail handles GET /files/:id/thumbnail
 func (h *Handler) ServeThumbnail(c *gin.Context) {
-	path, err := h.svc.GetThumbnailPath(c.Param("id"))
-	serveOrError(c, path, err)
+	path, redirect, err := h.svc.ThumbnailTarget(c.Param("id"))
+	serveOrRedirect(c, path, redirect, err)
 }
 
-func serveOrError(c *gin.Context, path string, err error) {
+func serveOrRedirect(c *gin.Context, path, redirect string, err error) {
 	if err != nil {
-		switch err.Error() {
-		case "file not found":
+		switch {
+		case err.Error() == "file not found":
 			utils.NotFound(c, err.Error())
-		case "file has been deleted":
+		case err.Error() == "file has been deleted":
 			utils.Gone(c, err.Error())
+		case errors.Is(err, ErrStorageConfig), errors.Is(err, ErrStorageDisabled):
+			utils.Error(c, http.StatusServiceUnavailable, err.Error())
 		default:
 			utils.InternalError(c, err.Error())
 		}
+		return
+	}
+	if redirect != "" {
+		c.Redirect(http.StatusFound, redirect)
 		return
 	}
 	c.File(path)
@@ -1095,7 +1289,7 @@ func NewModule(resolve HandlerResolver, publicResolve PublicResolver) *Module {
 
 func (m *Module) Name() string { return "files" }
 
-func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFunc) {
+func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.HandlerFunc) {
 	// Public serve routes (generated assets must be fetchable by external AI APIs).
 	m.public(rg.GET, "/t/:slug/files/:id/serve", "ServeFile")
 	m.public(rg.GET, "/t/:slug/files/:id/thumbnail", "ServeThumbnail")
@@ -1104,6 +1298,11 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 	g.Use(authMw, tenantMw)
 	{
 		g.POST("/upload", m.priv("Upload"))
+		g.POST("/presign", m.priv("Presign"))
+		// Per-tenant bucket: any member reads it, only tenant admins change it.
+		g.GET("/storage", m.priv("GetStorageConfig"))
+		g.PUT("/storage", adminMw, m.priv("SaveStorageConfig"))
+		g.DELETE("/storage", adminMw, m.priv("DeleteStorageConfig"))
 		g.GET("/page", m.priv("ListFilesPage"))
 		g.GET("/by-event/:eventId", m.priv("ListFilesByEvent"))
 		g.GET("", m.priv("ListFiles"))
@@ -1145,6 +1344,14 @@ func dispatch(hdl *Handler, method string, c *gin.Context) {
 	switch method {
 	case "Upload":
 		hdl.Upload(c)
+	case "Presign":
+		hdl.Presign(c)
+	case "GetStorageConfig":
+		hdl.GetStorageConfig(c)
+	case "SaveStorageConfig":
+		hdl.SaveStorageConfig(c)
+	case "DeleteStorageConfig":
+		hdl.DeleteStorageConfig(c)
 	case "ListFilesPage":
 		hdl.ListFilesPage(c)
 	case "ListFilesByEvent":

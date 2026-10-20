@@ -149,6 +149,9 @@ func main() {
 	wbStore := workerbridge.NewStore(sysDB)
 	manager.SetWorkerBridge(wbStore)
 
+	// Object storage is per tenant (storage_config, managed over HTTP): there
+	// is no global bucket, so a tenant without one keeps using local disk.
+
 	// ─── Middleware ───────────────────────────────────────────
 	authMw := middleware.Auth(cfg.JWTSecret)
 	tenantMw := tenancy.Middleware(reg)

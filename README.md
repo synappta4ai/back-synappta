@@ -155,7 +155,13 @@ GET  /api/v1/agency/tasks/server-communications  # ?task_id: detalle HTTP del pr
 PATCH /api/v1/agency/tasks/rating           # rating excluyente: buena_toma / elegida_final
 
 GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant explícito
+GET  /api/v1/files/storage                  # bucket del tenant (lectura: cualquier miembro)
+PUT  /api/v1/files/storage                  # admin del tenant: guardar/rotar el bucket propio
+DELETE /api/v1/files/storage                # admin: volver a disco local
+GET  /outputs/*                             # estático: imágenes/videos generados (siempre local)
 ```
+
+Almacenamiento de binarios (biblioteca vs generados, con y sin bucket): [docs/ALMACENAMIENTO_ASSETS.md](docs/ALMACENAMIENTO_ASSETS.md).
 
 ### Forma de un modelo en la API
 

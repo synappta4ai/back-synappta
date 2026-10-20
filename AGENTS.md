@@ -61,6 +61,35 @@ the API catalog. Flow:
   orphaned downloaded task polls as `running` forever (the worker does not
   expose a job-status-by-id RPC yet).
 
+## Per-tenant object storage (MinIO/S3)
+
+Files live on the local disk (`UPLOAD_DIR`) unless the tenant configures its
+own bucket: there is **no global bucket** in the environment and the back
+never depends on one.
+
+- Config: `storage_config` (one row per tenant, `migrations/tenant/00007`),
+  managed by `GET/PUT/DELETE /api/v1/files/storage` (write = tenant admin,
+  read = any member, secrets masked). Credentials are AES-256-GCM sealed with
+  `ENCRYPTION_KEY` via `internal/secretbox`; the logic lives in
+  `internal/modules/file/storage_config.go`.
+- Saving validates the payload **and** the bucket: `bucketProbe` does a signed
+  HEAD that must answer 200, so a broken endpoint/credential is never
+  persisted. `enabled=false` keeps the row but reverts the tenant to local.
+- `POST /api/v1/files/presign` signs a PUT with the tenant's bucket and
+  returns 503 when there is none — the front then uses `POST /files/upload`
+  (local disk). Keys: `<tenant>/<category>/<YYYY>/<MM>/<uuid><ext>`, only
+  image/video/audio types, and `Content-Type` is signed.
+- Signing lives in `internal/storage` (SigV4 query auth, no SDK), validated
+  against AWS's published example and against a real MinIO.
+- Endpoints are tenant-supplied and the server connects to them, so
+  `guardPublicEndpoint` rejects loopback/private/link-local targets unless
+  `STORAGE_ALLOW_PRIVATE_ENDPOINTS=true` (development MinIO). Keep it off in
+  production.
+- Tests: `TEST_DATABASE_URL=... go test ./internal/modules/file -run
+  TestStorageConfig` applies the real migration to a disposable database;
+  live uploads need `MINIO_TEST_ENDPOINT/BUCKET/ACCESS_KEY/SECRET_KEY`.
+- `max_size` is advisory: S3 ignores size on a plain presigned PUT.
+
 ## Remote MCP server & assistant tool-calling
 
 Two surfaces expose the same tenant-scoped domain operations:

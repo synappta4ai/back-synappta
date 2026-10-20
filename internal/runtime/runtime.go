@@ -268,7 +268,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("file store: %w", err)
 	}
-	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug)
+	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug, m.cfg.EncryptionKey, m.cfg.MaxUploadBytes, m.cfg.StorageAllowPrivateEndpoints)
 	credStore := credential.NewStore(pool, m.cfg.EncryptionKey)
 	eventSvc := event.NewService(event.NewStore(pool))
 	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL, t.Slug)
