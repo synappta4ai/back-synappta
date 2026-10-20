@@ -209,6 +209,11 @@ func main() {
 	tenantUsersHdl := tenant.NewTenantUsersHandler(sysDB)
 	tenant.SetTenantUsersHandler(tenantUsersHdl)
 	registry.Register(tenant.NewModule(tenant.NewHandler(tenant.NewService(tenant.NewStore(sysDB), provisioner, reg, cfg.EncryptionKey))))
+	// Platform superadmin manages a tenant's bucket by id (/tenants/:id/storage),
+	// so those routes need the runtime bundle of that tenant.
+	tenant.SetTenantStorageResolver(func(id int64) (tenant.StorageAdmin, error) {
+		return manager.FilesForTenantID(id)
+	})
 	registry.Register(model.NewModule(func(c *gin.Context) (model.CredentialLister, bool) {
 		hdl, ok := manager.CredentialsFor(c)
 		if !ok || hdl == nil {

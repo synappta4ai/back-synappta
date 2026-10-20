@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"synapta/internal/modules/credential"
+	"synapta/internal/modules/file"
 	"synapta/internal/modules/model"
 	"synapta/internal/tenancy"
 	"synapta/internal/utils"
@@ -347,6 +348,101 @@ func parseTenantID(c *gin.Context) (int64, bool) {
 	return id, true
 }
 
+// ─── Per-tenant object storage (platform superadmin) ────────────
+
+// StorageAdmin is the tenant-bucket surface the platform endpoints need. It is
+// implemented by the tenant's file handler so the same service, encryption key
+// and probe are used as in /files/storage.
+type StorageAdmin interface {
+	StorageConfigForAdmin() (*file.StorageConfig, error)
+	SaveStorageConfigForAdmin(file.StorageConfigRequest) (*file.StorageConfig, error)
+	DeleteStorageConfigForAdmin() error
+}
+
+// storageForTenant resolves a tenant's storage surface by numeric id. Wired
+// from main (it needs the runtime bundle manager).
+var storageForTenant func(id int64) (StorageAdmin, error)
+
+// SetTenantStorageResolver connects the per-tenant file services. The routes
+// answer 500 until it is set.
+func SetTenantStorageResolver(fn func(id int64) (StorageAdmin, error)) {
+	storageForTenant = fn
+}
+
+// storageAdmin resolves the target tenant's storage surface, writing the
+// response itself when the tenant or the resolver is missing.
+func storageAdmin(c *gin.Context) (StorageAdmin, bool) {
+	id, ok := parseTenantID(c)
+	if !ok {
+		return nil, false
+	}
+	if storageForTenant == nil {
+		utils.InternalError(c, "storage admin is not available")
+		return nil, false
+	}
+	admin, err := storageForTenant(id)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return nil, false
+	}
+	if admin == nil {
+		utils.NotFound(c, fmt.Sprintf("tenant %d not found", id))
+		return nil, false
+	}
+	return admin, true
+}
+
+// TenantStorage handles GET /tenants/:id/storage (platform superadmin).
+// Returns the bucket configuration with secrets masked (configured=false means
+// the tenant stores files on local disk).
+func (h *Handler) TenantStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	cfg, err := admin.StorageConfigForAdmin()
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, cfg)
+}
+
+// TenantSaveStorage handles PUT /tenants/:id/storage (platform superadmin).
+// Saving runs the signed HEAD probe, so an unreachable bucket is rejected with
+// 400 and nothing is persisted.
+func (h *Handler) TenantSaveStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	var req file.StorageConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "invalid body: "+err.Error())
+		return
+	}
+	cfg, err := admin.SaveStorageConfigForAdmin(req)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, cfg)
+}
+
+// TenantDeleteStorage handles DELETE /tenants/:id/storage (platform
+// superadmin): the tenant goes back to local disk storage.
+func (h *Handler) TenantDeleteStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	if err := admin.DeleteStorageConfigForAdmin(); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "storage config removed; the tenant stores files locally")
+}
+
 // TenantModels handles GET /tenants/:id/models (platform superadmin).
 // Returns the model catalog annotated with per-tenant credential status.
 func (h *Handler) TenantModels(c *gin.Context) {
@@ -587,6 +683,11 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
 				utils.Success(c, CatalogPermissions())
 			})
 		}
+
+		// Per-tenant object storage (platform superadmin).
+		g.GET("/:id/storage", m.hdl.TenantStorage)
+		g.PUT("/:id/storage", m.hdl.TenantSaveStorage)
+		g.DELETE("/:id/storage", m.hdl.TenantDeleteStorage)
 
 		// Per-tenant model/credential management (platform superadmin).
 		g.GET("/:id/models", m.hdl.TenantModels)

@@ -12,6 +12,8 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -101,6 +103,38 @@ func (m *Manager) Resolve(c *gin.Context) (*Bundle, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// FilesForTenantID resolves a tenant's file handler from its numeric id.
+//
+// Platform-superadmin endpoints that act on another tenant (/tenants/:id/...)
+// have no tenant in their token, so they cannot use Resolve. A nil handler
+// with a nil error means the tenant does not exist.
+func (m *Manager) FilesForTenantID(id int64) (*file.Handler, error) {
+	t, err := m.tenantByID(id)
+	if err != nil || t == nil {
+		return nil, err
+	}
+	b, err := m.Bundle(t)
+	if err != nil {
+		return nil, err
+	}
+	return b.Files, nil
+}
+
+// tenantByID reads one tenant row from the system schema (nil when absent).
+func (m *Manager) tenantByID(id int64) (*tenancy.Tenant, error) {
+	t := &tenancy.Tenant{}
+	err := m.reg.System().QueryRow(
+		`SELECT id, slug, name, active, created_at, updated_at FROM tenants WHERE id = $1`, id,
+	).Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &t.CreatedAt, &t.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // Bundle returns (building if needed) the bundle for a tenant.

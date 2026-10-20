@@ -291,6 +291,27 @@ func (h *Handler) DeleteStorageConfig(c *gin.Context) {
 	utils.Message(c, "storage config removed; the tenant stores files locally")
 }
 
+// ─── Platform-admin access ─────────────────────────────────────
+
+// The methods below expose the same service calls to platform endpoints that
+// resolve a tenant by id (/tenants/:id/storage) instead of from the JWT. The
+// HTTP handlers above keep their tenant-scoped behavior.
+
+// StorageConfigForAdmin returns the tenant's configuration with masked secrets.
+func (h *Handler) StorageConfigForAdmin() (*StorageConfig, error) {
+	return h.svc.StorageConfigRead()
+}
+
+// SaveStorageConfigForAdmin validates (including the bucket probe) and saves.
+func (h *Handler) SaveStorageConfigForAdmin(req StorageConfigRequest) (*StorageConfig, error) {
+	return h.svc.SaveStorageConfig(req)
+}
+
+// DeleteStorageConfigForAdmin reverts the tenant to local disk storage.
+func (h *Handler) DeleteStorageConfigForAdmin() error {
+	return h.svc.DeleteStorageConfig()
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 // normalizedStorage is the validated payload (Enabled already resolved).
