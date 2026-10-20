@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"synapta/internal/storage"
 )
@@ -291,6 +292,87 @@ func TestUploadEndpointStoresInBucket(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK || !bytes.Equal(got, data) {
 		t.Fatalf("GET del bucket: status=%d bytes=%d (want %d)", res.StatusCode, len(got), len(data))
+	}
+}
+
+// postUpload sube un PNG por el endpoint multipart, como lo hace el front.
+func postUpload(t *testing.T, r http.Handler, data []byte) UploadResult {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	if err := mw.WriteField("category", "images"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := mw.CreateFormFile("file", "cache-control.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	mw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/files/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d (%s)", w.Code, w.Body.String())
+	}
+	var created struct {
+		Data UploadResult `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("respuesta no es JSON: %v", err)
+	}
+	if created.Data.ID == "" {
+		t.Fatalf("sin id en la respuesta: %s", w.Body.String())
+	}
+	return created.Data
+}
+
+// El redirect al bucket tiene que ser cacheable: sin Cache-Control el browser
+// repite el 302 por cada vista de la misma miniatura (una grilla de 20
+// imágenes = 20 hits al API), y el max-age tiene que vencer antes que la firma
+// o el browser reusaría una URL ya caducada.
+func TestServeRedirectCarriesCacheControl(t *testing.T) {
+	store, _ := newTestStore(t)
+	fake := newFakeS3(t, "acme-media")
+	svc := NewService(store, "", "acme", testEncKey, 10<<20, true)
+	if _, err := svc.SaveStorageConfig(StorageConfigRequest{
+		Endpoint: fake.endpoint, Bucket: fake.bucket, AccessKey: "ak", SecretKey: "sk",
+	}); err != nil {
+		t.Fatalf("SaveStorageConfig: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.DeleteStorageConfig() })
+	r := newRouter(svc)
+
+	created := postUpload(t, r, testPNG(t, 64, 48))
+
+	for _, suffix := range []string{"/serve", "/thumbnail"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/files/"+created.ID+suffix, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusFound {
+			t.Fatalf("%s status = %d (%s)", suffix, w.Code, w.Body.String())
+		}
+		if loc := w.Header().Get("Location"); !strings.Contains(loc, "X-Amz-Signature=") {
+			t.Fatalf("%s Location no está firmado: %q", suffix, loc)
+		}
+
+		header := w.Header().Get("Cache-Control")
+		if !strings.HasPrefix(header, "private, max-age=") {
+			t.Fatalf("%s Cache-Control = %q, want private, max-age=<segundos>", suffix, header)
+		}
+		maxAge, err := strconv.Atoi(strings.TrimPrefix(header, "private, max-age="))
+		if err != nil || maxAge <= 0 {
+			t.Fatalf("%s max-age inválido en %q", suffix, header)
+		}
+		if time.Duration(maxAge)*time.Second >= storage.DefaultTTL {
+			t.Fatalf("%s max-age (%ds) no puede alcanzar el TTL de la firma (%s)",
+				suffix, maxAge, storage.DefaultTTL)
+		}
 	}
 }
 
