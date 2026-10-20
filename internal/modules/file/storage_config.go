@@ -436,6 +436,36 @@ func probeBucket(p *storage.Presigner) error {
 	if !bytes.Equal(got, probePayload) {
 		return errors.New("el endpoint no devolvió lo que se acaba de subir: no parece una API S3 (¿el endpoint apunta a la consola web?)")
 	}
+	return probePublicRead(ctx, p, key)
+}
+
+// probePublicRead checks that public_base really serves objects without a
+// signature. With a public base the API hands the bucket URL straight to the
+// browser, so a private bucket there would break every image instead of just
+// adding a hop.
+func probePublicRead(ctx context.Context, p *storage.Presigner, key string) error {
+	if p.PublicBase() == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.PublicURL(key), nil)
+	if err != nil {
+		return fmt.Errorf("no se pudo preparar la lectura desde public_base: %w", err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("no se pudo conectar con public_base: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("public_base respondió %d: la lectura pública del bucket tiene que estar activa o el campo debe quedar vacío", res.StatusCode)
+	}
+	got, err := io.ReadAll(io.LimitReader(res.Body, int64(len(probePayload))+1))
+	if err != nil {
+		return fmt.Errorf("no se pudo leer desde public_base: %w", err)
+	}
+	if !bytes.Equal(got, probePayload) {
+		return errors.New("public_base devolvió otro contenido que el objeto de prueba (¿el dominio apunta a otro bucket?)")
+	}
 	return nil
 }
 

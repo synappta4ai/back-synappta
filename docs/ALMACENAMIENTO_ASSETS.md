@@ -340,6 +340,19 @@ endpoint no puede resolver a loopback ni a rangos privados (salvo
 `public_base` y si hay secret guardado; cualquier miembro del tenant puede
 leerlo, solo el admin escribirlo.
 
+### Lectura de los archivos: `public_base` vs redirect
+
+- **Con `public_base`** (CDN o dominio público del bucket) `url` y
+  `thumbnail_url` apuntan directo a `public_base/<key>`: el browser y el CDN
+  leen del bucket, la API no participa por cada vista y la URL no caduca (por
+  eso nunca se devuelven URLs prefirmadas: expiran en 15 min). El guardado
+  verifica que ese dominio entregue el objeto **sin firma**; si el bucket es
+  privado, la config se rechaza en vez de romper todas las imágenes.
+- **Sin `public_base`** (o archivos en `local`) la URL sigue siendo
+  `/api/v1/t/:slug/files/:id/serve|thumbnail`: para el bucket es un `302` a una
+  firma fresca (los bytes no pasan por la API) con `Cache-Control: private,
+  max-age=300`; para disco el API sirve el archivo.
+
 ---
 
 ## 9. Limitaciones conocidas

@@ -129,6 +129,10 @@ func (p *Presigner) Host() string { return p.endpoint.Hostname() }
 // TTL is how long a signed URL stays valid.
 func (p *Presigner) TTL() time.Duration { return p.ttl }
 
+// PublicBase is the configured public read base (CDN or the bucket's public
+// domain), or "" when reads must be signed.
+func (p *Presigner) PublicBase() string { return p.publicBase }
+
 // PresignPut returns a presigned PUT URL for key. When contentType is not
 // empty it is signed too, so the upload must send that exact Content-Type
 // (returned in the "headers" map of the API response).

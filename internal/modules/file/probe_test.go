@@ -27,12 +27,18 @@ func consoleLikeEndpoint(t *testing.T) *httptest.Server {
 
 func presignerFor(t *testing.T, endpoint, bucket string) *storage.Presigner {
 	t.Helper()
+	return presignerWithBase(t, endpoint, bucket, "")
+}
+
+func presignerWithBase(t *testing.T, endpoint, bucket, publicBase string) *storage.Presigner {
+	t.Helper()
 	p, err := storage.New(storage.Config{
-		Endpoint:  endpoint,
-		Bucket:    bucket,
-		Region:    "us-east-1",
-		AccessKey: "ak",
-		SecretKey: "sk",
+		Endpoint:   endpoint,
+		Bucket:     bucket,
+		Region:     "us-east-1",
+		AccessKey:  "ak",
+		SecretKey:  "sk",
+		PublicBase: publicBase,
 	})
 	if err != nil {
 		t.Fatalf("storage.New: %v", err)
@@ -69,6 +75,40 @@ func TestProbeBucketRejectsMissingBucket(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "404") {
 		t.Fatalf("el error debería nombrar el 404: %v", err)
+	}
+}
+
+// Con public_base el front lee del bucket, así que el probe tiene que fallar si
+// ese dominio no sirve el objeto sin firma: si no, se guarda una config que
+// rompe todas las imágenes.
+func TestProbeBucketRejectsPrivatePublicBase(t *testing.T) {
+	fake := newFakeS3(t, "media")
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "AccessDenied", http.StatusForbidden)
+	}))
+	t.Cleanup(public.Close)
+
+	err := probeBucket(presignerWithBase(t, fake.endpoint, fake.bucket, public.URL+"/media"))
+	if err == nil {
+		t.Fatal("un public_base que no sirve el objeto debería fallar la verificación")
+	}
+	if !strings.Contains(err.Error(), "public_base") {
+		t.Fatalf("el error debería nombrar public_base: %v", err)
+	}
+}
+
+func TestProbeBucketAcceptsPublicBaseThatServesTheObject(t *testing.T) {
+	fake := newFakeS3(t, "media")
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(probePayload)
+	}))
+	t.Cleanup(public.Close)
+
+	if err := probeBucket(presignerWithBase(t, fake.endpoint, fake.bucket, public.URL+"/media")); err != nil {
+		t.Fatalf("public_base válido: %v", err)
+	}
+	if keys := fake.keys(); len(keys) != 0 {
+		t.Fatalf("el probe dejó objetos en el bucket: %v", keys)
 	}
 }
 

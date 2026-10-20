@@ -83,6 +83,11 @@ never depends on one.
   returns 503 when there is none — the front then uses `POST /files/upload`
   (local disk). Keys: `<tenant>/<category>/<YYYY>/<MM>/<uuid><ext>`, only
   image/video/audio types, and `Content-Type` is signed.
+- Reads: with `public_base` set (and verified public by the probe) `url` and
+  `thumbnail_url` point straight at the bucket/CDN; otherwise they stay on
+  `/api/v1/t/:slug/files/:id/serve`, which redirects bucket files to a fresh
+  signature (`Cache-Control: private, max-age=300`). Never return a presigned
+  URL in a response: it expires in 15 minutes.
 - Signing lives in `internal/storage` (SigV4 query auth, no SDK), validated
   against AWS's published example and against a real MinIO.
 - Endpoints are tenant-supplied and the server connects to them, so

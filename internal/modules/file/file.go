@@ -545,6 +545,48 @@ func (s *Service) publicFileURL(id, suffix string) string {
 	return s.baseURL + "/api/v1/t/" + s.tenantSlug + "/files/" + id + suffix
 }
 
+// bucketReader returns the tenant's presigner when its bucket has a public
+// read base (CDN or the bucket's own public domain), nil otherwise. Reads in
+// that case skip the API entirely: no hop, no expiring signature, and the
+// browser/CDN caches the object.
+func (s *Service) bucketReader() *storage.Presigner {
+	p, err := s.presigner()
+	if err != nil || p == nil || p.PublicBase() == "" {
+		return nil
+	}
+	return p
+}
+
+// bucketReaderFor resolves the public base once per response and only when an
+// item actually lives in the bucket, so a tenant without one pays no query.
+func (s *Service) bucketReaderFor(files []File) *storage.Presigner {
+	for i := range files {
+		if files[i].Backend == "s3" {
+			return s.bucketReader()
+		}
+	}
+	return nil
+}
+
+// readURL is where a client should fetch f from. With a public bucket base the
+// URL points straight at the bucket (zero API traffic per view); otherwise it
+// stays on the tenant-scoped API URL, which streams from disk or redirects to
+// a freshly signed URL. Signature URLs are never returned: they expire in 15
+// minutes and clients keep these values around.
+func (s *Service) readURL(f *File, reader *storage.Presigner, thumbnail bool) string {
+	if reader != nil && f.Backend == "s3" {
+		key := f.Path
+		if thumbnail {
+			key = thumbnailPath(f.Path)
+		}
+		return reader.PublicURL(key)
+	}
+	if thumbnail {
+		return s.publicFileURL(f.ID, "/thumbnail")
+	}
+	return s.publicFileURL(f.ID, "/serve")
+}
+
 type UploadResult struct {
 	ID           string `json:"id"`
 	Filename     string `json:"filename"`
@@ -590,14 +632,15 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 			return nil, fmt.Errorf("dedup lookup failed: %w", err)
 		}
 		if existing != nil {
+			reader := s.bucketReaderFor([]File{*existing})
 			thumbnailURL := ""
 			if strings.HasPrefix(existing.MimeType, "image/") {
-				thumbnailURL = s.publicFileURL(existing.ID, "/thumbnail")
+				thumbnailURL = s.readURL(existing, reader, true)
 			}
 			format := existing.Format
 			return &UploadResult{
 				ID: existing.ID, Filename: existing.Filename,
-				URL:  s.publicFileURL(existing.ID, "/serve"),
+				URL:  s.readURL(existing, reader, false),
 				Size: existing.Size, MimeType: existing.MimeType, Format: format,
 				Category: existing.Category, ThumbnailURL: thumbnailURL,
 				Duplicate: true,
@@ -646,6 +689,7 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		return nil, fmt.Errorf("failed to create db record: %w", err)
 	}
 
+	reader := s.bucketReaderFor([]File{*file})
 	var thumbnailURL string
 	if strings.HasPrefix(mimeType, "image/") {
 		if thumb, ct, terr := makeThumbnail(data, ext); terr != nil {
@@ -653,7 +697,7 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 		} else if perr := backend.Put(ctx, thumbnailPath(fullPath), thumb, ct); perr != nil {
 			fmt.Printf("warning: failed to save thumbnail for %s: %v\n", fullPath, perr)
 		} else {
-			thumbnailURL = s.publicFileURL(file.ID, "/thumbnail")
+			thumbnailURL = s.readURL(file, reader, true)
 		}
 	}
 
@@ -664,7 +708,7 @@ func (s *Service) Upload(data []byte, filename, category, storage string, force 
 
 	return &UploadResult{
 		ID: file.ID, Filename: filename,
-		URL:  s.publicFileURL(file.ID, "/serve"),
+		URL:  s.readURL(file, reader, false),
 		Size: file.Size, MimeType: mimeType, Format: format, Category: category,
 		ThumbnailURL: thumbnailURL,
 	}, nil
@@ -897,19 +941,24 @@ func (s *Service) DecorateOne(f *File) *File {
 	if f == nil {
 		return f
 	}
-	f.URL = s.publicFileURL(f.ID, "/serve")
+	var reader *storage.Presigner
+	if f.Backend == "s3" {
+		reader = s.bucketReader()
+	}
+	f.URL = s.readURL(f, reader, false)
 	if strings.HasPrefix(f.MimeType, "image/") {
-		f.ThumbnailURL = s.publicFileURL(f.ID, "/thumbnail")
+		f.ThumbnailURL = s.readURL(f, reader, true)
 	}
 	return f
 }
 
 // decorate fills the computed public URL fields for API responses.
 func (s *Service) decorate(files []File) []File {
+	reader := s.bucketReaderFor(files)
 	for i := range files {
-		files[i].URL = s.publicFileURL(files[i].ID, "/serve")
+		files[i].URL = s.readURL(&files[i], reader, false)
 		if strings.HasPrefix(files[i].MimeType, "image/") {
-			files[i].ThumbnailURL = s.publicFileURL(files[i].ID, "/thumbnail")
+			files[i].ThumbnailURL = s.readURL(&files[i], reader, true)
 		}
 	}
 	return files
@@ -1151,6 +1200,9 @@ func serveOrRedirect(c *gin.Context, path, redirect string, err error) {
 		return
 	}
 	if redirect != "" {
+		// El destino es una URL firmada de 15 min: cachear el redirect un rato
+		// corto evita que cada vista de una miniatura vuelva a golpear la API.
+		c.Header("Cache-Control", "private, max-age=300")
 		c.Redirect(http.StatusFound, redirect)
 		return
 	}
