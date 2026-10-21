@@ -117,6 +117,10 @@ type DownloadedModel struct {
 	// (missing provider configuration, weights not downloaded, or an
 	// unmounted external volume).
 	Available bool `json:"available"`
+	// Downloaded reports complete weights on disk. It is what the panel uses
+	// to offer "delete weights" instead of "download"; Available is not the
+	// same question (a mounted-volume or engine check can differ).
+	Downloaded bool `json:"downloaded"`
 	// Downloading reports an in-progress background weights download.
 	Downloading bool `json:"downloading"`
 	// DownloadPercent is the live 0-100 progress of that download.
@@ -125,6 +129,11 @@ type DownloadedModel struct {
 	SizeBytes int64 `json:"size_bytes"`
 	// DownloadError carries the last download failure, if any.
 	DownloadError string `json:"download_error,omitempty"`
+	// DownloadPath is the absolute path the worker reports for the weights
+	// on its own disk. Empty when it has no weights folder (or an older
+	// worker that predates the field). Never rewritten here: the path means
+	// nothing on the back's filesystem.
+	DownloadPath string `json:"download_path,omitempty"`
 	// Notes from the worker catalog.
 	Notes string `json:"notes,omitempty"`
 }

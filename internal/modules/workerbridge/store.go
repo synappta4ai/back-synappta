@@ -526,6 +526,10 @@ type WorkerModel struct {
 	Family    string `json:"family"`
 	Available bool   `json:"available"`
 	Notes     string `json:"notes"`
+	// Downloaded: los pesos completos están en el disco de ese worker. Ojo:
+	// no es lo mismo que Available (un volumen desmontado o un motor caído
+	// dejan el modelo no disponible con los pesos intactos).
+	Downloaded bool `json:"downloaded,omitempty"`
 	// Downloading: hay una descarga de pesos en curso para esta clave.
 	Downloading bool `json:"downloading,omitempty"`
 	// DownloadPercent: 0-100 del progreso de esa descarga.
@@ -534,6 +538,11 @@ type WorkerModel struct {
 	SizeBytes int64 `json:"size_bytes,omitempty"`
 	// DownloadError: último fallo de descarga, si hubo.
 	DownloadError string `json:"download_error,omitempty"`
+	// DownloadPath: ruta absoluta de los pesos en la máquina del worker (la
+	// reporta su gRPC local). Vacía en agentes anteriores al campo o cuando el
+	// modelo no tiene carpeta de pesos. Solo informativa: el back y el front
+	// no la interpretan contra su propio disco.
+	DownloadPath string `json:"download_path,omitempty"`
 	// Identidad de la GPU que reportó el modelo (la completa el store).
 	WorkerID      string `json:"worker_id,omitempty"`
 	WorkerName    string `json:"worker_name,omitempty"`

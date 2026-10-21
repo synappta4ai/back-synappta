@@ -1548,10 +1548,12 @@
           "vram_gb": { "type": "integer" },
           "family": { "type": "string" },
           "available": { "type": "boolean", "description": "false when the worker lists the model but cannot run it" },
+          "downloaded": { "type": "boolean", "description": "true when the weights are fully on the worker disk" },
           "downloading": { "type": "boolean", "description": "true while a background weight download is running" },
           "download_percent": { "type": "number", "description": "Live 0-100 download progress" },
           "size_bytes": { "type": "integer", "description": "On-disk weight size when downloaded" },
           "download_error": { "type": "string", "description": "Last download failure, when present" },
+          "download_path": { "type": "string", "description": "Absolute path of the weights on the worker's machine; empty when unknown or the agent predates the field" },
           "notes": { "type": "string" }
         }
       },

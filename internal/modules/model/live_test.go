@@ -133,8 +133,9 @@ func setup(t *testing.T) (m *Module, addr string) {
 		models: []*inferencev1.ModelInfo{
 			{Key: "SD-1.5", Label: "Stable Diffusion 1.5", Mode: "image", Engine: "diffusers",
 				Pipeline: "sd15", Repo: "stable-diffusion-v1-5/stable-diffusion-v1-5", Steps: 20, VramGb: 4,
-				Family: "sd", Available: true, Downloading: true, DownloadPercent: 42.5,
-				SizeBytes: 420, DownloadError: ""},
+				Family: "sd", Available: true, Downloaded: true, Downloading: true, DownloadPercent: 42.5,
+				SizeBytes: 420, DownloadError: "",
+				DownloadPath: "/home/u/.cache/huggingface/hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5"},
 			{Key: "Wan2.1-T2V-1.3B", Label: "Wan 2.1 T2V 1.3B", Mode: "video", Engine: "diffusers",
 				Pipeline: "wan", Repo: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", Steps: 30, VramGb: 6,
 				Family: "wan", Available: true},
@@ -253,6 +254,34 @@ func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("missing %s in %s", want, body)
 		}
+	}
+}
+
+// La ruta de los pesos también viaja en el snapshot del bridge: es lo que el
+// panel admin muestra en equipos emparejados, donde el back no tiene gRPC.
+func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
+	m := NewModule(allUsableResolver())
+	killCentral(t)
+	const path = "/home/u/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev"
+	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
+		Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
+		Pipeline: "flux", Family: "flux", Available: true, Downloaded: true, DownloadPath: path,
+		WorkerID: "w-1", WorkerName: "PC-Casa",
+	}}})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || len(env.Data) != 1 {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	d := env.Data[0].Downloaded
+	if d == nil || !d.Downloaded || d.DownloadPath != path {
+		t.Fatalf("bridge weights path lost: %+v", d)
+	}
+	if !strings.Contains(w.Body.String(), `"download_path":"`+path+`"`) {
+		t.Fatalf("missing download_path in %s", w.Body.String())
 	}
 }
 
@@ -675,6 +704,12 @@ func TestListTypeDownloadedMapsLiveState(t *testing.T) {
 	sd := workerModelByName(t, env.Data, "SD-1.5")
 	if sd.Downloaded == nil || !sd.Downloaded.Downloading || sd.Downloaded.DownloadPercent != 42.5 || sd.Downloaded.SizeBytes != 420 {
 		t.Fatalf("live download state not mapped: %+v", sd.Downloaded)
+	}
+	// La ruta de los pesos la reporta el worker y el back la reenvía tal cual:
+	// es la máquina del worker, no el disco del back.
+	if !sd.Downloaded.Downloaded ||
+		sd.Downloaded.DownloadPath != "/home/u/.cache/huggingface/hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5" {
+		t.Fatalf("weights path not mapped: %+v", sd.Downloaded)
 	}
 }
 
