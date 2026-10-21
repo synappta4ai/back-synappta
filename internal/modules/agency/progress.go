@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -173,6 +175,46 @@ func (s *Core) ensureLocalVideo(taskID string, result *GeneratorResult) {
 	}
 	out.LocalURL = localURL
 	log.Printf("[outputs] %s stored locally for task %s: %s", kind, taskID, localURL)
+}
+
+// publishLocalOutputs moves finished artifacts into the tenant bucket when it
+// has one: every output whose bytes already sit in the local outputs dir goes
+// to outputs/<rel> in the bucket, its URL switches to the public tenant-scoped
+// route, and the local copy is removed to free disk. Without a bucket — or if
+// an upload fails — the output stays exactly as before (local /outputs URL).
+func (s *Core) publishLocalOutputs(result *GeneratorResult) {
+	if result == nil || s.outputPublisher == nil || s.outputsDir == "" {
+		return
+	}
+	prefix := config.OutPutUrl() + "/"
+	for i := range result.Outputs {
+		out := &result.Outputs[i]
+		local := out.LocalURL
+		if local == "" && strings.HasPrefix(out.URL, prefix) {
+			local = out.URL
+		}
+		if !strings.HasPrefix(local, prefix) {
+			continue
+		}
+		rel := strings.TrimPrefix(local, prefix)
+		path := filepath.Join(s.outputsDir, filepath.FromSlash(rel))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			// Already published (re-poll) or gone: nothing to move.
+			continue
+		}
+		url, stored := s.outputPublisher.StoreOutput(rel, data, utils.MimeForFilename(rel))
+		if !stored {
+			continue
+		}
+		out.URL = s.absoluteOutputURL(url)
+		out.LocalURL = ""
+		if err := os.Remove(path); err != nil {
+			log.Printf("[outputs] stored %s in the tenant bucket; local copy kept: %v", rel, err)
+			continue
+		}
+		log.Printf("[outputs] %s stored in the tenant bucket", rel)
+	}
 }
 
 // mediaKindForOutput classifies an output as image/audio/video from its

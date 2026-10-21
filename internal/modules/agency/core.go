@@ -71,6 +71,9 @@ type Core struct {
 	genAssetSt   *GeneratedAssetStore
 	genSaver     GenerationSaver
 	pushNotifier PushNotifier
+	// outputPublisher moves finished artifacts to the tenant bucket when it has
+	// one; nil (or stored=false) keeps them on local disk.
+	outputPublisher OutputPublisher
 	// bridgeModels resuelve modelos servidos por las GPUs emparejadas del
 	// tenant (nil en deploys con worker central, donde el catálogo vivo por
 	// gRPC es la única fuente "downloaded").
@@ -113,6 +116,10 @@ func (s *Core) serveURL(fileID string) string {
 
 // SetPushNotifier wires the push service used for async completion alerts.
 func (s *Core) SetPushNotifier(pn PushNotifier) { s.pushNotifier = pn }
+
+// SetOutputPublisher wires the tenant's storage so completed generations can be
+// saved to its bucket instead of local disk.
+func (s *Core) SetOutputPublisher(p OutputPublisher) { s.outputPublisher = p }
 
 // RegisterGenerator registers a generator that satisfies PipelineRunner.
 func (s *Core) RegisterGenerator(gen PipelineRunner) { s.pipelineGens = append(s.pipelineGens, gen) }
@@ -428,6 +435,12 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		return nil, err
 	}
 
+	// Sync generators (Gemini images) leave their bytes on local disk: move them
+	// to the tenant bucket when it has one.
+	if result != nil {
+		s.publishLocalOutputs(result)
+	}
+
 	// Calculate the generation spend: a provider-reported estimate
 	// (Higgsfield /estimate, in credits + USD) wins over local calculators.
 	if result.CostCredits > 0 || result.CostUSD > 0 {
@@ -670,6 +683,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		// Persist the video under the server's own outputs and serve it from
 		// our domain instead of the expiring signed provider URL.
 		s.ensureLocalVideo(taskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
@@ -926,6 +940,7 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 
 	if result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED {
 		s.ensureLocalVideo(logEntry.TaskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL

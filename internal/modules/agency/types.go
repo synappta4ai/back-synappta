@@ -209,6 +209,14 @@ type PushNotifier interface {
 	SendToUser(userID int64, title, body string, data map[string]string)
 }
 
+// OutputPublisher stores a generated artifact in the tenant's own storage and
+// returns its public URL. stored=false means no bucket is configured (or the
+// upload failed): the caller keeps the bytes on local disk, so the bucket stays
+// optional, just like uploads.
+type OutputPublisher interface {
+	StoreOutput(relPath string, data []byte, contentType string) (url string, stored bool)
+}
+
 // GenerationSaver persists completed generation outputs to the piece's
 // generation row (video_url / video_local_url). taskID links the generation
 // with its generation_log for payload retrieval.

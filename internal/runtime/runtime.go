@@ -325,6 +325,9 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		return eventSvc.SaveGenerationOutput(pieceID, number, videoURL, localURL, taskID)
 	})
 	core.SetPushNotifier(pushSvc)
+	// Generated media follows the same rule as uploads: the tenant's bucket
+	// when configured, local disk otherwise.
+	core.SetOutputPublisher(fileSvc)
 
 	// Generators (video ×3, image ×3, text ×1). Audio has no generator yet.
 	core.RegisterGenerator(agencyvideo.NewSeedanceGenerator())
