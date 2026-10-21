@@ -35,8 +35,9 @@ Key rules when touching this area:
   `modality: ""` and its raw mode preserved in `downloaded.mode`. Do not map
   it to `text`.
 - `inference.proto` + generated code live in `internal/worker/proto`; they
-  mirror brain-master's `proto/inference.proto` (regenerate if the worker
-  contract changes).
+  mirror the canonical contract in the `inference-worker` repo
+  (`proto/inference.proto`). Copy the proto here and regenerate the Go stubs
+  whenever the worker contract changes. (`brain-master` is retired.)
 - Config: `BM_WORKER_ADDR` (`host:port`, or `tls://host:port` for cloudflared
   tunnels) and `BM_WORKER_TIMEOUT_SECONDS` (per-call, default 6).
 
