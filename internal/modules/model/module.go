@@ -2,7 +2,10 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -78,6 +81,10 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 			admin.POST("/models/:key/cancel", m.WorkerCancelDownload)
 			admin.DELETE("/models", m.WorkerDeleteAllModels)
 			admin.DELETE("/models/:key", m.WorkerDeleteModel)
+
+			// ─── Artefactos del worker (videos / imágenes generados) ───
+			admin.GET("/artifacts", m.WorkerListArtifacts)
+			admin.DELETE("/artifacts/:name", m.WorkerDeleteArtifact)
 		}
 	}
 }
@@ -559,6 +566,88 @@ func workerMessage(err error) string {
 		return "inference worker not configured (BM_WORKER_ADDR)"
 	}
 	return err.Error()
+}
+
+// ─── Worker artifacts (list / delete) ─────────────────────────────────
+
+// WorkerArtifact es un archivo generado expuesto por el artifact server del worker.
+type WorkerArtifact struct {
+	Name       string `json:"name"`
+	SizeBytes  int64  `json:"size_bytes"`
+}
+
+// WorkerListArtifacts handles GET /api/v1/worker/artifacts — lista los
+// artefactos (videos/imágenes) disponibles en el artifact server del worker.
+func (m *Module) WorkerListArtifacts(c *gin.Context) {
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, base+"/artifacts", nil)
+	if err != nil {
+		utils.InternalError(c, "build artifact list request: "+err.Error())
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		utils.InternalError(c, "worker artifact server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		utils.InternalError(c, fmt.Sprintf("worker artifact server returned %d", resp.StatusCode))
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		utils.InternalError(c, "read artifact list: "+err.Error())
+		return
+	}
+	var payload struct {
+		Artifacts []WorkerArtifact `json:"artifacts"`
+		Count     int              `json:"count"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		utils.InternalError(c, "parse artifact list: "+err.Error())
+		return
+	}
+	utils.Success(c, payload.Artifacts)
+}
+
+// WorkerDeleteArtifact handles DELETE /api/v1/worker/artifacts/:name — borra
+// un artefacto del artifact server del worker.
+func (m *Module) WorkerDeleteArtifact(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		utils.BadRequest(c, "artifact name is required")
+		return
+	}
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodDelete, base+"/artifacts/"+name, nil)
+	if err != nil {
+		utils.InternalError(c, "build artifact delete request: "+err.Error())
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		utils.InternalError(c, "worker artifact server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		utils.NotFound(c, "artifact not found")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		utils.InternalError(c, fmt.Sprintf("worker artifact server returned %d", resp.StatusCode))
+		return
+	}
+	utils.Success(c, gin.H{"deleted": name, "ok": true})
 }
 
 // workerRPCError maps a worker RPC failure to the HTTP status its gRPC code

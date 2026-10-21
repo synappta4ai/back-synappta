@@ -163,6 +163,7 @@ func main() {
 	// downloaded side of the model catalog is simply absent.
 	model.SetWorkerClient(worker.NewClient())
 	model.SetWorkerAddr(cfg.WorkerAddr)
+	model.SetWorkerArtifactBase(cfg.WorkerArtifactBase)
 	model.SetBridgeSource(wbStore)
 
 	// ─── Router ───────────────────────────────────────────────

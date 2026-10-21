@@ -55,6 +55,21 @@ func workerAddr() string {
 // (agency live model resolution).
 func WorkerAddr() string { return workerAddr() }
 
+// workerArtifactBase holds the configured BM_WORKER_ARTIFACT_BASE (set once at
+// startup). Used to proxy artifact list/delete to the worker's artifact server.
+var workerArtifactBase atomic.Value // string
+
+// SetWorkerArtifactBase stores the artifact base URL.
+func SetWorkerArtifactBase(base string) { workerArtifactBase.Store(base) }
+
+// WorkerArtifactBase returns the configured artifact base ("" if unset).
+func WorkerArtifactBase() string {
+	if v, ok := workerArtifactBase.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
 // workerClientOrNil returns the wired client, or nil.
 func workerClientOrNil() *worker.Client {
 	if v, ok := workerClient.Load().(*worker.Client); ok {
