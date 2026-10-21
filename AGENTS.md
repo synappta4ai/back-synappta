@@ -37,8 +37,9 @@ Key rules when touching this area:
   it to `text`.
 - `inference.proto` + generated code live in `internal/worker/proto`; they
   mirror the canonical contract in the `inference-worker` repo
-  (`proto/inference.proto`). Copy the proto here and regenerate the Go stubs
-  whenever the worker contract changes. (`brain-master`, the legacy gateway +
+  (`proto/inference.proto`, byte-identical). Copy the proto here and
+  regenerate the Go stubs whenever the worker contract changes; the exact
+  commands are in the worker README. (`brain-master`, the legacy gateway +
   old studio, is retired and gone from the workspace.)
 - Config: `BM_WORKER_ADDR` (`host:port`, or `tls://host:port` for cloudflared
   tunnels) and `BM_WORKER_TIMEOUT_SECONDS` (per-call, default 6).
