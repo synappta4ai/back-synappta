@@ -3,7 +3,7 @@
 Backend **Go + Gin** orientado a eventos para generación IA: **eventos → programas → piezas → generaciones**, con generación de **video, imagen, texto y audio** y dos tipos de modelos distinguibles:
 
 - **`api`** — proveedores externos (BytePlus, Gemini, Anthropic) con credenciales por tenant.
-- **`downloaded`** — pesos ejecutados por el **inference worker de brain-master** (Python, gRPC), consultados **en vivo y sin caché**.
+- **`downloaded`** — pesos ejecutados por el **inference worker** (repo `inference-worker`, Python + gRPC), consultados **en vivo y sin caché**.
 
 ## Arquitectura
 
@@ -49,7 +49,7 @@ synapta/
 └── internal/
     ├── db/                    # pgx + pool limits + quote ident
     ├── worker/                # cliente gRPC stateless del inference worker
-    │   └── proto/             # inference.proto + código generado (brain-master)
+    │   └── proto/             # inference.proto + código generado (espejo del worker)
     ├── tenancy/               # registry, middleware, provisioner
     ├── runtime/               # bundle de servicios por tenant
     ├── middleware/            # JWT, rate limit (IP + usuario)
@@ -84,13 +84,13 @@ BM_WORKER_TIMEOUT_SECONDS=6             # timeout por llamada (lecturas siempre 
 BM_WORKER_ARTIFACT_BASE=                # vacío en local; URL del artifact server si el worker es remoto
 ```
 
-Worker local en modo mock (sin GPU, sin descargas — repo brain-master):
+Worker local en modo mock (sin GPU, sin descargas — repo `inference-worker`):
 
 ```bash
-BM_ARTIFACT_PORT=50052 py -3 inference-worker/run_mock.py   # gRPC :50051 + artifacts :50052
+BM_ARTIFACT_PORT=50052 py -3 ../inference-worker/run_mock.py   # gRPC :50051 + artifacts :50052
 ```
 
-Worker remoto (Colab T4 / VM): el worker anuncia su túnel y se usa esa dirección en `BM_WORKER_ADDR` (`tls://…` para cloudflared). Ver `deploy/README.md` de brain-master.
+Worker remoto (Colab T4 / VM): el worker anuncia su túnel y se usa esa dirección en `BM_WORKER_ADDR` (`tls://…` para cloudflared). Ver el README de `inference-worker`.
 
 ### GPU de usuarios (bridge saliente, "Tu GPU")
 

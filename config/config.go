@@ -44,8 +44,9 @@ type Config struct {
 	// SSRF probe into the internal network. Development MinIO needs `true`.
 	StorageAllowPrivateEndpoints bool
 
-	// Inference worker (brain-master Python gRPC server) for downloaded
-	// models. Empty disables the downloaded-model side of the catalog.
+	// Inference worker (inference-worker repo, Python gRPC server) for
+	// downloaded models. Empty disables the downloaded-model side of the
+	// catalog.
 	WorkerAddr           string
 	WorkerTimeoutSeconds int
 

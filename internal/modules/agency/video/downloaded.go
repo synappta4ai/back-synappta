@@ -1,6 +1,6 @@
 // Package agencyvideo: downloaded-model generator.
 //
-// Runs models whose weights live on the brain-master inference worker
+// Runs models whose weights live on the inference worker
 // (type "downloaded" in the model catalog). Unlike the API generators, there
 // is no external provider: Synapta dials the worker directly over gRPC.
 //
@@ -35,8 +35,8 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// streamTimeout bounds a whole generation stream. The worker of brain-master
-// can take a long time for heavy jobs, so this is generous — it only guards
+// streamTimeout bounds a whole generation stream. The inference worker can
+// take a long time for heavy jobs, so this is generous — it only guards
 // against a silently dead worker (no events, no EOF).
 const streamTimeout = 6 * time.Hour
 

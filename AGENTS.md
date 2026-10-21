@@ -15,9 +15,10 @@ The catalog (`internal/modules/model`) has two model types:
 - **`api`** — external provider HTTP APIs (BytePlus, Gemini, Anthropic).
   Defined statically in `catalog.go`; each entry's `Generator` field links it
   to a `PipelineRunner`. To add one, follow `docs/ADDING_A_NEW_VIDEO_MODEL.md`.
-- **`downloaded`** — weights executed by the brain-master inference worker
-  (Python, gRPC). These are **never defined in code**: every read goes live
-  to the worker via the stateless client in `internal/worker` (dial per call,
+- **`downloaded`** — weights executed by the inference worker (Python, gRPC;
+  its own repo, `inference-worker`). These are **never defined in code**:
+  every read goes live to the worker via the stateless client in
+  `internal/worker` (dial per call,
   no cached catalog, no persisted state, no mock data). If the worker is
   unreachable, downloaded models are simply absent from listings — never
   invented.
@@ -37,7 +38,8 @@ Key rules when touching this area:
 - `inference.proto` + generated code live in `internal/worker/proto`; they
   mirror the canonical contract in the `inference-worker` repo
   (`proto/inference.proto`). Copy the proto here and regenerate the Go stubs
-  whenever the worker contract changes. (`brain-master` is retired.)
+  whenever the worker contract changes. (`brain-master`, the legacy gateway +
+  old studio, is retired and gone from the workspace.)
 - Config: `BM_WORKER_ADDR` (`host:port`, or `tls://host:port` for cloudflared
   tunnels) and `BM_WORKER_TIMEOUT_SECONDS` (per-call, default 6).
 

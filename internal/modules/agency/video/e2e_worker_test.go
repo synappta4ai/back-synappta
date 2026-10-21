@@ -1,12 +1,12 @@
 package agencyvideo
 
 // Cross-language end-to-end tests against a REAL Python inference worker
-// (brain-master) instead of the in-process Go fake.
+// (the `inference-worker` repo) instead of the in-process Go fake.
 //
 // Skipped unless BM_E2E_WORKER_ADDR is set. Local run:
 //
-//	py -3 brain-master/inference-worker/run_mock.py      # worker gRPC :50051
-//	BM_ARTIFACT_PORT=50052 py -3 .../run_mock.py         # + artifact server
+//	py -3 ../inference-worker/run_mock.py               # worker gRPC :50051
+//	BM_ARTIFACT_PORT=50052 py -3 ../inference-worker/run_mock.py  # + artifacts
 //	BM_E2E_WORKER_ADDR=127.0.0.1:50051 \
 //	  BM_E2E_ARTIFACT_BASE=http://127.0.0.1:50052 \
 //	  go test ./internal/modules/agency/video/ -run TestE2EWorker -v

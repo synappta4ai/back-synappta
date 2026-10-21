@@ -30,8 +30,8 @@ const (
 
 // ModelType distinguishes how a model is served:
 //   - "api": external provider HTTP API (per-tenant credentials).
-//   - "downloaded": weights executed by the brain-master inference worker
-//     (gRPC). Listed live from the worker; never cached by Synapta.
+//   - "downloaded": weights executed by the inference worker (gRPC). Listed
+//     live from the worker; never cached by Synapta.
 type ModelType string
 
 const (
@@ -95,8 +95,8 @@ type Model struct {
 	WorkerVersion string `json:"worker_version,omitempty"`
 }
 
-// DownloadedModel describes a model whose weights run on the brain-master
-// inference worker. Every field is reported live by the worker's ListModels
+// DownloadedModel describes a model whose weights run on the inference
+// worker. Every field is reported live by the worker's ListModels
 // RPC; Synapta never persists or caches it.
 type DownloadedModel struct {
 	// Mode as the worker reports it: image | video | tts | audio.

@@ -1,7 +1,7 @@
 // Live downloaded-model integration.
 //
-// The brain-master inference worker (Python, gRPC) is the single source of
-// truth for downloaded models. Every read goes live to the worker via
+// The inference worker (Python, gRPC) — its own repo, `inference-worker` — is
+// the single source of truth for downloaded models. Every read goes live to the worker via
 // internal/worker; nothing — catalog, availability, telemetry — is cached,
 // persisted or invented here. If the worker is unreachable, downloaded models
 // simply do not appear (callers can inspect WorkerError).
