@@ -91,6 +91,38 @@ func TestLookupModelPrefersStaticCatalog(t *testing.T) {
 	}
 }
 
+// Un nombre "<proveedor local>/<modelo>" se resuelve sin catálogo estático:
+// el tenant puede levantar cualquier modelo en su Ollama/LM Studio. No consulta
+// al worker ni a las GPUs.
+func TestLookupModelResolvesLocalProviderNames(t *testing.T) {
+	f := &fakeBridgeModels{}
+	c := newBridgeCore(f.resolve)
+
+	got := c.lookupModel("ollama/qwen2.5:7b")
+	if got == nil {
+		t.Fatal("local model not resolved")
+	}
+	if got.CredentialProvider != model.ProviderOllama {
+		t.Errorf("provider = %q", got.CredentialProvider)
+	}
+	if got.Modality != model.ModalityText || got.Generator != "openai-text" {
+		t.Errorf("modality/generator = %q/%q", got.Modality, got.Generator)
+	}
+	if got.Endpoint != "/chat/completions" {
+		t.Errorf("endpoint = %q", got.Endpoint)
+	}
+	if got.BaseURL != model.DefaultLocalBaseURL(model.ProviderOllama) {
+		t.Errorf("base_url = %q", got.BaseURL)
+	}
+	if f.calls != 0 {
+		t.Fatalf("bridge resolver called %d times for a local model", f.calls)
+	}
+
+	if lm := c.lookupModel("lmstudio/qwen2.5-7b-instruct"); lm == nil || lm.CredentialProvider != model.ProviderLMStudio {
+		t.Fatalf("lmstudio model resolved as %+v", lm)
+	}
+}
+
 // Sin bridge (deploy con worker central) el comportamiento no cambia.
 func TestLookupModelWithoutBridgeSource(t *testing.T) {
 	c := NewCore(&config.Config{}, nil, nil, "", "")

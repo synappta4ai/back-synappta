@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"synapta/internal/modules/model"
 	"synapta/internal/utils"
 )
 
@@ -25,11 +26,31 @@ const (
 	// ProviderOpenRouter is the LLM provider used by the agency agent flow
 	// (DCS Agent chat): its key travels per-request, never via .env.
 	ProviderOpenRouter = "openrouter"
+	// ProviderOllama and ProviderLMStudio are the tenant's own OpenAI-
+	// compatible servers. They need no secret: the credential stores the base
+	// URL and their models are discovered live from that server.
+	ProviderOllama   = "ollama"
+	ProviderLMStudio = "lmstudio"
 )
 
 var validProviders = map[string]bool{
 	ProviderBytePlus: true, ProviderGemini: true, ProviderAnthropic: true,
 	ProviderHiggsfield: true, ProviderOpenRouter: true,
+	ProviderOllama: true, ProviderLMStudio: true,
+}
+
+// localProviders are the providers served by a server the tenant runs itself.
+var localProviders = []string{ProviderOllama, ProviderLMStudio}
+
+// IsLocalProvider reports whether the provider is a tenant-run OpenAI-
+// compatible server (no API key, models discovered live).
+func IsLocalProvider(p string) bool {
+	for _, local := range localProviders {
+		if p == local {
+			return true
+		}
+	}
+	return false
 }
 
 // IsValidProvider reports whether the provider name is one of the supported ones.
@@ -197,7 +218,7 @@ func validateKeyFormat(provider, apiKey string) error {
 // Upsert creates or updates the tenant's credential for a provider.
 func (s *Store) Upsert(req *UpsertRequest) (*Credential, error) {
 	if !validProviders[req.Provider] {
-		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic, higgsfield, openrouter)", req.Provider)
+		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic, higgsfield, openrouter, ollama, lmstudio)", req.Provider)
 	}
 
 	// Trim pasted values — stray whitespace/newlines break Authorization headers.
@@ -384,6 +405,7 @@ func (h *Handler) Resolve(provider string) (*Resolve, error) {
 // is listed only when its provider has a stored authentication secret.
 var generationProviders = []string{
 	ProviderBytePlus, ProviderGemini, ProviderAnthropic, ProviderHiggsfield,
+	ProviderOllama, ProviderLMStudio,
 }
 
 // UsableProviders reports which generation providers can actually run.
@@ -394,11 +416,39 @@ func (h *Handler) UsableProviders() (map[string]bool, error) {
 		if err != nil {
 			return nil, err
 		}
-		if res != nil && res.AuthKey() != "" {
+		if res == nil {
+			continue
+		}
+		// Local servers authenticate nothing: the stored credential (even with
+		// an empty key) is what makes them eligible.
+		if res.AuthKey() != "" || IsLocalProvider(provider) {
 			usable[provider] = true
 		}
 	}
 	return usable, nil
+}
+
+// LocalModelEndpoints returns the base URL of every local OpenAI-compatible
+// server this tenant configured, keyed by provider. An empty base_url falls
+// back to the provider's default port. Providers without a credential are
+// omitted, so discovery only ever reads servers the tenant set up.
+func (h *Handler) LocalModelEndpoints() (map[string]string, error) {
+	out := make(map[string]string, len(localProviders))
+	for _, provider := range localProviders {
+		res, err := h.store.Get(provider)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			continue
+		}
+		base := strings.TrimRight(strings.TrimSpace(res.BaseURL), "/")
+		if base == "" {
+			base = model.DefaultLocalBaseURL(model.CredentialProvider(provider))
+		}
+		out[provider] = base
+	}
+	return out, nil
 }
 
 // List handles GET /credentials

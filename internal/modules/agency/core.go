@@ -155,7 +155,9 @@ func (s *Core) resolveProvider(m *modelRef) (*credential.Resolve, error) {
 	if res == nil {
 		return nil, fmt.Errorf("no credentials configured for provider %q — add them in admin → tenants → gestionar", m.CredentialProvider)
 	}
-	if res.AuthKey() == "" {
+	// Local servers (Ollama, LM Studio) authenticate nothing: their
+	// credential only stores the base URL.
+	if res.AuthKey() == "" && !model.IsLocalProvider(m.CredentialProvider) {
 		return nil, fmt.Errorf("provider %q has no credentials for generation — add an API key or Key ID + Key Secret in admin → tenants → gestionar", m.CredentialProvider)
 	}
 	return res, nil
@@ -1324,6 +1326,8 @@ func defaultBaseURLFor(p string) string {
 		return "https://generativelanguage.googleapis.com/v1beta"
 	case "anthropic":
 		return "https://api.anthropic.com/v1"
+	case "ollama", "lmstudio":
+		return model.DefaultLocalBaseURL(model.CredentialProvider(p))
 	default:
 		return ""
 	}
@@ -1338,6 +1342,8 @@ func defaultEndpointFor(p string) string {
 		return ""
 	case "anthropic":
 		return "/messages"
+	case "ollama", "lmstudio":
+		return "/chat/completions"
 	default:
 		return ""
 	}

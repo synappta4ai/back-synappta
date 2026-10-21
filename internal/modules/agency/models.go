@@ -42,6 +42,22 @@ func LookupModel(name string) *modelEntry {
 		}
 	}
 
+	// Local OpenAI-compatible providers (Ollama, LM Studio): the name is
+	// "<provider>/<model id>", so every model the tenant's server reports
+	// resolves without a static catalog entry. The credential's base_url wins
+	// in resolveRoute; the default port is the fallback.
+	if provider, id, ok := model.ParseLocalModel(name); ok {
+		return &modelEntry{
+			Name:               model.LocalModelName(provider, id),
+			CredentialProvider: provider,
+			Modality:           model.ModalityText,
+			Generator:          "openai-text",
+			BaseURL:            model.DefaultLocalBaseURL(provider),
+			Endpoint:           "/chat/completions",
+			Type:               model.TypeAPI,
+		}
+	}
+
 	// Downloaded models: ask the worker live (no cache, no local copy).
 	addr := model.WorkerAddr()
 	c := model.WorkerClient()

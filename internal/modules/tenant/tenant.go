@@ -3,11 +3,13 @@
 package tenant
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -129,6 +131,10 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 	}
 
 	configured := map[string]bool{}
+	// localEndpoints holds the base URL of every local OpenAI-compatible
+	// server the tenant configured: their models are not in the static
+	// catalog and have to be read live, same as the public listing.
+	localEndpoints := map[string]string{}
 	if pool, err := s.reg.Pool(t.Slug); err == nil {
 		rows, err := pool.Query(`SELECT DISTINCT provider FROM credentials`)
 		if err == nil {
@@ -140,6 +146,14 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 			}
 			rows.Close()
 		}
+		for _, provider := range []string{credential.ProviderOllama, credential.ProviderLMStudio} {
+			var baseURL string
+			err := pool.QueryRow(`SELECT COALESCE(base_url,'') FROM credentials WHERE provider = $1`, provider).Scan(&baseURL)
+			if err != nil {
+				continue // no credential for this provider
+			}
+			localEndpoints[provider] = baseURL
+		}
 		// A missing/failing read only means "nothing configured".
 	}
 
@@ -150,6 +164,18 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 			Model:                m,
 			CredentialConfigured: configured[string(m.CredentialProvider)],
 		})
+	}
+	// Local models: whatever the tenant's servers report right now. A stopped
+	// server contributes nothing, so the admin view never invents entries.
+	for provider, baseURL := range localEndpoints {
+		discovered, derr := model.DiscoverLocalModels(context.Background(), model.CredentialProvider(provider), baseURL)
+		if derr != nil {
+			log.Printf("[tenant] local catalog %s unavailable: %v", provider, derr)
+			continue
+		}
+		for _, m := range discovered {
+			out = append(out, TenantModelView{Model: m, CredentialConfigured: true})
+		}
 	}
 	return out, nil
 }

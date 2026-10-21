@@ -24,6 +24,15 @@ type CredentialLister interface {
 	UsableProviders() (map[string]bool, error)
 }
 
+// LocalModelLister is the optional credential capability the catalog uses to
+// reach the tenant's own OpenAI-compatible servers (Ollama, LM Studio). Their
+// models are not in the static catalog: they are discovered live from each
+// server. Handlers that cannot discover anything simply don't implement it.
+type LocalModelLister interface {
+	// LocalModelEndpoints maps each configured local provider to its base URL.
+	LocalModelEndpoints() (map[string]string, error)
+}
+
 // CredentialResolver supplies the tenant-scoped credential lister. It returns
 // false when the request has no tenant bundle, in which case listings fail
 // closed instead of silently offering models the tenant cannot run.
@@ -380,7 +389,52 @@ func (m *Module) usableAPIModels(c *gin.Context, modality Modality) ([]Model, bo
 		utils.InternalError(c, err.Error())
 		return nil, true
 	}
-	return FilterAPIByCredentials(List(modality), usable), false
+	models := FilterAPIByCredentials(List(modality), usable)
+	// Local providers (Ollama, LM Studio) serve models the static catalog
+	// cannot enumerate: discover them live from each configured server.
+	if modality == "" || modality == ModalityText {
+		models = append(models, m.localModels(c)...)
+	}
+	return models, false
+}
+
+// localModels returns the models the tenant's local OpenAI-compatible servers
+// report right now. It never fails the listing: a server that is stopped or
+// slow contributes no entries (and no invented ones), matching how an
+// unreachable inference worker degrades the downloaded catalog.
+func (m *Module) localModels(c *gin.Context) []Model {
+	if m.resolve == nil {
+		return nil
+	}
+	lister, ok := m.resolve(c)
+	if !ok || lister == nil {
+		return nil
+	}
+	source, ok := lister.(LocalModelLister)
+	if !ok {
+		return nil
+	}
+	endpoints, err := source.LocalModelEndpoints()
+	if err != nil {
+		log.Printf("[model] local provider endpoints: %v", err)
+		return nil
+	}
+	out := make([]Model, 0, len(endpoints))
+	for provider, baseURL := range endpoints {
+		models, derr := DiscoverLocalModels(c.Request.Context(), CredentialProvider(provider), baseURL)
+		if derr != nil {
+			log.Printf("[model] local catalog %s unavailable: %v", provider, derr)
+			continue
+		}
+		out = append(out, models...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CredentialProvider != out[j].CredentialProvider {
+			return out[i].CredentialProvider < out[j].CredentialProvider
+		}
+		return out[i].DisplayName < out[j].DisplayName
+	})
+	return out
 }
 
 // usableProviders resolves the tenant credential lister and reports which

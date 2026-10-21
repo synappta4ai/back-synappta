@@ -337,6 +337,10 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
+	// Local LLM servers the tenant runs (Ollama, LM Studio): names are
+	// "<provider>/<model id>", discovered live from /v1/models. Registered
+	// before the downloaded generator, which claims any unknown name.
+	core.RegisterGenerator(agencytext.NewOpenAITextGenerator())
 	// Image Higgsfield FIRST: its Match is narrow (soul/ideogram/recraft) while
 	// the video one claims any "higgsfield-*", so registering video first would
 	// shadow the image models (Soul 2 et al.) and route them to the video
