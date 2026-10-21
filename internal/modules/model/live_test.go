@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -285,7 +286,11 @@ func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
 	}
 }
 
-func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
+// El worker es opcional: sin worker central y sin GPUs emparejadas la vista de
+// gestión responde 200 con la lista vacía. Un 500 acá rompía el panel de un
+// deploy donde el worker todavía no está instalado, y no hay forma de que el
+// usuario lo arregle desde esa pantalla.
+func TestWorkerModelsDegradesWithoutAnySource(t *testing.T) {
 	m := NewModule(allUsableResolver())
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
@@ -294,11 +299,14 @@ func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
 	withTenant(c, 7)
 	m.WorkerModels(c)
 	env, code := decode(t, w)
-	if code != http.StatusInternalServerError || env.Success {
+	if code != http.StatusOK || !env.Success {
 		t.Fatalf("status=%d body=%s", code, w.Body.String())
 	}
-	if !strings.Contains(env.Message, "inference worker unavailable") {
-		t.Fatalf("message=%q", env.Message)
+	if len(env.Data) != 0 {
+		t.Fatalf("expected an empty catalog, got %+v", env.Data)
+	}
+	if got := w.Header().Get("X-Worker-Source"); got != "central" {
+		t.Fatalf("X-Worker-Source=%q, want central (no bridge snapshots)", got)
 	}
 }
 
@@ -557,9 +565,10 @@ func TestListByModalityIncludesBridgeModel(t *testing.T) {
 	}
 }
 
-// Sin ninguna fuente viva, type=downloaded sigue respondiendo 500 (no un
-// listado vacío silencioso): el caller pidió explícitamente esa fuente.
-func TestListTypeDownloaded500WithoutAnySource(t *testing.T) {
+// Sin ninguna fuente viva, type=downloaded responde 200 con catálogo vacío: el
+// worker es opcional y pedir explícitamente esa fuente no cambia la regla. El
+// filtro sigue siendo útil (nunca inventa modelos ni los mezcla con los api).
+func TestListTypeDownloadedDegradesWithoutAnySource(t *testing.T) {
 	m := NewModule(allUsableResolver())
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
@@ -567,8 +576,12 @@ func TestListTypeDownloaded500WithoutAnySource(t *testing.T) {
 	c, w := testCtx(t, "/api/v1/models?type=downloaded")
 	withTenant(c, 7)
 	m.List(c)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	if len(env.Data) != 0 {
+		t.Fatalf("expected no downloaded models, got %+v", env.Data)
 	}
 }
 
@@ -908,17 +921,35 @@ func TestWorkerWriteRejectsUnconfiguredWorker(t *testing.T) {
 	}
 }
 
-func TestContextCancellationPropagates(t *testing.T) {
+// Un contexto ya cancelado no cuelga el handler ni se disfraza de catálogo:
+// la lectura al worker muere rápido y degrada a lista vacía, igual que un
+// worker apagado. El status sigue siendo 200 porque el cliente que canceló ya
+// no está escuchando y el worker es opcional.
+func TestCancelledContextDegradesInsteadOfHanging(t *testing.T) {
 	m, _ := setup(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already dead: the live read must fail, not hang
+	cancel() // already dead: the live read must return, not hang
 
 	c, w := testCtx(t, "/api/v1/models?type=downloaded")
 	c.Request = c.Request.WithContext(ctx)
-	m.List(c)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("cancelled context: status=%d body=%s", w.Code, w.Body.String())
+	done := make(chan struct{})
+	go func() {
+		m.List(c)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler hung on a cancelled context")
+	}
+
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("cancelled context: status=%d body=%s", code, w.Body.String())
+	}
+	if len(env.Data) != 0 {
+		t.Fatalf("cancelled context produced models: %+v", env.Data)
 	}
 }

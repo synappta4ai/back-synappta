@@ -163,7 +163,7 @@
       "get": {
         "tags": ["Models"],
         "summary": "List usable models (API + live downloaded)",
-        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. A dead worker degrades to API-only (header X-Worker-Status: unreachable). Nothing is cached.",
+        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. The inference worker is optional: a dead worker degrades to API-only (header X-Worker-Status: unreachable) and, with type=downloaded, to an empty list with 200 — never a 5xx, because no worker is a valid deployment state. Nothing is cached.",
         "operationId": "listModels",
         "parameters": [
           { "name": "modality", "in": "query", "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },

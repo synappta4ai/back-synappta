@@ -124,7 +124,7 @@ func (m *Module) List(c *gin.Context) {
 	if handled {
 		return
 	}
-	live, _ := m.liveUsable(c)
+	live := m.liveUsable(c)
 	models = append(models, filterByModalityOrAll(live, modality)...)
 	utils.Success(c, models)
 }
@@ -155,7 +155,7 @@ func (m *Module) ListByModality(c *gin.Context) {
 	if handled {
 		return
 	}
-	live, _ := m.liveUsable(c)
+	live := m.liveUsable(c)
 	models = append(models, filterByModalityOrAll(live, modality)...)
 	utils.Success(c, models)
 }
@@ -164,9 +164,14 @@ func (m *Module) ListByModality(c *gin.Context) {
 // from the two dispatch paths: the back's own worker (live gRPC over
 // BM_WORKER_ADDR) and the GPUs the tenant paired through the bridge. Both
 // reads are live and uncached; whichever side fails contributes nothing.
-// The worker is optional: if it is unreachable, the downloaded catalog is
-// simply empty rather than breaking the listing for every other model.
-func (m *Module) liveUsable(c *gin.Context) ([]Model, error) {
+//
+// The worker is optional, so this never fails the request: an unreachable
+// worker (or a cancelled request) simply means an empty downloaded catalog,
+// and the failure is logged. Callers that list API models keep serving them,
+// and a caller that asked only for downloaded models gets 200 with zero
+// entries — the panel shows "nothing configured" instead of an error it
+// cannot act on.
+func (m *Module) liveUsable(c *gin.Context) []Model {
 	ctx := c.Request.Context()
 	central, cerr := ListUsable(ctx, workerAddr())
 	var bridge []Model
@@ -182,7 +187,7 @@ func (m *Module) liveUsable(c *gin.Context) ([]Model, error) {
 	if cerr != nil {
 		logWorkerError(c, cerr)
 	}
-	return models, nil
+	return models
 }
 
 // mergeByName concatenates catalogs keeping one entry per model name (first
@@ -371,12 +376,11 @@ func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Mode
 		return models, false
 	}
 	// "downloaded" is the union of both dispatch paths (central worker +
-	// paired GPUs). Failing the request is only honest when neither could
-	// answer; an empty catalog from a reachable source is a valid answer.
-	models, err := m.liveUsable(c)
-	if err != nil {
-		models = nil
-	}
+	// paired GPUs). The worker is optional: an unreachable one (or a dead
+	// request context) yields an empty catalog, not a 500 — the listing is
+	// still a truthful answer, and failing here would break the panel for a
+	// deployment that simply has no worker yet.
+	models := m.liveUsable(c)
 	return filterByModalityOrAll(models, modality), false
 }
 
