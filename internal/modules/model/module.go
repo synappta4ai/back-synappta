@@ -163,14 +163,9 @@ func (m *Module) ListByModality(c *gin.Context) {
 // liveUsable returns the downloaded models a tenant can run right now, merged
 // from the two dispatch paths: the back's own worker (live gRPC over
 // BM_WORKER_ADDR) and the GPUs the tenant paired through the bridge. Both
-// reads are live and uncached; whichever side fails contributes nothing and
-// its error is returned so a caller listing ONLY downloaded models can still
-// answer 500 when the catalog could not be read at all. A bridge-only tenant
-// therefore gets its GPU catalog, and a central-only tenant is unaffected.
-//
-// The first error is the central worker's; bridge failures are logged (and
-// reported only when the central answered) because an unwired snapshot
-// source is the normal state on central-only deployments.
+// reads are live and uncached; whichever side fails contributes nothing.
+// The worker is optional: if it is unreachable, the downloaded catalog is
+// simply empty rather than breaking the listing for every other model.
 func (m *Module) liveUsable(c *gin.Context) ([]Model, error) {
 	ctx := c.Request.Context()
 	central, cerr := ListUsable(ctx, workerAddr())
@@ -184,11 +179,8 @@ func (m *Module) liveUsable(c *gin.Context) ([]Model, error) {
 		}
 	}
 	models := mergeByName(central, bridge)
-	// Only complain about the central worker when it actually cost us
-	// entries: with GPUs serving the same catalog the listing is intact.
-	if cerr != nil && len(bridge) == 0 {
+	if cerr != nil {
 		logWorkerError(c, cerr)
-		return models, cerr
 	}
 	return models, nil
 }
@@ -272,7 +264,9 @@ func (m *Module) WorkerModels(c *gin.Context) {
 				return
 			}
 		}
-		utils.InternalError(c, workerMessage(err))
+		log.Printf("[model] worker/models: worker unreachable, returning empty list: %v", err)
+		c.Header(WorkerSourceHeader, "central")
+		utils.Success(c, []Model{})
 		return
 	}
 	c.Header(WorkerSourceHeader, "central")
@@ -380,9 +374,8 @@ func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Mode
 	// paired GPUs). Failing the request is only honest when neither could
 	// answer; an empty catalog from a reachable source is a valid answer.
 	models, err := m.liveUsable(c)
-	if err != nil && len(models) == 0 {
-		utils.InternalError(c, workerMessage(err))
-		return nil, true
+	if err != nil {
+		models = nil
 	}
 	return filterByModalityOrAll(models, modality), false
 }
