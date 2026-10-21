@@ -341,6 +341,12 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	// "<provider>/<model id>", discovered live from /v1/models. Registered
 	// before the downloaded generator, which claims any unknown name.
 	core.RegisterGenerator(agencytext.NewOpenAITextGenerator())
+	// Hosted inference clouds the tenant pays for itself: the OpenAI-compatible
+	// images route (Together, DeepInfra, OpenRouter) and RunPod serverless
+	// endpoints. Both match only "<provider>/…" names, so the curated catalog
+	// keeps its own generators.
+	core.RegisterGenerator(agencyimage.NewOpenAIImageGenerator())
+	core.RegisterGenerator(agencyimage.NewRunPodGenerator())
 	// Image Higgsfield FIRST: its Match is narrow (soul/ideogram/recraft) while
 	// the video one claims any "higgsfield-*", so registering video first would
 	// shadow the image models (Soul 2 et al.) and route them to the video

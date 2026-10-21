@@ -162,6 +162,7 @@ GET  /outputs/*                             # estático: imágenes/videos genera
 ```
 
 Almacenamiento de binarios (biblioteca vs generados, con y sin bucket): [docs/ALMACENAMIENTO_ASSETS.md](docs/ALMACENAMIENTO_ASSETS.md).
+Inference providers hospedados (RunPod, Together, DeepInfra, OpenRouter, …): [docs/INFERENCE_PROVIDERS.md](docs/INFERENCE_PROVIDERS.md).
 
 ### Forma de un modelo en la API
 

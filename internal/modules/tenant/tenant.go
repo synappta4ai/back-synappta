@@ -177,6 +177,18 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 			out = append(out, TenantModelView{Model: m, CredentialConfigured: true})
 		}
 	}
+	// Hosted inference clouds: the admin view lists the same discovered models
+	// the public catalog offers, so the panel can show the credential as
+	// configured and let ops pick a model that actually runs.
+	if store, err := s.credentialStore(t); err != nil {
+		log.Printf("[tenant] credential store for %q: %v", t.Slug, err)
+	} else if endpoints, err := store.InferenceEndpoints(); err != nil {
+		log.Printf("[tenant] inference endpoints for %q: %v", t.Slug, err)
+	} else {
+		for _, m := range model.DiscoverAllInferenceModels(context.Background(), endpoints) {
+			out = append(out, TenantModelView{Model: m, CredentialConfigured: true})
+		}
+	}
 	return out, nil
 }
 

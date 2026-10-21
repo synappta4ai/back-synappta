@@ -1,10 +1,14 @@
 // OpenAI-compatible text generator.
 //
-// Serves the tenant's own local LLM servers — Ollama (default :11434/v1) and
-// LM Studio (default :1234/v1), plus any OpenAI-compatible endpoint the tenant
-// points a local credential at. Generation is synchronous and costs nothing:
-// the compute runs on the tenant's machine, so no cost calculator reports
-// spend for these models.
+// Serves two kinds of OpenAI-compatible text backends:
+//   - the tenant's own local LLM servers — Ollama (default :11434/v1) and
+//     LM Studio (default :1234/v1), named "ollama/<model>" / "lmstudio/<model>";
+//   - the hosted inference clouds (Together, DeepInfra, GMI, Baseten, Vultr,
+//     DigitalOcean, CoreWeave, OpenRouter), named "<provider>/<model>".
+//
+// Generation is synchronous. Local servers cost nothing (the compute runs on
+// the tenant's machine) and hosted providers bill the tenant directly, so no
+// cost calculator reports spend for these models.
 package agencytext
 
 import (
@@ -46,12 +50,29 @@ func (g *OpenAITextGenerator) Name() string { return openAITextGeneratorName }
 // ContentType returns "text".
 func (g *OpenAITextGenerator) ContentType() string { return "text" }
 
-// Match reports whether the model name is served by a local provider
-// ("ollama/…" or "lmstudio/…"). Prefix matching is what routes the request:
-// the pipeline only hands generators a name, not a provider.
+// Match reports whether the model is a text model on an OpenAI-compatible
+// backend: a local server or a hosted inference provider. Prefix matching is
+// what routes the request: the pipeline only hands generators a name, not a
+// provider.
 func (g *OpenAITextGenerator) Match(modelName string) bool {
-	_, _, ok := model.ParseLocalModel(modelName)
+	if _, _, ok := model.ParseLocalModel(modelName); ok {
+		return true
+	}
+	_, _, ok := inferenceTextModel(modelName)
 	return ok
+}
+
+// inferenceTextModel resolves "<provider>/<model>" when the provider is a
+// hosted cloud and the id classifies as a text model.
+func inferenceTextModel(name string) (model.CredentialProvider, string, bool) {
+	provider, id, ok := model.ParseInferenceModel(name)
+	if !ok || model.IsEndpointScopedProvider(provider) {
+		return "", "", false
+	}
+	if model.ClassifyInferenceModel(id) != model.ModalityText {
+		return "", "", false
+	}
+	return provider, id, true
 }
 
 // Validate checks the request against text-generation constraints.
@@ -60,8 +81,10 @@ func (g *OpenAITextGenerator) Validate(req *agency.GeneratorRequest) error {
 	if errs.HasErrors() {
 		return errs
 	}
-	if _, _, ok := model.ParseLocalModel(req.Model); !ok {
-		errs.Add("model", "is not a local model (expected ollama/<model> or lmstudio/<model>)")
+	if _, _, local := model.ParseLocalModel(req.Model); !local {
+		if _, _, ok := inferenceTextModel(req.Model); !ok {
+			errs.Add("model", "is not a text model on an OpenAI-compatible provider (expected <provider>/<model>)")
+		}
 	}
 	if req.Resolution != "" {
 		errs.Add("resolution", "text generation does not support resolution overrides")
@@ -88,6 +111,9 @@ func (g *OpenAITextGenerator) Validate(req *agency.GeneratorRequest) error {
 // The provider prefix is stripped: the server only knows the bare model id.
 func (g *OpenAITextGenerator) BuildPayload(req *agency.GeneratorRequest) map[string]interface{} {
 	_, modelID, _ := model.ParseLocalModel(req.Model)
+	if modelID == "" {
+		_, modelID, _ = inferenceTextModel(req.Model)
+	}
 	if modelID == "" {
 		modelID = req.Model
 	}
@@ -116,7 +142,7 @@ func (g *OpenAITextGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 	// LM Studio serve the OpenAI routes only under /v1.
 	base := model.NormalizeLocalBaseURL(req.BaseURL)
 	if base == "" {
-		return nil, fmt.Errorf("local text provider %q has no base URL configured", req.Model)
+		return nil, fmt.Errorf("text provider %q has no base URL configured", req.Model)
 	}
 	path := req.Endpoint
 	if strings.TrimSpace(path) == "" {

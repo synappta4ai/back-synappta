@@ -58,6 +58,43 @@ func LookupModel(name string) *modelEntry {
 		}
 	}
 
+	// Hosted inference clouds (RunPod, Together, DeepInfra, …): the name is
+	// "<provider>/<model id>", so any model the tenant's key reaches resolves
+	// without a static catalog entry. The modality is classified from the
+	// model id, exactly like the live catalog does, so routing and listing
+	// never disagree.
+	if provider, id, ok := model.ParseInferenceModel(name); ok {
+		modality := model.ClassifyInferenceModel(id)
+		generator := model.GeneratorOpenAIText
+		endpoint := "/chat/completions"
+		switch {
+		case model.IsEndpointScopedProvider(provider):
+			// RunPod: one serverless endpoint per model, always an image
+			// worker (the modality its queue API is commonly used for).
+			modality = model.ModalityImage
+			generator = model.GeneratorRunPod
+			endpoint = "/v2/" + id
+		case modality == model.ModalityImage:
+			if path := model.InferenceImagePath(provider); path != "" {
+				generator = model.GeneratorOpenAIImage
+				endpoint = path
+			} else {
+				// The provider has no OpenAI-compatible image route:
+				// treat the id as text instead of failing on submit.
+				modality = model.ModalityText
+			}
+		}
+		return &modelEntry{
+			Name:               model.InferenceModelName(provider, id),
+			CredentialProvider: provider,
+			Modality:           modality,
+			Generator:          generator,
+			BaseURL:            model.InferenceProviderBaseURL(provider),
+			Endpoint:           endpoint,
+			Type:               model.TypeAPI,
+		}
+	}
+
 	// Downloaded models: ask the worker live (no cache, no local copy).
 	addr := model.WorkerAddr()
 	c := model.WorkerClient()

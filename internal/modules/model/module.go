@@ -36,6 +36,14 @@ type LocalModelLister interface {
 	LocalModelEndpoints() (map[string]string, error)
 }
 
+// InferenceModelLister is the optional credential capability the catalog uses
+// to list the models a hosted inference cloud (RunPod, Together, DeepInfra,
+// …) serves for this tenant. Like the local servers, nothing is cached and an
+// unreachable provider contributes no entries.
+type InferenceModelLister interface {
+	InferenceEndpoints() ([]InferenceEndpoint, error)
+}
+
 // CredentialResolver supplies the tenant-scoped credential lister. It returns
 // false when the request has no tenant bundle, in which case listings fail
 // closed instead of silently offering models the tenant cannot run.
@@ -399,6 +407,9 @@ func (m *Module) usableAPIModels(c *gin.Context, modality Modality) ([]Model, bo
 	if modality == "" || modality == ModalityText {
 		models = append(models, m.localModels(c)...)
 	}
+	// Hosted inference clouds (RunPod, Together, DeepInfra, …) list only the
+	// models this tenant's key can reach: discover them live per provider.
+	models = append(models, m.inferenceModels(c, modality)...)
 	return models, false
 }
 
@@ -438,6 +449,39 @@ func (m *Module) localModels(c *gin.Context) []Model {
 		}
 		return out[i].DisplayName < out[j].DisplayName
 	})
+	return out
+}
+
+// inferenceModels returns the hosted inference models the tenant can run
+// right now, filtered by modality. A provider that is down, slow or has no
+// key contributes nothing (and reports the failure in the log), matching how
+// unreachable local servers and workers degrade the catalog.
+func (m *Module) inferenceModels(c *gin.Context, modality Modality) []Model {
+	if m.resolve == nil {
+		return nil
+	}
+	lister, ok := m.resolve(c)
+	if !ok || lister == nil {
+		return nil
+	}
+	source, ok := lister.(InferenceModelLister)
+	if !ok {
+		return nil
+	}
+	endpoints, err := source.InferenceEndpoints()
+	if err != nil {
+		log.Printf("[model] inference provider endpoints: %v", err)
+		return nil
+	}
+	// Discovery is concurrent and degrades per provider, so one slow cloud
+	// costs a single timeout instead of one per provider.
+	discovered := DiscoverAllInferenceModels(c.Request.Context(), endpoints)
+	out := make([]Model, 0, len(discovered))
+	for _, m := range discovered {
+		if modality == "" || m.Modality == modality {
+			out = append(out, m)
+		}
+	}
 	return out
 }
 
@@ -569,8 +613,8 @@ func workerMessage(err error) string {
 
 // WorkerArtifact es un archivo generado expuesto por el artifact server del worker.
 type WorkerArtifact struct {
-	Name       string `json:"name"`
-	SizeBytes  int64  `json:"size_bytes"`
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 // WorkerListArtifacts handles GET /api/v1/worker/artifacts — lista los

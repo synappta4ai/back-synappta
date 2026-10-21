@@ -5,6 +5,7 @@ package credential
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,12 +32,26 @@ const (
 	// URL and their models are discovered live from that server.
 	ProviderOllama   = "ollama"
 	ProviderLMStudio = "lmstudio"
+	// Hosted inference clouds: the tenant brings its own key and the catalog
+	// lists whatever GET {base_url}/models answers. RunPod is a serverless
+	// endpoint per model, addressed as "runpod/<endpoint-id>".
+	ProviderRunPod       = string(model.ProviderRunPod)
+	ProviderTogether     = string(model.ProviderTogether)
+	ProviderDeepInfra    = string(model.ProviderDeepInfra)
+	ProviderGMI          = string(model.ProviderGMI)
+	ProviderBaseten      = string(model.ProviderBaseten)
+	ProviderVultr        = string(model.ProviderVultr)
+	ProviderDigitalOcean = string(model.ProviderDigitalOcean)
+	ProviderCoreWeave    = string(model.ProviderCoreWeave)
 )
 
 var validProviders = map[string]bool{
 	ProviderBytePlus: true, ProviderGemini: true, ProviderAnthropic: true,
 	ProviderHiggsfield: true, ProviderOpenRouter: true,
 	ProviderOllama: true, ProviderLMStudio: true,
+	ProviderRunPod: true, ProviderTogether: true, ProviderDeepInfra: true,
+	ProviderGMI: true, ProviderBaseten: true, ProviderVultr: true,
+	ProviderDigitalOcean: true, ProviderCoreWeave: true,
 }
 
 // localProviders are the providers served by a server the tenant runs itself.
@@ -218,7 +233,7 @@ func validateKeyFormat(provider, apiKey string) error {
 // Upsert creates or updates the tenant's credential for a provider.
 func (s *Store) Upsert(req *UpsertRequest) (*Credential, error) {
 	if !validProviders[req.Provider] {
-		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic, higgsfield, openrouter, ollama, lmstudio)", req.Provider)
+		return nil, fmt.Errorf("invalid provider %q (valid: byteplus, gemini, anthropic, higgsfield, openrouter, ollama, lmstudio, runpod, together, deepinfra, gmi, baseten, vultr, digitalocean, coreweave)", req.Provider)
 	}
 
 	// Trim pasted values — stray whitespace/newlines break Authorization headers.
@@ -403,9 +418,15 @@ func (h *Handler) Resolve(provider string) (*Resolve, error) {
 
 // generationProviders are the catalog API providers shown in /models: a model
 // is listed only when its provider has a stored authentication secret.
+//
+// The hosted inference clouds are included so their live-discovered models
+// pass the same credential filter as the curated catalog.
 var generationProviders = []string{
 	ProviderBytePlus, ProviderGemini, ProviderAnthropic, ProviderHiggsfield,
 	ProviderOllama, ProviderLMStudio,
+	ProviderRunPod, ProviderTogether, ProviderDeepInfra, ProviderGMI,
+	ProviderBaseten, ProviderVultr, ProviderDigitalOcean, ProviderCoreWeave,
+	ProviderOpenRouter,
 }
 
 // UsableProviders reports which generation providers can actually run.
@@ -426,6 +447,51 @@ func (h *Handler) UsableProviders() (map[string]bool, error) {
 		}
 	}
 	return usable, nil
+}
+
+// InferenceEndpoints returns the hosted inference providers this tenant
+// configured, with the decrypted key the live catalog needs to list their
+// models. Providers without a key are omitted: discovery must never call a
+// provider the tenant cannot use.
+func (s *Store) InferenceEndpoints() ([]model.InferenceEndpoint, error) {
+	out := make([]model.InferenceEndpoint, 0)
+	for _, provider := range model.InferenceProviderNames() {
+		res, err := s.Get(provider)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil || res.AuthKey() == "" {
+			continue
+		}
+		out = append(out, model.InferenceEndpoint{
+			Provider:   provider,
+			BaseURL:    res.BaseURL,
+			APIKey:     res.APIKey,
+			EndpointID: endpointIDFromExtra(provider, res.Extra),
+		})
+	}
+	return out, nil
+}
+
+// InferenceEndpoints exposes the store capability on the HTTP handler (the
+// model module resolves tenants through it).
+func (h *Handler) InferenceEndpoints() ([]model.InferenceEndpoint, error) {
+	return h.store.InferenceEndpoints()
+}
+
+// endpointIDFromExtra reads the RunPod serverless endpoint id saved in the
+// credential's extra JSON. Other providers have no endpoint id.
+func endpointIDFromExtra(provider, extra string) string {
+	if provider != ProviderRunPod || strings.TrimSpace(extra) == "" {
+		return ""
+	}
+	var parsed struct {
+		EndpointID string `json:"endpoint_id"`
+	}
+	if err := json.Unmarshal([]byte(extra), &parsed); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.EndpointID)
 }
 
 // LocalModelEndpoints returns the base URL of every local OpenAI-compatible

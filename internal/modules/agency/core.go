@@ -255,23 +255,23 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			taskID = "<no-task>"
 		}
 		logEntry := &GenerationLog{
-			TaskID:           taskID,
-			ModelName:        modelName,
-			UserID:           intPtrOrNil(req.UserID),
-			EventID:          req.EventID,
-			ProgramID:        req.ProgramID,
-			PieceID:          req.PieceID,
-			PieceCode:        req.PieceCode,
-			GenerationNumber: req.GenerationNumber,
-			Request:          string(reqBytes),
-			Outputs:          outputs,
-			Status:           status,
-			ErrorMessage:     errLog,
-			ResourceType:     req.ResourceType,
-			ContentTypes:     extractContentTypes(req.Content),
-			EstimatedCost:    estimatedCost,
-			CostSource:       costSource,
-			CostCredits:      costCredits,
+			TaskID:                taskID,
+			ModelName:             modelName,
+			UserID:                intPtrOrNil(req.UserID),
+			EventID:               req.EventID,
+			ProgramID:             req.ProgramID,
+			PieceID:               req.PieceID,
+			PieceCode:             req.PieceCode,
+			GenerationNumber:      req.GenerationNumber,
+			Request:               string(reqBytes),
+			Outputs:               outputs,
+			Status:                status,
+			ErrorMessage:          errLog,
+			ResourceType:          req.ResourceType,
+			ContentTypes:          extractContentTypes(req.Content),
+			EstimatedCost:         estimatedCost,
+			CostSource:            costSource,
+			CostCredits:           costCredits,
 			ProviderTransactionID: providerTxID,
 		}
 		if saveErr := s.logStore.Create(logEntry); saveErr != nil {
@@ -1329,7 +1329,9 @@ func defaultBaseURLFor(p string) string {
 	case "ollama", "lmstudio":
 		return model.DefaultLocalBaseURL(model.CredentialProvider(p))
 	default:
-		return ""
+		// Hosted inference clouds (RunPod, Together, DeepInfra, …) carry
+		// their API root in the model registry.
+		return model.InferenceProviderBaseURL(model.CredentialProvider(p))
 	}
 }
 
@@ -1345,6 +1347,11 @@ func defaultEndpointFor(p string) string {
 	case "ollama", "lmstudio":
 		return "/chat/completions"
 	default:
+		// RunPod needs the endpoint id (carried by the model entry itself),
+		// so there is no provider-wide route to default to.
+		if model.InferenceProviderBaseURL(model.CredentialProvider(p)) != "" {
+			return "/chat/completions"
+		}
 		return ""
 	}
 }
