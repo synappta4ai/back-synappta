@@ -221,7 +221,7 @@ func main() {
 			return nil, false
 		}
 		return hdl, true
-	}))
+	}, cfg.OutputsDir))
 
 	// Tenant-scoped modules resolve their handler per request.
 	registry.Register(event.NewModule(manager.EventsFor))

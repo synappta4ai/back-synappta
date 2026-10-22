@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -64,10 +67,13 @@ type CredentialResolver func(c *gin.Context) (CredentialLister, bool)
 // unavailable entries, download progress and on-disk size) with download,
 // cancel and delete operations.
 type Module struct {
-	resolve CredentialResolver
+	resolve     CredentialResolver
+	outputsDir  string // carpeta donde se guarda el payload del worker para auto-update
 }
 
-func NewModule(resolve CredentialResolver) *Module { return &Module{resolve: resolve} }
+func NewModule(resolve CredentialResolver, outputsDir string) *Module {
+	return &Module{resolve: resolve, outputsDir: outputsDir}
+}
 
 func (m *Module) Name() string { return "models" }
 
@@ -95,6 +101,10 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 			// ─── Artefactos del worker (videos / imágenes generados) ───
 			admin.GET("/artifacts", m.WorkerListArtifacts)
 			admin.DELETE("/artifacts/:name", m.WorkerDeleteArtifact)
+
+			// ─── Auto-update del worker (servido por este back vía /outputs) ───
+			admin.POST("/update-payload", m.WorkerUpdatePayload)
+			admin.POST("/update", m.WorkerUpdate)
 		}
 	}
 }
@@ -815,6 +825,82 @@ func (m *Module) WorkerDeleteArtifact(c *gin.Context) {
 		return
 	}
 	utils.Success(c, gin.H{"deleted": name, "ok": true})
+}
+
+// WorkerUpdateRequest es el payload de POST /api/v1/worker/update.
+type WorkerUpdateRequest struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// WorkerUpdatePayload guarda el zip del worker subido por el admin en la
+// carpeta de outputs, para que el worker lo descargue vía /outputs.
+func (m *Module) WorkerUpdatePayload(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		utils.BadRequest(c, "file es requerido (campo form-data 'file')")
+		return
+	}
+	if filepath.Ext(file.Filename) != ".zip" {
+		utils.BadRequest(c, "el archivo debe ser .zip")
+		return
+	}
+	if m.outputsDir == "" {
+		utils.InternalError(c, "outputsDir no configurado")
+		return
+	}
+	if err := os.MkdirAll(m.outputsDir, 0o755); err != nil {
+		utils.InternalError(c, "crear outputsDir: "+err.Error())
+		return
+	}
+	dst := filepath.Join(m.outputsDir, "worker-update.zip")
+	if err := c.SaveUploadedFile(file, dst); err != nil {
+		utils.InternalError(c, "guardar payload: "+err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"path": dst, "size": file.Size, "url": "/outputs/worker-update.zip"})
+}
+
+// WorkerUpdate ordena al worker que se auto-actualice. Reenvía al artifact
+// server del worker (BM_WORKER_ARTIFACT_BASE/worker/update) la url y el hash
+// del payload. Si no se pasa url, se asume que el back sirve el zip subido
+// previamente en /outputs/worker-update.zip.
+func (m *Module) WorkerUpdate(c *gin.Context) {
+	var req WorkerUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "body JSON requerido: {url, sha256?}")
+		return
+	}
+	if req.URL == "" {
+		req.URL = "http://" + c.Request.Host + "/outputs/worker-update.zip"
+	}
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		utils.InternalError(c, "marshal update request: "+err.Error())
+		return
+	}
+	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, base+"/worker/update", bytes.NewReader(body))
+	if err != nil {
+		utils.InternalError(c, "build update request: "+err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if tok := c.Request.Header.Get("X-Artifact-Token"); tok != "" {
+		httpReq.Header.Set("X-Artifact-Token", tok)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		utils.InternalError(c, "worker update server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	c.Data(resp.StatusCode, "application/json", respBody)
 }
 
 // workerRPCError maps a worker RPC failure to the HTTP status its gRPC code

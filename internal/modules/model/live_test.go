@@ -150,7 +150,7 @@ func setup(t *testing.T) (m *Module, addr string) {
 	addr = startFakeWorker(t, f)
 	SetWorkerClient(worker.NewClient())
 	SetWorkerAddr(addr)
-	return NewModule(allUsableResolver()), addr
+	return NewModule(allUsableResolver(), ""), addr
 }
 
 // fakeBridgeSource reuses ONE concrete type: atomic.Value panics if stores
@@ -193,7 +193,7 @@ func killCentral(t *testing.T) {
 }
 
 func TestWorkerModelsFallsBackToBridge(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeModels()})
 
@@ -220,7 +220,7 @@ func TestWorkerModelsFallsBackToBridge(t *testing.T) {
 // pedirle el modelo y el estado real de pesos (el agente lo leyó de su gRPC
 // local). Sin esto el panel mostraba todo "Disponible" y sin botón.
 func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
 		Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
@@ -261,7 +261,7 @@ func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
 // La ruta de los pesos también viaja en el snapshot del bridge: es lo que el
 // panel admin muestra en equipos emparejados, donde el back no tiene gRPC.
 func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	const path = "/home/u/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev"
 	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
@@ -291,7 +291,7 @@ func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
 // deploy donde el worker todavía no está instalado, y no hay forma de que el
 // usuario lo arregle desde esa pantalla.
 func TestWorkerModelsDegradesWithoutAnySource(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
 
@@ -420,7 +420,7 @@ func TestListMergedWorkerDown(t *testing.T) {
 	SetWorkerAddr("127.0.0.1:1")
 	t.Cleanup(func() { SetWorkerAddr("") })
 
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	c, w := testCtx(t, "/api/v1/models")
 	m.List(c)
 	env, code := decode(t, w)
@@ -465,7 +465,7 @@ func bridgeCatalog() []workerbridge.WorkerModel {
 // bridge (worker central caído o inexistente) el listado de generación debe
 // mostrar lo que las máquinas del tenant pueden correr, y nada más.
 func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -492,7 +492,7 @@ func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
 // El listado público no ofrece elegir un modelo cuyos pesos no están en la
 // GPU: /worker/models sí lo muestra (ahí se descarga).
 func TestListTypeDownloadedHidesBridgeModelWithoutWeights(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -536,7 +536,7 @@ func TestListMergedDedupesModelsOfBothPaths(t *testing.T) {
 // Filtro por modalidad en la vista fusionada: el modelo de la GPU responde al
 // modality que las listas de generación piden.
 func TestListByModalityIncludesBridgeModel(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -569,7 +569,7 @@ func TestListByModalityIncludesBridgeModel(t *testing.T) {
 // worker es opcional y pedir explícitamente esa fuente no cambia la regla. El
 // filtro sigue siendo útil (nunca inventa modelos ni los mezcla con los api).
 func TestListTypeDownloadedDegradesWithoutAnySource(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
 
@@ -657,7 +657,7 @@ func TestWorkerStatusUnconfigured(t *testing.T) {
 	SetWorkerAddr("")
 	t.Cleanup(func() { SetWorkerAddr("") })
 
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	c, w := testCtx(t, "/api/v1/worker/status")
 	m.WorkerStatus(c)
 
@@ -728,7 +728,7 @@ func TestListTypeDownloadedMapsLiveState(t *testing.T) {
 
 func TestListTypeAPIRespectsCredentials(t *testing.T) {
 	setup(t)
-	m := NewModule(testResolver(map[string]bool{string(ProviderBytePlus): true}))
+	m := NewModule(testResolver(map[string]bool{string(ProviderBytePlus): true}), "")
 
 	want := 0
 	for _, item := range catalog {
@@ -752,7 +752,7 @@ func TestListTypeAPIRespectsCredentials(t *testing.T) {
 
 func TestListWithoutTenantCredentialsFailsClosed(t *testing.T) {
 	setup(t)
-	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return nil, false })
+	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return nil, false }, "")
 
 	c, w := testCtx(t, "/api/v1/models")
 	m.List(c)

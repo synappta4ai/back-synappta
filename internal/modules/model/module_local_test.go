@@ -28,7 +28,7 @@ func listModels(t *testing.T, lister CredentialLister, query string) []Model {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
-	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return lister, true })
+	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return lister, true }, "")
 	router := gin.New()
 	router.GET("/models", m.List)
 
