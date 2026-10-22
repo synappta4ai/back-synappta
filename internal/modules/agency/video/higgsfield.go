@@ -23,6 +23,7 @@ import (
 
 	"synapta/config"
 	"synapta/internal/modules/agency"
+	"synapta/internal/modules/model"
 	"synapta/internal/utils"
 )
 
@@ -62,9 +63,12 @@ func (g *HiggsfieldGenerator) Name() string { return g.label }
 // ContentType returns "video".
 func (g *HiggsfieldGenerator) ContentType() string { return "video" }
 
-// Match reports whether this generator handles the model name.
+// Match reports whether this generator handles the model name: any video
+// model of the curated Higgsfield catalog (declarative — adding a model is
+// a catalog row, no code change).
 func (g *HiggsfieldGenerator) Match(modelName string) bool {
-	return strings.Contains(strings.ToLower(modelName), "higgsfield-")
+	m := model.ByName(modelName)
+	return m != nil && m.Generator == "higgsfield" && m.Modality == model.ModalityVideo
 }
 
 // Validate checks the request against Higgsfield constraints.

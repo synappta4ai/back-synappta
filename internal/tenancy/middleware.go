@@ -8,18 +8,47 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// TenantHeader is the request header platform ops use to pick the tenant to
+// administer in the admin console. It overrides the token's tenant_id, but only
+// for platform superadmins.
+const TenantHeader = "X-Tenant-Slug"
+
 // Middleware resolves the tenant for every request.
 //
 // Resolution order:
-//  1. JWT claim "tenant_id" → looked up in the system DB (must be active).
-//  2. Header "X-Tenant-Slug" — only allowed for platform SUPER_ADMIN (level 0),
-//     used by platform ops to impersonate a tenant.
+//  1. Header "X-Tenant-Slug" — only allowed for platform SUPER_ADMIN (level 0).
+//     The admin console sends it so Videos, Imágenes and Logs read the tenant
+//     chosen in the console instead of the one baked into the JWT claim.
+//  2. JWT claim "tenant_id" → looked up in the system DB (must be active).
+//
+// The header wins over the claim on purpose: a platform superadmin always
+// carries a tenant_id (the one used to sign in), so checking the claim first
+// would make the console's tenant selector a no-op.
 //
 // The resolved *Tenant is injected into the request context; handlers read it
 // with tenancy.FromContext(c.Request.Context()).
 func Middleware(reg *Registry) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. JWT claim path (set by the auth middleware earlier in the chain).
+		// 1. Header override — platform superadmin only.
+		if slug := strings.TrimSpace(c.GetHeader(TenantHeader)); slug != "" {
+			if callerLevel(c) != 0 {
+				abort(c, 403, "only platform superadmin may switch tenant via "+TenantHeader)
+				return
+			}
+			t, err := tenantBySlug(reg, slug)
+			if err != nil {
+				abort(c, 500, "failed to resolve tenant")
+				return
+			}
+			if t == nil || !t.Active {
+				abort(c, 403, "tenant not found or inactive")
+				return
+			}
+			attach(c, t)
+			return
+		}
+
+		// 2. JWT claim path (set by the auth middleware earlier in the chain).
 		if tenantID, ok := c.Get("tenant_id"); ok {
 			if id, ok := toInt64(tenantID); ok && id > 0 {
 				t, err := tenantByID(reg, id)
@@ -36,27 +65,7 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 			}
 		}
 
-		// 2. Header override — platform superadmin only.
-		if slug := c.GetHeader("X-Tenant-Slug"); slug != "" {
-			level := callerLevel(c)
-			if level != 0 {
-				abort(c, 403, "only platform superadmin may switch tenant via X-Tenant-Slug")
-				return
-			}
-			t, err := tenantBySlug(reg, slug)
-			if err != nil {
-				abort(c, 500, "failed to resolve tenant")
-				return
-			}
-			if t == nil || !t.Active {
-				abort(c, 403, "tenant not found or inactive")
-				return
-			}
-			attach(c, t)
-			return
-		}
-
-		abort(c, 400, "missing tenant context: no tenant_id claim or X-Tenant-Slug header")
+		abort(c, 400, "missing tenant context: no tenant_id claim or "+TenantHeader+" header")
 	}
 }
 

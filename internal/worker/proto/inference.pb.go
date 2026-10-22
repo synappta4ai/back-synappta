@@ -73,8 +73,9 @@ type ModelInfo struct {
 	Downloaded      bool                   `protobuf:"varint,12,opt,name=downloaded,proto3" json:"downloaded,omitempty"`                                   // pesos completos en disco (no se vuelve a bajar)
 	Downloading     bool                   `protobuf:"varint,13,opt,name=downloading,proto3" json:"downloading,omitempty"`                                 // descarga en curso ahora mismo
 	DownloadPercent float32                `protobuf:"fixed32,14,opt,name=download_percent,json=downloadPercent,proto3" json:"download_percent,omitempty"` // 0..100 mientras descarga
-	SizeBytes       int64                  `protobuf:"varint,15,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`                    // bytes ocupados en disco (0 si no está)
+	SizeBytes       int64                  `protobuf:"varint,15,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`                    // pesos completos en disco (0 si no hay ninguno)
 	DownloadError   string                 `protobuf:"bytes,16,opt,name=download_error,json=downloadError,proto3" json:"download_error,omitempty"`         // último error de descarga/borrado
+	DownloadPath    string                 `protobuf:"bytes,17,opt,name=download_path,json=downloadPath,proto3" json:"download_path,omitempty"`            // ruta absoluta de los pesos en disco
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -217,6 +218,13 @@ func (x *ModelInfo) GetSizeBytes() int64 {
 func (x *ModelInfo) GetDownloadError() string {
 	if x != nil {
 		return x.DownloadError
+	}
+	return ""
+}
+
+func (x *ModelInfo) GetDownloadPath() string {
+	if x != nil {
+		return x.DownloadPath
 	}
 	return ""
 }
@@ -1388,7 +1396,7 @@ var File_inference_proto protoreflect.FileDescriptor
 const file_inference_proto_rawDesc = "" +
 	"\n" +
 	"\x0finference.proto\x12\x14maestro.inference.v1\"\x13\n" +
-	"\x11ListModelsRequest\"\xbd\x03\n" +
+	"\x11ListModelsRequest\"\xe2\x03\n" +
 	"\tModelInfo\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05label\x18\x02 \x01(\tR\x05label\x12\x12\n" +
@@ -1409,7 +1417,8 @@ const file_inference_proto_rawDesc = "" +
 	"\x10download_percent\x18\x0e \x01(\x02R\x0fdownloadPercent\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x0f \x01(\x03R\tsizeBytes\x12%\n" +
-	"\x0edownload_error\x18\x10 \x01(\tR\rdownloadError\"\x95\x01\n" +
+	"\x0edownload_error\x18\x10 \x01(\tR\rdownloadError\x12#\n" +
+	"\rdownload_path\x18\x11 \x01(\tR\fdownloadPath\"\x95\x01\n" +
 	"\x12ListModelsResponse\x127\n" +
 	"\x06models\x18\x01 \x03(\v2\x1f.maestro.inference.v1.ModelInfoR\x06models\x12\x1f\n" +
 	"\vdevice_name\x18\x02 \x01(\tR\n" +

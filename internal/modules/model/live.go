@@ -1,7 +1,7 @@
 // Live downloaded-model integration.
 //
-// The brain-master inference worker (Python, gRPC) is the single source of
-// truth for downloaded models. Every read goes live to the worker via
+// The inference worker (Python, gRPC) — its own repo, `inference-worker` — is
+// the single source of truth for downloaded models. Every read goes live to the worker via
 // internal/worker; nothing — catalog, availability, telemetry — is cached,
 // persisted or invented here. If the worker is unreachable, downloaded models
 // simply do not appear (callers can inspect WorkerError).
@@ -54,6 +54,36 @@ func workerAddr() string {
 // WorkerAddr exposes the configured worker address to other packages
 // (agency live model resolution).
 func WorkerAddr() string { return workerAddr() }
+
+// WorkerPing comprueba que el worker responde (GpuTelemetry) dentro del
+// timeout. Se usa para readyz y diagnósticos: si el worker no contesta, el
+// back no se presenta como listo y el panel ve "model not found" con causa.
+func WorkerPing(ctx context.Context) error {
+	c := workerClientOrNil()
+	if c == nil {
+		return fmt.Errorf("%w: worker client not wired", ErrWorkerUnreachable)
+	}
+	addr := workerAddr()
+	if addr == "" {
+		return ErrWorkerUnreachable
+	}
+	return c.Ping(ctx, addr)
+}
+
+// workerArtifactBase holds the configured BM_WORKER_ARTIFACT_BASE (set once at
+// startup). Used to proxy artifact list/delete to the worker's artifact server.
+var workerArtifactBase atomic.Value // string
+
+// SetWorkerArtifactBase stores the artifact base URL.
+func SetWorkerArtifactBase(base string) { workerArtifactBase.Store(base) }
+
+// WorkerArtifactBase returns the configured artifact base ("" if unset).
+func WorkerArtifactBase() string {
+	if v, ok := workerArtifactBase.Load().(string); ok {
+		return v
+	}
+	return ""
+}
 
 // workerClientOrNil returns the wired client, or nil.
 func workerClientOrNil() *worker.Client {
@@ -121,10 +151,12 @@ func BridgeModelsForTenant(ctx context.Context, tenantID int64) ([]Model, error)
 				VRAMGb:          int32(m.VRAMGb),
 				Family:          m.Family,
 				Available:       m.Available,
+				Downloaded:      m.Downloaded,
 				Downloading:     m.Downloading,
 				DownloadPercent: m.DownloadPercent,
 				SizeBytes:       m.SizeBytes,
 				DownloadError:   m.DownloadError,
+				DownloadPath:    m.DownloadPath,
 				Notes:           m.Notes,
 			},
 		})
@@ -281,10 +313,12 @@ func mapLiveModels(in []*inferencev1.ModelInfo) []Model {
 				VRAMGb:          m.VramGb,
 				Family:          m.Family,
 				Available:       m.Available,
+				Downloaded:      m.Downloaded,
 				Downloading:     m.Downloading,
 				DownloadPercent: m.DownloadPercent,
 				SizeBytes:       m.SizeBytes,
 				DownloadError:   m.DownloadError,
+				DownloadPath:    m.DownloadPath,
 				Notes:           m.Notes,
 			},
 		})

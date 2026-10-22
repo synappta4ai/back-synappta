@@ -26,7 +26,9 @@ type modelEntry struct {
 // LookupModel resolves a model from the read-only code catalog, falling back
 // to a live lookup on the inference worker for downloaded models. Downloaded
 // names are never cached: every unknown name hits the worker once per call.
-func LookupModel(name string) *modelEntry {
+// workerAddr is the address of the inference worker to consult for downloaded
+// models (can be a per-user worker). Empty means no worker lookup is possible.
+func LookupModel(name string, workerAddr string) *modelEntry {
 	if m := model.ByName(name); m != nil {
 		return &modelEntry{
 			Name:               m.Name,
@@ -42,9 +44,71 @@ func LookupModel(name string) *modelEntry {
 		}
 	}
 
+	// Local OpenAI-compatible providers (Ollama, LM Studio): the name is
+	// "<provider>/<model id>", so every model the tenant's server reports
+	// resolves without a static catalog entry. The credential's base_url wins
+	// in resolveRoute; the default port is the fallback.
+	if provider, id, ok := model.ParseLocalModel(name); ok {
+		return &modelEntry{
+			Name:               model.LocalModelName(provider, id),
+			CredentialProvider: provider,
+			Modality:           model.ModalityText,
+			Generator:          "openai-text",
+			BaseURL:            model.DefaultLocalBaseURL(provider),
+			Endpoint:           "/chat/completions",
+			Type:               model.TypeAPI,
+		}
+	}
+
+	// Hosted inference clouds (RunPod, Together, DeepInfra, …): the name is
+	// "<provider>/<model id>", so any model the tenant's key reaches resolves
+	// without a static catalog entry. The modality is classified from the
+	// model id, exactly like the live catalog does, so routing and listing
+	// never disagree.
+	if provider, id, ok := model.ParseInferenceModel(name); ok {
+		modality := model.ResolveInferenceModality(provider, id)
+		generator := model.GeneratorOpenAIText
+		endpoint := "/chat/completions"
+		switch {
+		case model.IsEndpointScopedProvider(provider):
+			// RunPod: one serverless endpoint per model, always an image
+			// worker (the modality its queue API is commonly used for).
+			modality = model.ModalityImage
+			generator = model.GeneratorRunPod
+			endpoint = "/v2/" + id
+		case modality == model.ModalityVideo:
+			// Only OpenRouter exposes a hosted video route; other
+			// providers cannot reach this branch (ResolveInferenceModality
+			// maps them back to text).
+			generator = model.GeneratorOpenRouterVideo
+			endpoint = model.InferenceVideoPath(provider)
+		case modality == model.ModalityImage:
+			if path := model.InferenceImagePath(provider); path != "" {
+				generator = model.GeneratorOpenAIImage
+				endpoint = path
+			} else {
+				// The provider has no OpenAI-compatible image route:
+				// treat the id as text instead of failing on submit.
+				modality = model.ModalityText
+			}
+		}
+		return &modelEntry{
+			Name:               model.InferenceModelName(provider, id),
+			CredentialProvider: provider,
+			Modality:           modality,
+			Generator:          generator,
+			BaseURL:            model.InferenceProviderBaseURL(provider),
+			Endpoint:           endpoint,
+			Type:               model.TypeAPI,
+		}
+	}
+
 	// Downloaded models: ask the worker live (no cache, no local copy).
-	addr := model.WorkerAddr()
 	c := model.WorkerClient()
+	addr := workerAddr
+	if addr == "" {
+		addr = model.WorkerAddr() // fallback a la dirección global (BM_WORKER_ADDR)
+	}
 	if addr == "" || c == nil {
 		return nil
 	}
@@ -103,8 +167,8 @@ func (s *Core) SetBridgeModels(resolve BridgeModelResolver) { s.bridgeModels = r
 // del tenant. Sin este segundo paso un modelo que sólo existe en la GPU del
 // usuario moría en "model not found" antes de llegar al generator (y su
 // modalidad —image vs video— se perdía).
-func (s *Core) lookupModel(name string) *modelRef {
-	if m := LookupModel(name); m != nil {
+func (s *Core) lookupModel(name string, workerAddr string) *modelRef {
+	if m := LookupModel(name, workerAddr); m != nil {
 		return m
 	}
 	if s.bridgeModels == nil {

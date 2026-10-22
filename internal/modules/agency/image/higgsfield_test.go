@@ -9,12 +9,19 @@ import (
 func TestHiggsfieldImageMatch(t *testing.T) {
 	g := NewHiggsfieldImageGenerator()
 	cases := map[string]bool{
-		"higgsfield-soul-2-standard":  true,
-		"higgsfield-ideogram-4-0":     true,
-		"higgsfield-recraft-4-1":      true,
-		"higgsfield-kling-3-0-turbo":  false, // video generator's
-		"dreamina-seedream-4-pro":     false,
-		"gemini-3.1-flash-image":      false,
+		"higgsfield-soul-2-standard":    true,
+		"higgsfield-ideogram-4-0":       true,
+		"higgsfield-recraft-4-1":        true,
+		"higgsfield-flux-kontext-max":   true,
+		"higgsfield-seedream-4-0":       true,
+		"higgsfield-marketing-studio":   true,
+		"higgsfield-marketing-sunburst": true,
+		// Declarative: unknown higgsfield- names don't match (the core
+		// reports "model not found" instead of reaching the generator).
+		"higgsfield-something-new":   false,
+		"higgsfield-kling-3-0-turbo": false, // video generator's
+		"dreamina-seedream-4-pro":    false,
+		"gemini-3.1-flash-image":     false,
 	}
 	for name, want := range cases {
 		if got := g.Match(name); got != want {

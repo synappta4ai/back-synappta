@@ -15,9 +15,10 @@ The catalog (`internal/modules/model`) has two model types:
 - **`api`** — external provider HTTP APIs (BytePlus, Gemini, Anthropic).
   Defined statically in `catalog.go`; each entry's `Generator` field links it
   to a `PipelineRunner`. To add one, follow `docs/ADDING_A_NEW_VIDEO_MODEL.md`.
-- **`downloaded`** — weights executed by the brain-master inference worker
-  (Python, gRPC). These are **never defined in code**: every read goes live
-  to the worker via the stateless client in `internal/worker` (dial per call,
+- **`downloaded`** — weights executed by the inference worker (Python, gRPC;
+  its own repo, `inference-worker`). These are **never defined in code**:
+  every read goes live to the worker via the stateless client in
+  `internal/worker` (dial per call,
   no cached catalog, no persisted state, no mock data). If the worker is
   unreachable, downloaded models are simply absent from listings — never
   invented.
@@ -35,8 +36,11 @@ Key rules when touching this area:
   `modality: ""` and its raw mode preserved in `downloaded.mode`. Do not map
   it to `text`.
 - `inference.proto` + generated code live in `internal/worker/proto`; they
-  mirror brain-master's `proto/inference.proto` (regenerate if the worker
-  contract changes).
+  mirror the canonical contract in the `inference-worker` repo
+  (`proto/inference.proto`, byte-identical). Copy the proto here and
+  regenerate the Go stubs whenever the worker contract changes; the exact
+  commands are in the worker README. (`brain-master`, the legacy gateway +
+  old studio, is retired and gone from the workspace.)
 - Config: `BM_WORKER_ADDR` (`host:port`, or `tls://host:port` for cloudflared
   tunnels) and `BM_WORKER_TIMEOUT_SECONDS` (per-call, default 6).
 
@@ -139,16 +143,26 @@ Key rules:
 - Clients render `cr` as provider credits (Higgsfield) next to the USD
   equivalent, with explanatory tooltips.
 
+## Versionamiento antes de push
+
+Si tocás un archivo de este repo, **actualizá la versión antes de hacer push**. No commitees código sin subir la versión correspondiente. Un cambio lógico por commit; la versión va en un commit `chore` separado del commit de código.
+
 ## Ops scripts (scripts/)
 
 - `e2e_http.py` — full HTTP E2E (login → models → generate → artifact).
 - `sync-remote-media.mjs` — pull uploads/outputs that only exist on the
   remote deployment into local storage. Idempotent, `--dry-run` supported.
-  Requires creds in `../front-synapta/.env.e2e`.
+  Requires creds in `../front-synappta/.env.e2e`.
 - `deploy-sslip.sh` — deploy `bin/synapta-linux` to the remote host: scp,
   discover systemd vs bare process, back up the old binary, swap, restart,
   wait for `readyz=200`. Build first with
   `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/synapta-linux .`.
   Needs the SSH key authorized on the target host.
+- `validate-worker-models.mjs` — valida si un back resuelve modelos
+  "downloaded" (SD-1.5) vía el worker. Chequea `/readyz`,
+  `/api/v1/worker/diagnostic`, `/api/v1/models?type=downloaded` y, opcional,
+  `POST /api/v1/agency/image/generate`. Úsalo para comparar remoto vs local:
+  `node scripts/validate-worker-models.mjs --remote <url> --local <url>
+  --token <jwt>`.
 - Never commit `.env`, `.env.e2e` or `*.log`; `bin/` and `*.log` are
   gitignored.

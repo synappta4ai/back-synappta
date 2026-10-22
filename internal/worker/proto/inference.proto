@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package maestro.inference.v1;
 
+// The Go side is mirrored into back-synapta as internal/worker/proto.
 option go_package = "synapta/internal/worker/proto;inferencev1";
 
 service InferenceService {
@@ -54,6 +55,7 @@ message ModelInfo {
   float download_percent = 14; // 0..100 mientras descarga
   int64 size_bytes = 15;  // pesos completos en disco (0 si no hay ninguno)
   string download_error = 16; // último error de descarga/borrado
+  string download_path = 17; // ruta absoluta de los pesos en disco
 }
 
 message ListModelsResponse {

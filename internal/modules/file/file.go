@@ -15,6 +15,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -543,6 +544,82 @@ func NewService(store *Store, baseURL, tenantSlug, encryptionKey string, maxUplo
 // publicFileURL builds a JWT-free serve URL for browsers and external APIs.
 func (s *Service) publicFileURL(id, suffix string) string {
 	return s.baseURL + "/api/v1/t/" + s.tenantSlug + "/files/" + id + suffix
+}
+
+// outputKey is the bucket key of a generated artifact, in a prefix of its own
+// so media produced by models never mixes with library objects.
+func outputKey(relPath string) string { return "outputs/" + relPath }
+
+// validOutputPath accepts a relative path made of safe segments. Generated
+// names come from task ids and event/piece codes, but the serve route exposes
+// the path publicly, so traversal must be impossible.
+func validOutputPath(relPath string) bool {
+	if relPath == "" || len(relPath) > 512 || strings.HasPrefix(relPath, "/") {
+		return false
+	}
+	if strings.ContainsAny(relPath, "\\\x00") {
+		return false
+	}
+	for _, seg := range strings.Split(relPath, "/") {
+		switch seg {
+		case "", ".", "..":
+			return false
+		}
+	}
+	return true
+}
+
+// StoreOutput uploads a generated artifact to the tenant bucket. It reports
+// stored=false when the tenant has no bucket, or when the upload failed: the
+// bucket stays optional, exactly like uploads, and the caller keeps serving the
+// file from local disk.
+func (s *Service) StoreOutput(relPath string, data []byte, contentType string) (string, bool) {
+	if !validOutputPath(relPath) || len(data) == 0 {
+		return "", false
+	}
+	backend, err := s.uploadBackend()
+	if err != nil {
+		log.Printf("[outputs] backend selection for %s: %v", relPath, err)
+		return "", false
+	}
+	if backend.Name() != "s3" {
+		return "", false
+	}
+	key := outputKey(relPath)
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+	if err := backend.Put(ctx, key, data, contentTypeFor(relPath, contentType)); err != nil {
+		log.Printf("[outputs] bucket upload of %s failed: %v", key, err)
+		return "", false
+	}
+	return s.outputURL(relPath), true
+}
+
+// outputURL is the public, tenant-scoped URL of an artifact that lives in the
+// tenant bucket. It never carries a signature: those expire in 15 minutes and
+// the value is persisted in generation logs.
+func (s *Service) outputURL(relPath string) string {
+	return s.baseURL + "/api/v1/t/" + s.tenantSlug + "/outputs/" + relPath
+}
+
+// OutputTarget resolves where a bucket-backed output must be read from: the
+// bucket's public base when configured, otherwise a freshly signed GET.
+func (s *Service) OutputTarget(relPath string) (string, error) {
+	if !validOutputPath(relPath) {
+		return "", errors.New("file not found")
+	}
+	p, err := s.presigner()
+	if err != nil {
+		return "", err
+	}
+	if p == nil {
+		return "", ErrStorageConfig
+	}
+	key := outputKey(relPath)
+	if p.PublicBase() != "" {
+		return p.PublicURL(key), nil
+	}
+	return p.PresignGet(key, time.Now()), nil
 }
 
 // bucketReader returns the tenant's presigner when its bucket has a public
@@ -1202,6 +1279,14 @@ func (h *Handler) ServeThumbnail(c *gin.Context) {
 	serveOrRedirect(c, path, redirect, err)
 }
 
+// ServeOutput handles GET /t/:slug/outputs/*file — generated artifacts stored
+// in the tenant's bucket. Local outputs keep their /outputs static URL and
+// never reach this route.
+func (h *Handler) ServeOutput(c *gin.Context) {
+	redirect, err := h.svc.OutputTarget(strings.TrimPrefix(c.Param("file"), "/"))
+	serveOrRedirect(c, "", redirect, err)
+}
+
 func serveOrRedirect(c *gin.Context, path, redirect string, err error) {
 	if err != nil {
 		switch {
@@ -1372,6 +1457,8 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 	// Public serve routes (generated assets must be fetchable by external AI APIs).
 	m.public(rg.GET, "/t/:slug/files/:id/serve", "ServeFile")
 	m.public(rg.GET, "/t/:slug/files/:id/thumbnail", "ServeThumbnail")
+	// Generated media the tenant stores in its own bucket.
+	m.public(rg.GET, "/t/:slug/outputs/*file", "ServeOutput")
 
 	g := rg.Group("/files")
 	g.Use(authMw, tenantMw)
@@ -1453,6 +1540,8 @@ func dispatch(hdl *Handler, method string, c *gin.Context) {
 		hdl.ServeFile(c)
 	case "ServeThumbnail":
 		hdl.ServeThumbnail(c)
+	case "ServeOutput":
+		hdl.ServeOutput(c)
 	default:
 		utils.InternalError(c, "unknown handler method: "+method)
 	}

@@ -1,11 +1,15 @@
-// Higgsfield image generator. Wires Higgsfield image models (Soul 2,
-// Ideogram 4.0, Recraft 4.1) into the agency pipeline. All three share the
-// async Higgsfield request lifecycle: POST the model endpoint, poll
-// /requests/:id/status, download images[].url on completion.
-// API shape per docs.higgsfield.ai (Endpoint IDs verified 2026-09):
+// Higgsfield image generator. Wires the curated Higgsfield image models
+// (Soul 2, Ideogram 4.0, Recraft 4.1, Flux Kontext, Seedream, Marketing
+// Studio) into the agency pipeline. All share the async Higgsfield request
+// lifecycle: POST the model endpoint, poll /requests/:id/status, download
+// images[].url on completion.
+// API shape per docs.higgsfield.ai (Endpoint IDs verified 2026-09/10):
 //   - Soul 2:          POST /higgsfield-ai/soul/v2/standard  (num_images, 2K/4K)
 //   - Ideogram 4.0:    POST /ideogram/v4.0                   (image_url singular for edit)
 //   - Recraft V4.1:    POST /recraft/v4.1/text-to-image      (t2i only, 1k)
+//   - Flux Kontext:   POST /flux-pro/kontext/max/text-to-image
+//   - Seedream 4.0:    POST /bytedance/seedream/v4/text-to-image
+//   - Mkt Studio:      POST /marketing-studio/image[/sunburst]
 package agencyimage
 
 import (
@@ -19,6 +23,7 @@ import (
 
 	"synapta/config"
 	"synapta/internal/modules/agency"
+	"synapta/internal/modules/model"
 )
 
 // HiggsfieldStatuses maps Higgsfield task states to Synapta statuses.
@@ -66,14 +71,13 @@ func (g *HiggsfieldImageGenerator) Name() string { return g.label }
 // ContentType returns "image".
 func (g *HiggsfieldImageGenerator) ContentType() string { return "image" }
 
-// Match reports whether this generator handles the model name. Video models
-// are handled by agencyvideo.NewHiggsfieldGenerator.
+// Match reports whether this generator handles the model name: any image
+// model of the curated Higgsfield catalog (declarative — adding a model is
+// a catalog row, no code change). Video models are handled by
+// agencyvideo.NewHiggsfieldGenerator.
 func (g *HiggsfieldImageGenerator) Match(modelName string) bool {
-	lower := strings.ToLower(modelName)
-	return strings.Contains(lower, "higgsfield-") &&
-		(strings.Contains(lower, "soul") ||
-			strings.Contains(lower, "ideogram") ||
-			strings.Contains(lower, "recraft"))
+	m := model.ByName(modelName)
+	return m != nil && m.Generator == "higgsfield" && m.Modality == model.ModalityImage
 }
 
 // Validate checks the request against Higgsfield image constraints.

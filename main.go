@@ -163,6 +163,7 @@ func main() {
 	// downloaded side of the model catalog is simply absent.
 	model.SetWorkerClient(worker.NewClient())
 	model.SetWorkerAddr(cfg.WorkerAddr)
+	model.SetWorkerArtifactBase(cfg.WorkerArtifactBase)
 	model.SetBridgeSource(wbStore)
 
 	// ─── Router ───────────────────────────────────────────────
@@ -220,7 +221,7 @@ func main() {
 			return nil, false
 		}
 		return hdl, true
-	}))
+	}, cfg.OutputsDir))
 
 	// Tenant-scoped modules resolve their handler per request.
 	registry.Register(event.NewModule(manager.EventsFor))
@@ -301,6 +302,13 @@ func main() {
 		if err := provisioner.PingSystem(ctx); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "error": err.Error()})
 			return
+		}
+		if cfg.WorkerAddr != "" {
+			if err := model.WorkerPing(ctx); err != nil {
+				c.JSON(http.StatusServiceUnavailable,
+					gin.H{"status": "degraded", "error": "worker: " + err.Error()})
+				return
+			}
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})

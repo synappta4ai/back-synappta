@@ -71,6 +71,9 @@ type Core struct {
 	genAssetSt   *GeneratedAssetStore
 	genSaver     GenerationSaver
 	pushNotifier PushNotifier
+	// outputPublisher moves finished artifacts to the tenant bucket when it has
+	// one; nil (or stored=false) keeps them on local disk.
+	outputPublisher OutputPublisher
 	// bridgeModels resuelve modelos servidos por las GPUs emparejadas del
 	// tenant (nil en deploys con worker central, donde el catálogo vivo por
 	// gRPC es la única fuente "downloaded").
@@ -114,11 +117,26 @@ func (s *Core) serveURL(fileID string) string {
 // SetPushNotifier wires the push service used for async completion alerts.
 func (s *Core) SetPushNotifier(pn PushNotifier) { s.pushNotifier = pn }
 
+// SetOutputPublisher wires the tenant's storage so completed generations can be
+// saved to its bucket instead of local disk.
+func (s *Core) SetOutputPublisher(p OutputPublisher) { s.outputPublisher = p }
+
 // RegisterGenerator registers a generator that satisfies PipelineRunner.
 func (s *Core) RegisterGenerator(gen PipelineRunner) { s.pipelineGens = append(s.pipelineGens, gen) }
 
-func (s *Core) pickGenerator(modelName string) PipelineRunner {
+func (s *Core) pickGenerator(modelName string, workerAddr string) PipelineRunner {
 	for _, g := range s.pipelineGens {
+		// Los generators que soporten worker_addr per-request lo reciben antes
+		// de Match, para que DownloadedGenerator resuelva contra el worker
+		// correcto (Option B) o contra el global (BM_WORKER_ADDR). Solo se
+		// propaga un valor no vacío: un request sin worker_addr no debe
+		// borrar la dirección global del generator (multi-usuario: cada
+		// request comparte el mismo generator del tenant).
+		if workerAddr != "" {
+			if setter, ok := g.(interface{ SetWorkerAddr(string) }); ok {
+				setter.SetWorkerAddr(workerAddr)
+			}
+		}
 		if g.Match(modelName) {
 			return g
 		}
@@ -148,7 +166,9 @@ func (s *Core) resolveProvider(m *modelRef) (*credential.Resolve, error) {
 	if res == nil {
 		return nil, fmt.Errorf("no credentials configured for provider %q — add them in admin → tenants → gestionar", m.CredentialProvider)
 	}
-	if res.AuthKey() == "" {
+	// Local servers (Ollama, LM Studio) authenticate nothing: their
+	// credential only stores the base URL.
+	if res.AuthKey() == "" && !model.IsLocalProvider(m.CredentialProvider) {
 		return nil, fmt.Errorf("provider %q has no credentials for generation — add an API key or Key ID + Key Secret in admin → tenants → gestionar", m.CredentialProvider)
 	}
 	return res, nil
@@ -246,23 +266,23 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			taskID = "<no-task>"
 		}
 		logEntry := &GenerationLog{
-			TaskID:           taskID,
-			ModelName:        modelName,
-			UserID:           intPtrOrNil(req.UserID),
-			EventID:          req.EventID,
-			ProgramID:        req.ProgramID,
-			PieceID:          req.PieceID,
-			PieceCode:        req.PieceCode,
-			GenerationNumber: req.GenerationNumber,
-			Request:          string(reqBytes),
-			Outputs:          outputs,
-			Status:           status,
-			ErrorMessage:     errLog,
-			ResourceType:     req.ResourceType,
-			ContentTypes:     extractContentTypes(req.Content),
-			EstimatedCost:    estimatedCost,
-			CostSource:       costSource,
-			CostCredits:      costCredits,
+			TaskID:                taskID,
+			ModelName:             modelName,
+			UserID:                intPtrOrNil(req.UserID),
+			EventID:               req.EventID,
+			ProgramID:             req.ProgramID,
+			PieceID:               req.PieceID,
+			PieceCode:             req.PieceCode,
+			GenerationNumber:      req.GenerationNumber,
+			Request:               string(reqBytes),
+			Outputs:               outputs,
+			Status:                status,
+			ErrorMessage:          errLog,
+			ResourceType:          req.ResourceType,
+			ContentTypes:          extractContentTypes(req.Content),
+			EstimatedCost:         estimatedCost,
+			CostSource:            costSource,
+			CostCredits:           costCredits,
 			ProviderTransactionID: providerTxID,
 		}
 		if saveErr := s.logStore.Create(logEntry); saveErr != nil {
@@ -271,8 +291,9 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	}()
 
 	// Look up model in the code catalog (API + worker central + GPUs
-	// emparejadas del tenant).
-	m := s.lookupModel(req.Model)
+	// emparejadas del tenant). workerAddr puede ser la dirección de un
+	// worker propio del usuario (Option B) o vacía para usar la global.
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		errLog = fmt.Sprintf("model not found: %s", req.Model)
 		return nil, fmt.Errorf("model not found: %s", req.Model)
@@ -326,6 +347,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		InputDuration: inputDuration,
 		APIKey:        creds.APIKey,
 		AuthKey:       creds.AuthKey(),
+		WorkerAddr:    req.WorkerAddr,
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -348,8 +370,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}
 
-	// Pick generator
-	gen := s.pickGenerator(m.Name)
+	// Pick generator (pasa worker_addr para Option B).
+	gen := s.pickGenerator(m.Name, req.WorkerAddr)
 	if gen == nil {
 		errLog = fmt.Sprintf("no generator available for model: %s", m.Name)
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
@@ -426,6 +448,12 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	if err != nil {
 		errLog = err.Error()
 		return nil, err
+	}
+
+	// Sync generators (Gemini images) leave their bytes on local disk: move them
+	// to the tenant bucket when it has one.
+	if result != nil {
+		s.publishLocalOutputs(result)
 	}
 
 	// Calculate the generation spend: a provider-reported estimate
@@ -573,7 +601,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		}
 	}
 
-	m := s.lookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
 	}
@@ -587,7 +615,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -670,6 +698,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		// Persist the video under the server's own outputs and serve it from
 		// our domain instead of the expiring signed provider URL.
 		s.ensureLocalVideo(taskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
@@ -769,7 +798,7 @@ func (s *Core) CancelTask(taskID string) error {
 		return fmt.Errorf("unknown task: %s", taskID)
 	}
 
-	m := s.lookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return fmt.Errorf("model for task %s not found", taskID)
 	}
@@ -783,7 +812,7 @@ func (s *Core) CancelTask(taskID string) error {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -796,7 +825,7 @@ func (s *Core) CancelTask(taskID string) error {
 
 // PreviewPayload builds the AI API payload without sending it or saving logs.
 func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, error) {
-	m := s.lookupModel(req.Model)
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
@@ -842,7 +871,7 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 		genReq.GenerateAudio = *req.GenerateAudio
 	}
 
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -882,11 +911,11 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		return sr, nil
 	}
 
-	m := s.lookupModel(logEntry.ModelName)
+	m := s.lookupModel(logEntry.ModelName, "")
 	if m == nil {
 		return &StatusResult{Status: logEntry.Status, Error: "model not found for task " + logEntry.TaskID}, nil
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return &StatusResult{Status: logEntry.Status}, nil
 	}
@@ -926,6 +955,7 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 
 	if result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED {
 		s.ensureLocalVideo(logEntry.TaskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
@@ -1126,7 +1156,7 @@ func (s *Core) SyncAsset(modelName, fileID string) (*SyncAssetResult, error) {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
 
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}
@@ -1264,7 +1294,7 @@ func (s *Core) GallerySyncContent(items []ContentItem, modelName string) ([]Cont
 	if s.assetStore == nil {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}
@@ -1309,8 +1339,12 @@ func defaultBaseURLFor(p string) string {
 		return "https://generativelanguage.googleapis.com/v1beta"
 	case "anthropic":
 		return "https://api.anthropic.com/v1"
+	case "ollama", "lmstudio":
+		return model.DefaultLocalBaseURL(model.CredentialProvider(p))
 	default:
-		return ""
+		// Hosted inference clouds (RunPod, Together, DeepInfra, …) carry
+		// their API root in the model registry.
+		return model.InferenceProviderBaseURL(model.CredentialProvider(p))
 	}
 }
 
@@ -1323,7 +1357,14 @@ func defaultEndpointFor(p string) string {
 		return ""
 	case "anthropic":
 		return "/messages"
+	case "ollama", "lmstudio":
+		return "/chat/completions"
 	default:
+		// RunPod needs the endpoint id (carried by the model entry itself),
+		// so there is no provider-wide route to default to.
+		if model.InferenceProviderBaseURL(model.CredentialProvider(p)) != "" {
+			return "/chat/completions"
+		}
 		return ""
 	}
 }

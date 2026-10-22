@@ -4,9 +4,10 @@ Este documento describe el recorrido completo de los binarios de Synapta: qué
 sube el usuario a la biblioteca, qué generan los modelos y cómo se sirve todo,
 **con bucket propio del tenant o sin él**.
 
-Resumen de una línea: **solo la biblioteca (`/files`) puede irse al bucket del
-tenant; las imágenes y videos generados se guardan siempre en disco**
-(`OUTPUTS_DIR`) y el back los sirve desde `/outputs`.
+Resumen de una línea: **la biblioteca (`/files`) y los generados van al bucket
+del tenant cuando lo tiene configurado; sin bucket, todo se queda en disco**
+(`UPLOAD_DIR` para la biblioteca, `OUTPUTS_DIR` para los generados, servidos
+por el back desde `/outputs`). El bucket es siempre opcional.
 
 ---
 
@@ -15,13 +16,14 @@ tenant; las imágenes y videos generados se guardan siempre en disco**
 | Almacén | Qué guarda | Configurable por tenant | Servido por |
 |---|---|---|---|
 | **Biblioteca** (`files`) | subidas del usuario (imágenes, videos, audio, referencias del studio) y copias normalizadas temporales | **Sí**: bucket propio o disco local | `GET /api/v1/t/:slug/files/:id/serve` y `/thumbnail` |
-| **Outputs** (`OUTPUTS_DIR`) | imágenes y videos generados por los modelos (API y worker local) | No, siempre disco | `GET /outputs/...` (estático) |
+| **Outputs** (`OUTPUTS_DIR` y bucket) | imágenes y videos generados por los modelos (API y worker local) | **Sí**: bucket propio o disco | Local: `GET /outputs/...` (estático). Bucket: `GET /api/v1/t/:slug/outputs/...` (302 a la firma o al base público) |
 
 Cada tenant tiene su schema Postgres (`tenant_<slug>`) con su tabla `files`, y
 todos comparten el mismo `UPLOAD_DIR` / `OUTPUTS_DIR` del proceso. La
 separación de la biblioteca es lógica (filas por tenant) y, cuando hay bucket,
-física (un bucket por tenant). Los outputs no están separados por tenant: el
-nombre incluye el `taskID` pero el path no.
+física (un bucket por tenant). Los outputs en disco **no** están separados por
+tenant (el nombre incluye el `taskID` pero el path no); los que van al bucket
+sí, porque cada tenant tiene el suyo y la key arranca con `outputs/`.
 
 ```
                      ┌──────────────────────────────┐
@@ -48,10 +50,15 @@ Y en paralelo, la generación:
 modelo API ──(URL firmada/base64)──┐
 worker gRPC/bridge ──(artifact)────┤
                                    ▼
-                         OUTPUTS_DIR/{image,video,audio}/...
-                         (siempre disco, nunca bucket)
-                                   ▼
-                         GET /outputs/... (estático, público)
+                         OUTPUTS_DIR/{image,video,audio}/...   ← siempre se descarga acá
+                                   │ ¿tenant tiene bucket habilitado?
+                       ┌───────────┴────────────┐
+                       │ no                     │ sí
+                       ▼                        ▼
+          GET /outputs/... (estático)   PUT a <bucket>/outputs/...
+          el archivo queda en disco     y se borra la copia local
+                                        ▼
+          GET /api/v1/t/:slug/outputs/... (302 a public base o firma de 15 min)
 ```
 
 ---
@@ -204,14 +211,19 @@ Flujo típico de un video o imagen asíncrona:
 3. Al llegar a `SUCCESS`, `ensureLocalVideo` descarga la salida del proveedor a
    `OUTPUTS_DIR/<kind>/<kind>_<taskID><ext>` (`kind` = `image`, `video` o
    `audio`), para que el front no dependa de la URL firmada del proveedor que
-   expira.
+   expira. Inmediatamente después, `publishLocalOutputs` sube ese archivo al
+   bucket del tenant (key `outputs/<kind>/<archivo>`), reescribe
+   `outputs[].url` a la ruta pública del tenant, deja `local_url` vacío y borra
+   la copia local. Sin bucket (o si el PUT falla) no cambia nada: el output
+   sigue en disco con su `/outputs/...`, igual que antes.
 4. `saveToGeneration` persiste, si hay pieza y número, una fila en
    `piece_generations` con `video_url` (proveedor) y `video_local_url`
    (nuestra ruta `/outputs/...`), desactivando la generación anterior del mismo
    número.
 5. La API de estado (`GetStatusUnified`) devuelve `outputs[0].url` como URL
-   **absoluta del back** (`URL_PUBLIC + /outputs/...`), y `local_url` con la
-   ruta relativa.
+   **absoluta**: la del bucket (`URL_PUBLIC + /api/v1/t/:slug/outputs/...`)
+   cuando se publicó, o la del back (`URL_PUBLIC + /outputs/...`) si quedó en
+   disco; `local_url` lleva la ruta relativa (queda vacía al publicar).
 
 Nombres de archivo según el generador (todos dentro de `OUTPUTS_DIR`):
 
@@ -231,10 +243,14 @@ Nombres de archivo según el generador (todos dentro de `OUTPUTS_DIR`):
   `generation_logs` con `has_outputs`, filtrables por `event_id`, con la misma
   forma de `outputs`.
 
-Servido: `main.go` expone `router.Static("/outputs", OUTPUTS_DIR)`. Es un
-estático **sin auth y sin tenant en el path**: cualquiera con la URL (que
-incluye el `taskID`, no adivinable) puede leerlo durante toda la vida del
-archivo. No hay borrado de outputs desde la API: se limpian a mano.
+Servido: `main.go` expone `router.Static("/outputs", OUTPUTS_DIR)` para los
+outputs que quedaron en disco. Es un estático **sin auth**: cualquiera con la
+URL (que incluye el `taskID`, no adivinable) puede leerlo durante toda la vida
+del archivo. Los publicados al bucket se sirven en
+`/api/v1/t/:slug/outputs/...` (también público, ruta del módulo `file`): el
+handler hace `302` al `public_base` del bucket si está configurado, o a una
+firma GET fresca de 15 minutos. No hay borrado de outputs desde la API: los de
+disco se limpian a mano.
 
 ---
 
@@ -254,8 +270,9 @@ Los modelos `downloaded` corren en la GPU del usuario o en un worker remoto
    `artifact ... could not be retrieved from the worker`. Nunca se marca éxito
    sin bytes locales.
 
-Igual que los modelos de API, esto termina en `/outputs` y **no** en el bucket
-del tenant.
+Igual que los modelos de API, el artefacto se descarga a `OUTPUTS_DIR` y, si
+el tenant tiene bucket, se publica ahí con `publishLocalOutputs` (misma key
+`outputs/<kind>/<archivo>` y borrado de la copia local).
 
 ---
 
@@ -357,11 +374,16 @@ leerlo, solo el admin escribirlo.
 
 ## 9. Limitaciones conocidas
 
-1. **Los generados no van al bucket.** Con bucket configurado, `OUTPUTS_DIR`
-   sigue creciendo en el disco del back y se sirve desde el back. Si tenés
-   mucho volumen de generación, el bucket no alivia ese tráfico.
-2. **`/outputs` es global y sin auth.** No está namespaced por tenant ni
-   protegido; la privacidad depende de que el `taskID` no se filtre.
+1. **Sin bucket, `OUTPUTS_DIR` crece.** La copia local se descarga siempre
+   (aunque el tenant tenga bucket) y se borra recién cuando el PUT termina
+   bien; si el bucket no está configurado, el disco del back acumula todos los
+   generados y los sirve él.
+2. **Outputs públicos.** `/outputs/...` (disco) y
+   `/api/v1/t/:slug/outputs/...` (bucket) no piden auth; la privacidad depende
+   de que el `taskID` no se filtre. Al publicar un output se deja
+   `local_url = ""` a propósito: el front prefiere ese campo, así que cae a
+   `url` (la del bucket) en vez de pedir un archivo local que ya no existe. Las
+   filas viejas conservan su `local_url` y su archivo en disco.
 3. **`/files/presign` no registra el objeto.** Sube al bucket pero no crea fila
    en `files`, así que no aparece en la biblioteca ni tiene miniatura.
 4. **Dedup antes de elegir backend.** Subir bytes idénticos a un archivo viejo
@@ -377,7 +399,8 @@ leerlo, solo el admin escribirlo.
 9. **TTL fijo.** Las URLs prefirmadas (PUT y GET) duran 15 minutos; no es
    configurable por tenant.
 10. **Tamaño de generados sin tope.** Un video de salida grande se descarga
-    entero a memoria antes de escribirse (`utils.SaveURLOutput`).
+    entero a memoria antes de escribirse (`utils.SaveURLOutput`) y se vuelve a
+    leer entero para publicarlo al bucket (`publishLocalOutputs`).
 
 ---
 
@@ -395,6 +418,8 @@ leerlo, solo el admin escribirlo.
 | Migración `files.backend` | `migrations/tenant/00008_file_backend.sql` |
 | Guardado de generados y `piece_generations` | `internal/modules/agency/progress.go`, `internal/modules/agency/core.go`, `internal/modules/event/event.go` |
 | Artefactos de modelos descargados | `internal/modules/agency/video/downloaded.go` |
-| Escritura/URLs de outputs | `internal/utils/store.go`, `config/config.go` (`OutPutUrl`) |
-| Sirve `/outputs` | `main.go` |
+| Escritura/URLs de outputs en disco | `internal/utils/store.go`, `config/config.go` (`OutPutUrl`) |
+| Publicación de outputs al bucket | `internal/modules/file/file.go` (`StoreOutput`, `OutputTarget`), `internal/modules/agency/progress.go` (`publishLocalOutputs`) |
+| Sirve `/outputs` (disco) | `main.go` |
+| Sirve `/api/v1/t/:slug/outputs/...` (bucket) | `internal/modules/file/file.go` (`ServeOutput`) |
 | Tests del flujo | `internal/modules/file/upload_bucket_test.go`, `upload_backend_test.go`, `storage_config_test.go`, `internal/storage/presign_test.go` |

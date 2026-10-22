@@ -325,6 +325,9 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		return eventSvc.SaveGenerationOutput(pieceID, number, videoURL, localURL, taskID)
 	})
 	core.SetPushNotifier(pushSvc)
+	// Generated media follows the same rule as uploads: the tenant's bucket
+	// when configured, local disk otherwise.
+	core.SetOutputPublisher(fileSvc)
 
 	// Generators (video ×3, image ×3, text ×1). Audio has no generator yet.
 	core.RegisterGenerator(agencyvideo.NewSeedanceGenerator())
@@ -334,12 +337,27 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
+	// Local LLM servers the tenant runs (Ollama, LM Studio): names are
+	// "<provider>/<model id>", discovered live from /v1/models. Registered
+	// before the downloaded generator, which claims any unknown name.
+	core.RegisterGenerator(agencytext.NewOpenAITextGenerator())
+	// Hosted inference clouds the tenant pays for itself: the OpenAI-compatible
+	// images route (Together, DeepInfra, OpenRouter) and RunPod serverless
+	// endpoints. Both match only "<provider>/…" names, so the curated catalog
+	// keeps its own generators.
+	core.RegisterGenerator(agencyimage.NewOpenAIImageGenerator())
+	core.RegisterGenerator(agencyimage.NewRunPodGenerator())
 	// Image Higgsfield FIRST: its Match is narrow (soul/ideogram/recraft) while
 	// the video one claims any "higgsfield-*", so registering video first would
 	// shadow the image models (Soul 2 et al.) and route them to the video
 	// generator.
 	core.RegisterGenerator(agencyimage.NewHiggsfieldImageGenerator())
 	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	// OpenRouter dedicated video API (Veo, Kling, Wan, Seedance, Hailuo…):
+	// async submit/poll/download. Registered after Higgsfield so the
+	// curated catalog keeps precedence on overlapping names (there is none:
+	// hosted names are provider-namespaced).
+	core.RegisterGenerator(agencyvideo.NewOpenRouterVideoGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API
@@ -350,12 +368,17 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	//     restarts on both sides).
 	dlGen := agencyvideo.NewDownloadedGenerator(
 		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir)
-	if m.workerBridgeStore != nil && m.cfg.WorkerAddr == "" {
+	// Bridge siempre activo cuando hay store: cada usuario puede emparejar
+	// su propia GPU (multi-usuario) y generar aunque haya un worker
+	// central configurado. El generator prefiere el central cuando está
+	// vivo y cae al bridge cuando no lo está o no tiene el modelo.
+	if m.workerBridgeStore != nil {
 		dlGen.SetBridge(m.workerBridgeStore, t.ID)
-		// Sin worker central, los snapshots de las GPUs emparejadas son la
-		// única fuente viva de modelos "downloaded": el core los resuelve
-		// para generar (modalidad incluida) en vez de responder "model not
-		// found" a todo modelo que sólo vive en la máquina del usuario.
+		// Los snapshots de las GPUs emparejadas del tenant son fuente viva
+		// de modelos "downloaded" junto al worker central: el core los
+		// resuelve para generar (modalidad incluida) en vez de responder
+		// "model not found" a todo modelo que sólo vive en la máquina del
+		// usuario.
 		core.SetBridgeModels(bridgeModelResolver(m.workerBridgeStore, t.ID))
 	}
 	core.RegisterGenerator(dlGen)

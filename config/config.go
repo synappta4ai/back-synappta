@@ -44,10 +44,15 @@ type Config struct {
 	// SSRF probe into the internal network. Development MinIO needs `true`.
 	StorageAllowPrivateEndpoints bool
 
-	// Inference worker (brain-master Python gRPC server) for downloaded
-	// models. Empty disables the downloaded-model side of the catalog.
+	// Inference worker (inference-worker repo, Python gRPC server) for
+	// downloaded models. Empty disables the downloaded-model side of the
+	// catalog.
 	WorkerAddr           string
 	WorkerTimeoutSeconds int
+
+	// Base URL del artifact server del worker (BM_WORKER_ARTIFACT_BASE),
+	// usado para listar y borrar artefactos (videos/imágenes generados).
+	WorkerArtifactBase string
 
 	// AgentServerURL is the standalone DCS Agent server (Inmobiliaria /
 	// Cine workflows) that the /agent/chat endpoint proxies to.
@@ -220,6 +225,7 @@ func Load() *Config {
 
 		WorkerAddr:           strings.TrimSpace(os.Getenv("BM_WORKER_ADDR")),
 		WorkerTimeoutSeconds: workerTimeout,
+		WorkerArtifactBase:   strings.TrimRight(os.Getenv("BM_WORKER_ARTIFACT_BASE"), "/"),
 
 		AgentServerURL: getEnv("AGENT_SERVER_URL", "http://localhost:3200"),
 

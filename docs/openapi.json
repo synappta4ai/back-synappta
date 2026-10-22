@@ -163,7 +163,7 @@
       "get": {
         "tags": ["Models"],
         "summary": "List usable models (API + live downloaded)",
-        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. A dead worker degrades to API-only (header X-Worker-Status: unreachable). Nothing is cached.",
+        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. The inference worker is optional: a dead worker degrades to API-only (header X-Worker-Status: unreachable) and, with type=downloaded, to an empty list with 200 — never a 5xx, because no worker is a valid deployment state. Nothing is cached.",
         "operationId": "listModels",
         "parameters": [
           { "name": "modality", "in": "query", "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },
@@ -1548,10 +1548,12 @@
           "vram_gb": { "type": "integer" },
           "family": { "type": "string" },
           "available": { "type": "boolean", "description": "false when the worker lists the model but cannot run it" },
+          "downloaded": { "type": "boolean", "description": "true when the weights are fully on the worker disk" },
           "downloading": { "type": "boolean", "description": "true while a background weight download is running" },
           "download_percent": { "type": "number", "description": "Live 0-100 download progress" },
           "size_bytes": { "type": "integer", "description": "On-disk weight size when downloaded" },
           "download_error": { "type": "string", "description": "Last download failure, when present" },
+          "download_path": { "type": "string", "description": "Absolute path of the weights on the worker's machine; empty when unknown or the agent predates the field" },
           "notes": { "type": "string" }
         }
       },

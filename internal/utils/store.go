@@ -95,6 +95,12 @@ func DecodeBase64(s string) ([]byte, error) {
 	return data, nil
 }
 
+// MimeForFilename returns the content type to serve a file with, from its
+// extension; empty when the extension is unknown.
+func MimeForFilename(filename string) string {
+	return mimeTypes[strings.ToLower(filepath.Ext(filename))]
+}
+
 // DetectMediaType detects the media type from a filename extension.
 func DetectMediaType(filename string) string {
 	ext := strings.ToLower(filepath.Ext(filename))

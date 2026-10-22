@@ -1,5 +1,5 @@
-// Package worker is the stateless gRPC client for the brain-master
-// inference worker (Python).
+// Package worker is the stateless gRPC client for the inference worker
+// (Python, repo `inference-worker`).
 //
 // Stateless by design — "nothing cached":
 //   - No persistent connection is kept. Every call dials the worker, runs the

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -133,8 +134,9 @@ func setup(t *testing.T) (m *Module, addr string) {
 		models: []*inferencev1.ModelInfo{
 			{Key: "SD-1.5", Label: "Stable Diffusion 1.5", Mode: "image", Engine: "diffusers",
 				Pipeline: "sd15", Repo: "stable-diffusion-v1-5/stable-diffusion-v1-5", Steps: 20, VramGb: 4,
-				Family: "sd", Available: true, Downloading: true, DownloadPercent: 42.5,
-				SizeBytes: 420, DownloadError: ""},
+				Family: "sd", Available: true, Downloaded: true, Downloading: true, DownloadPercent: 42.5,
+				SizeBytes: 420, DownloadError: "",
+				DownloadPath: "/home/u/.cache/huggingface/hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5"},
 			{Key: "Wan2.1-T2V-1.3B", Label: "Wan 2.1 T2V 1.3B", Mode: "video", Engine: "diffusers",
 				Pipeline: "wan", Repo: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", Steps: 30, VramGb: 6,
 				Family: "wan", Available: true},
@@ -148,7 +150,7 @@ func setup(t *testing.T) (m *Module, addr string) {
 	addr = startFakeWorker(t, f)
 	SetWorkerClient(worker.NewClient())
 	SetWorkerAddr(addr)
-	return NewModule(allUsableResolver()), addr
+	return NewModule(allUsableResolver(), ""), addr
 }
 
 // fakeBridgeSource reuses ONE concrete type: atomic.Value panics if stores
@@ -191,7 +193,7 @@ func killCentral(t *testing.T) {
 }
 
 func TestWorkerModelsFallsBackToBridge(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeModels()})
 
@@ -218,7 +220,7 @@ func TestWorkerModelsFallsBackToBridge(t *testing.T) {
 // pedirle el modelo y el estado real de pesos (el agente lo leyó de su gRPC
 // local). Sin esto el panel mostraba todo "Disponible" y sin botón.
 func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
 		Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
@@ -256,8 +258,40 @@ func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
 	}
 }
 
-func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
-	m := NewModule(allUsableResolver())
+// La ruta de los pesos también viaja en el snapshot del bridge: es lo que el
+// panel admin muestra en equipos emparejados, donde el back no tiene gRPC.
+func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
+	m := NewModule(allUsableResolver(), "")
+	killCentral(t)
+	const path = "/home/u/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev"
+	setBridge(t, fakeBridgeSource{models: []workerbridge.WorkerModel{{
+		Key: "FLUX.1-dev", Label: "FLUX.1 dev", Mode: "image", Engine: "diffusers",
+		Pipeline: "flux", Family: "flux", Available: true, Downloaded: true, DownloadPath: path,
+		WorkerID: "w-1", WorkerName: "PC-Casa",
+	}}})
+
+	c, w := testCtx(t, "/api/v1/worker/models")
+	withTenant(c, 7)
+	m.WorkerModels(c)
+	env, code := decode(t, w)
+	if code != http.StatusOK || len(env.Data) != 1 {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	d := env.Data[0].Downloaded
+	if d == nil || !d.Downloaded || d.DownloadPath != path {
+		t.Fatalf("bridge weights path lost: %+v", d)
+	}
+	if !strings.Contains(w.Body.String(), `"download_path":"`+path+`"`) {
+		t.Fatalf("missing download_path in %s", w.Body.String())
+	}
+}
+
+// El worker es opcional: sin worker central y sin GPUs emparejadas la vista de
+// gestión responde 200 con la lista vacía. Un 500 acá rompía el panel de un
+// deploy donde el worker todavía no está instalado, y no hay forma de que el
+// usuario lo arregle desde esa pantalla.
+func TestWorkerModelsDegradesWithoutAnySource(t *testing.T) {
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
 
@@ -265,11 +299,14 @@ func TestWorkerModelsStill500WithoutBridge(t *testing.T) {
 	withTenant(c, 7)
 	m.WorkerModels(c)
 	env, code := decode(t, w)
-	if code != http.StatusInternalServerError || env.Success {
+	if code != http.StatusOK || !env.Success {
 		t.Fatalf("status=%d body=%s", code, w.Body.String())
 	}
-	if !strings.Contains(env.Message, "inference worker unavailable") {
-		t.Fatalf("message=%q", env.Message)
+	if len(env.Data) != 0 {
+		t.Fatalf("expected an empty catalog, got %+v", env.Data)
+	}
+	if got := w.Header().Get("X-Worker-Source"); got != "central" {
+		t.Fatalf("X-Worker-Source=%q, want central (no bridge snapshots)", got)
 	}
 }
 
@@ -383,7 +420,7 @@ func TestListMergedWorkerDown(t *testing.T) {
 	SetWorkerAddr("127.0.0.1:1")
 	t.Cleanup(func() { SetWorkerAddr("") })
 
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	c, w := testCtx(t, "/api/v1/models")
 	m.List(c)
 	env, code := decode(t, w)
@@ -428,7 +465,7 @@ func bridgeCatalog() []workerbridge.WorkerModel {
 // bridge (worker central caído o inexistente) el listado de generación debe
 // mostrar lo que las máquinas del tenant pueden correr, y nada más.
 func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -455,7 +492,7 @@ func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
 // El listado público no ofrece elegir un modelo cuyos pesos no están en la
 // GPU: /worker/models sí lo muestra (ahí se descarga).
 func TestListTypeDownloadedHidesBridgeModelWithoutWeights(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -499,7 +536,7 @@ func TestListMergedDedupesModelsOfBothPaths(t *testing.T) {
 // Filtro por modalidad en la vista fusionada: el modelo de la GPU responde al
 // modality que las listas de generación piden.
 func TestListByModalityIncludesBridgeModel(t *testing.T) {
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{models: bridgeCatalog()})
 
@@ -528,18 +565,23 @@ func TestListByModalityIncludesBridgeModel(t *testing.T) {
 	}
 }
 
-// Sin ninguna fuente viva, type=downloaded sigue respondiendo 500 (no un
-// listado vacío silencioso): el caller pidió explícitamente esa fuente.
-func TestListTypeDownloaded500WithoutAnySource(t *testing.T) {
-	m := NewModule(allUsableResolver())
+// Sin ninguna fuente viva, type=downloaded responde 200 con catálogo vacío: el
+// worker es opcional y pedir explícitamente esa fuente no cambia la regla. El
+// filtro sigue siendo útil (nunca inventa modelos ni los mezcla con los api).
+func TestListTypeDownloadedDegradesWithoutAnySource(t *testing.T) {
+	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
 	setBridge(t, fakeBridgeSource{})
 
 	c, w := testCtx(t, "/api/v1/models?type=downloaded")
 	withTenant(c, 7)
 	m.List(c)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("status=%d body=%s", code, w.Body.String())
+	}
+	if len(env.Data) != 0 {
+		t.Fatalf("expected no downloaded models, got %+v", env.Data)
 	}
 }
 
@@ -575,9 +617,9 @@ func TestListImageMerged(t *testing.T) {
 	m.ListByModality(c)
 	env, code := decode(t, w)
 
-	// Static image models (2 gemini + seedream + 3 higgsfield) + live Wan image.
-	if code != http.StatusOK || len(env.Data) < 6 {
-		t.Fatalf("image merged: want >= 6, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	// Static image models (3 gemini + seedream + 7 higgsfield) + live Wan image.
+	if code != http.StatusOK || len(env.Data) < 10 {
+		t.Fatalf("image merged: want >= 10, got %d (status %d): %s", len(env.Data), code, w.Body.String())
 	}
 	hf := 0
 	for _, mm := range env.Data {
@@ -585,8 +627,8 @@ func TestListImageMerged(t *testing.T) {
 			hf++
 		}
 	}
-	if hf != 3 {
-		t.Fatalf("image merged: want 3 higgsfield models, got %d", hf)
+	if hf != 7 {
+		t.Fatalf("image merged: want 7 higgsfield models, got %d", hf)
 	}
 }
 
@@ -615,7 +657,7 @@ func TestWorkerStatusUnconfigured(t *testing.T) {
 	SetWorkerAddr("")
 	t.Cleanup(func() { SetWorkerAddr("") })
 
-	m := NewModule(allUsableResolver())
+	m := NewModule(allUsableResolver(), "")
 	c, w := testCtx(t, "/api/v1/worker/status")
 	m.WorkerStatus(c)
 
@@ -676,11 +718,17 @@ func TestListTypeDownloadedMapsLiveState(t *testing.T) {
 	if sd.Downloaded == nil || !sd.Downloaded.Downloading || sd.Downloaded.DownloadPercent != 42.5 || sd.Downloaded.SizeBytes != 420 {
 		t.Fatalf("live download state not mapped: %+v", sd.Downloaded)
 	}
+	// La ruta de los pesos la reporta el worker y el back la reenvía tal cual:
+	// es la máquina del worker, no el disco del back.
+	if !sd.Downloaded.Downloaded ||
+		sd.Downloaded.DownloadPath != "/home/u/.cache/huggingface/hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5" {
+		t.Fatalf("weights path not mapped: %+v", sd.Downloaded)
+	}
 }
 
 func TestListTypeAPIRespectsCredentials(t *testing.T) {
 	setup(t)
-	m := NewModule(testResolver(map[string]bool{string(ProviderBytePlus): true}))
+	m := NewModule(testResolver(map[string]bool{string(ProviderBytePlus): true}), "")
 
 	want := 0
 	for _, item := range catalog {
@@ -704,7 +752,7 @@ func TestListTypeAPIRespectsCredentials(t *testing.T) {
 
 func TestListWithoutTenantCredentialsFailsClosed(t *testing.T) {
 	setup(t)
-	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return nil, false })
+	m := NewModule(func(*gin.Context) (CredentialLister, bool) { return nil, false }, "")
 
 	c, w := testCtx(t, "/api/v1/models")
 	m.List(c)
@@ -873,17 +921,35 @@ func TestWorkerWriteRejectsUnconfiguredWorker(t *testing.T) {
 	}
 }
 
-func TestContextCancellationPropagates(t *testing.T) {
+// Un contexto ya cancelado no cuelga el handler ni se disfraza de catálogo:
+// la lectura al worker muere rápido y degrada a lista vacía, igual que un
+// worker apagado. El status sigue siendo 200 porque el cliente que canceló ya
+// no está escuchando y el worker es opcional.
+func TestCancelledContextDegradesInsteadOfHanging(t *testing.T) {
 	m, _ := setup(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already dead: the live read must fail, not hang
+	cancel() // already dead: the live read must return, not hang
 
 	c, w := testCtx(t, "/api/v1/models?type=downloaded")
 	c.Request = c.Request.WithContext(ctx)
-	m.List(c)
 
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("cancelled context: status=%d body=%s", w.Code, w.Body.String())
+	done := make(chan struct{})
+	go func() {
+		m.List(c)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler hung on a cancelled context")
+	}
+
+	env, code := decode(t, w)
+	if code != http.StatusOK || !env.Success {
+		t.Fatalf("cancelled context: status=%d body=%s", code, w.Body.String())
+	}
+	if len(env.Data) != 0 {
+		t.Fatalf("cancelled context produced models: %+v", env.Data)
 	}
 }
