@@ -424,8 +424,10 @@ func (g *DownloadedGenerator) bridgeJobForTask(taskID string) *workerbridge.Job 
 // worker_jobs (la GPU reporta por HTTP y el artefacto se sube al back) en
 // cada poll; los centrales del mapa local en memoria.
 func (g *DownloadedGenerator) GetStatus(taskID, apiKey, baseURL, endpoint string) (*agency.GeneratorResult, error) {
+	// Un solo read de worker_jobs por poll: el job ya traído se mapea
+	// directo en vez de consultar la DB dos veces por cada encuesta.
 	if job := g.bridgeJobForTask(taskID); job != nil {
-		return g.bridgeStatus(taskID)
+		return g.bridgeStatusFromJob(job, taskID), nil
 	}
 	ts, ok := g.store.get(taskID)
 	if !ok {
@@ -469,20 +471,10 @@ func outputType(name string) string {
 	}
 }
 
-// bridgeStatus mapea una fila de worker_jobs al resultado del generator.
-// Un job desconocido (la DB no lo tiene) se reporta running para que el
-// reconciler siga preguntando, igual que el camino gRPC.
-func (g *DownloadedGenerator) bridgeStatus(taskID string) (*agency.GeneratorResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
-	defer cancel()
-	job, err := g.bridge.JobByTaskID(ctx, g.tenantID, taskID)
-	if err != nil {
-		// Todavía sin fila visible: running optimista (el encolado es reciente).
-		return &agency.GeneratorResult{
-			TaskID: taskID, Status: config.STATUS_RUNNING,
-			Raw: map[string]interface{}{"job_id": taskID, "engine": "inference-worker-bridge"},
-		}, nil
-	}
+// bridgeStatusFromJob mapea una fila de worker_jobs al resultado del
+// generator. Recibe el job ya leído por bridgeJobForTask: un solo read de
+// DB por poll, importante cuando el front encuesta cada pocos segundos.
+func (g *DownloadedGenerator) bridgeStatusFromJob(job *workerbridge.Job, taskID string) *agency.GeneratorResult {
 	result := &agency.GeneratorResult{
 		TaskID: taskID,
 		Status: config.STATUS_RUNNING,
@@ -512,7 +504,7 @@ func (g *DownloadedGenerator) bridgeStatus(taskID string) (*agency.GeneratorResu
 		result.Status = config.STATUS_FAILED
 		result.Error = "cancelled"
 	}
-	return result, nil
+	return result
 }
 
 // CancelTask drops the local stream and asks the worker to abort the job.
