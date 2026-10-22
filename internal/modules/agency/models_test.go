@@ -40,7 +40,7 @@ func TestLookupModelFallsBackToBridge(t *testing.T) {
 	}}
 	c := newBridgeCore(f.resolve)
 
-	got := c.lookupModel("SDXL-Turbo")
+	got := c.lookupModel("SDXL-Turbo", "")
 	if got == nil {
 		t.Fatal("bridge model not resolved")
 	}
@@ -59,7 +59,7 @@ func TestLookupModelResolvesBridgeModelWithoutWeights(t *testing.T) {
 		Name: "FLUX.1-dev", Modality: model.ModalityImage, Available: false,
 	}}).resolve)
 
-	if got := c.lookupModel("FLUX.1-dev"); got == nil || got.Modality != model.ModalityImage {
+	if got := c.lookupModel("FLUX.1-dev", ""); got == nil || got.Modality != model.ModalityImage {
 		t.Fatalf("resolved %+v, want the declared model", got)
 	}
 }
@@ -68,7 +68,7 @@ func TestLookupModelUnknownNameStaysNil(t *testing.T) {
 	f := &fakeBridgeModels{} // ninguna GPU declara el nombre
 	c := newBridgeCore(f.resolve)
 
-	if got := c.lookupModel("Nope-1"); got != nil {
+	if got := c.lookupModel("Nope-1", ""); got != nil {
 		t.Fatalf("resolved %+v, want nil", got)
 	}
 	if f.calls != 1 {
@@ -82,7 +82,7 @@ func TestLookupModelPrefersStaticCatalog(t *testing.T) {
 	f := &fakeBridgeModels{ref: &BridgeModelRef{Name: apiModel}}
 	c := newBridgeCore(f.resolve)
 
-	got := c.lookupModel(apiModel)
+	got := c.lookupModel(apiModel, "")
 	if got == nil || got.Type != model.TypeAPI {
 		t.Fatalf("resolved %+v, want the API catalog entry", got)
 	}
@@ -98,7 +98,7 @@ func TestLookupModelResolvesLocalProviderNames(t *testing.T) {
 	f := &fakeBridgeModels{}
 	c := newBridgeCore(f.resolve)
 
-	got := c.lookupModel("ollama/qwen2.5:7b")
+	got := c.lookupModel("ollama/qwen2.5:7b", "")
 	if got == nil {
 		t.Fatal("local model not resolved")
 	}
@@ -118,7 +118,7 @@ func TestLookupModelResolvesLocalProviderNames(t *testing.T) {
 		t.Fatalf("bridge resolver called %d times for a local model", f.calls)
 	}
 
-	if lm := c.lookupModel("lmstudio/qwen2.5-7b-instruct"); lm == nil || lm.CredentialProvider != model.ProviderLMStudio {
+	if lm := c.lookupModel("lmstudio/qwen2.5-7b-instruct", ""); lm == nil || lm.CredentialProvider != model.ProviderLMStudio {
 		t.Fatalf("lmstudio model resolved as %+v", lm)
 	}
 }
@@ -126,7 +126,7 @@ func TestLookupModelResolvesLocalProviderNames(t *testing.T) {
 // Sin bridge (deploy con worker central) el comportamiento no cambia.
 func TestLookupModelWithoutBridgeSource(t *testing.T) {
 	c := NewCore(&config.Config{}, nil, nil, "", "")
-	if got := c.lookupModel("SDXL-Turbo"); got != nil {
+	if got := c.lookupModel("SDXL-Turbo", ""); got != nil {
 		t.Fatalf("resolved %+v without a bridge source, want nil", got)
 	}
 }
@@ -137,7 +137,7 @@ func TestLookupModelBridgeErrorIsNotAModel(t *testing.T) {
 	c := newBridgeCore(func(context.Context, string) (*BridgeModelRef, error) {
 		return nil, errors.New("registry down")
 	})
-	if got := c.lookupModel("SDXL-Turbo"); got != nil {
+	if got := c.lookupModel("SDXL-Turbo", ""); got != nil {
 		t.Fatalf("resolved %+v on registry failure, want nil", got)
 	}
 }

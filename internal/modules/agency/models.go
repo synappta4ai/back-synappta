@@ -26,7 +26,9 @@ type modelEntry struct {
 // LookupModel resolves a model from the read-only code catalog, falling back
 // to a live lookup on the inference worker for downloaded models. Downloaded
 // names are never cached: every unknown name hits the worker once per call.
-func LookupModel(name string) *modelEntry {
+// workerAddr is the address of the inference worker to consult for downloaded
+// models (can be a per-user worker). Empty means no worker lookup is possible.
+func LookupModel(name string, workerAddr string) *modelEntry {
 	if m := model.ByName(name); m != nil {
 		return &modelEntry{
 			Name:               m.Name,
@@ -96,14 +98,17 @@ func LookupModel(name string) *modelEntry {
 	}
 
 	// Downloaded models: ask the worker live (no cache, no local copy).
-	addr := model.WorkerAddr()
 	c := model.WorkerClient()
+	addr := workerAddr
+	if addr == "" {
+		addr = model.WorkerAddr() // fallback a la dirección global (BM_WORKER_ADDR)
+	}
 	if addr == "" || c == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	live, err := model.ListUsable(ctx, addr)
+	live, err := model.ListUsable(ctx, workerAddr)
 	if err != nil {
 		log.Printf("[agency] live model lookup for %q failed: %v", name, err)
 		return nil
@@ -156,8 +161,8 @@ func (s *Core) SetBridgeModels(resolve BridgeModelResolver) { s.bridgeModels = r
 // del tenant. Sin este segundo paso un modelo que sólo existe en la GPU del
 // usuario moría en "model not found" antes de llegar al generator (y su
 // modalidad —image vs video— se perdía).
-func (s *Core) lookupModel(name string) *modelRef {
-	if m := LookupModel(name); m != nil {
+func (s *Core) lookupModel(name string, workerAddr string) *modelRef {
+	if m := LookupModel(name, workerAddr); m != nil {
 		return m
 	}
 	if s.bridgeModels == nil {

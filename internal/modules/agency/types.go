@@ -55,6 +55,11 @@ type GenerateRequest struct {
 	UserID           int    `json:"user_id"`
 	// ResourceType — lo setea cada dominio (video/image/audio/text) automáticamente.
 	ResourceType string `json:"-"`
+	// WorkerAddr es la dirección del inference worker de este usuario para
+	// modelos "downloaded". Si va vacío, el back usa BM_WORKER_ADDR global
+	// (el único del deploy). Cada usuario puede apuntar a su propio worker
+	// local sin que haya que quemar IPs en los env.
+	WorkerAddr string `json:"worker_addr,omitempty"`
 }
 
 // OutputResource represents a single generated output (video, image, audio, text).
@@ -159,6 +164,9 @@ type GeneratorRequest struct {
 	// carries more than one reference, which the single-image i2v route cannot
 	// express.
 	ReferenceEndpoint string
+	// WorkerAddr es la dirección del inference worker para modelos descargados.
+	// Si va vacío, el generator usa su dirección global (BM_WORKER_ADDR).
+	WorkerAddr string
 }
 
 // GeneratorResult is the response returned by a generator.

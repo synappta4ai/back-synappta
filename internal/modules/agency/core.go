@@ -124,8 +124,14 @@ func (s *Core) SetOutputPublisher(p OutputPublisher) { s.outputPublisher = p }
 // RegisterGenerator registers a generator that satisfies PipelineRunner.
 func (s *Core) RegisterGenerator(gen PipelineRunner) { s.pipelineGens = append(s.pipelineGens, gen) }
 
-func (s *Core) pickGenerator(modelName string) PipelineRunner {
+func (s *Core) pickGenerator(modelName string, workerAddr string) PipelineRunner {
 	for _, g := range s.pipelineGens {
+		// Los generators que soporten worker_addr per-request lo reciben antes
+		// de Match, para que DownloadedGenerator resuelva contra el worker
+		// correcto (Option B) o contra el global (BM_WORKER_ADDR).
+		if setter, ok := g.(interface{ SetWorkerAddr(string) }); ok {
+			setter.SetWorkerAddr(workerAddr)
+		}
 		if g.Match(modelName) {
 			return g
 		}
@@ -280,8 +286,9 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	}()
 
 	// Look up model in the code catalog (API + worker central + GPUs
-	// emparejadas del tenant).
-	m := s.lookupModel(req.Model)
+	// emparejadas del tenant). workerAddr puede ser la dirección de un
+	// worker propio del usuario (Option B) o vacía para usar la global.
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		errLog = fmt.Sprintf("model not found: %s", req.Model)
 		return nil, fmt.Errorf("model not found: %s", req.Model)
@@ -335,6 +342,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		InputDuration: inputDuration,
 		APIKey:        creds.APIKey,
 		AuthKey:       creds.AuthKey(),
+		WorkerAddr:    req.WorkerAddr,
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -357,8 +365,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}
 
-	// Pick generator
-	gen := s.pickGenerator(m.Name)
+	// Pick generator (pasa worker_addr para Option B).
+	gen := s.pickGenerator(m.Name, req.WorkerAddr)
 	if gen == nil {
 		errLog = fmt.Sprintf("no generator available for model: %s", m.Name)
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
@@ -588,7 +596,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		}
 	}
 
-	m := s.lookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
 	}
@@ -602,7 +610,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -785,7 +793,7 @@ func (s *Core) CancelTask(taskID string) error {
 		return fmt.Errorf("unknown task: %s", taskID)
 	}
 
-	m := s.lookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return fmt.Errorf("model for task %s not found", taskID)
 	}
@@ -799,7 +807,7 @@ func (s *Core) CancelTask(taskID string) error {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -812,7 +820,7 @@ func (s *Core) CancelTask(taskID string) error {
 
 // PreviewPayload builds the AI API payload without sending it or saving logs.
 func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, error) {
-	m := s.lookupModel(req.Model)
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
@@ -858,7 +866,7 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 		genReq.GenerateAudio = *req.GenerateAudio
 	}
 
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -898,11 +906,11 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		return sr, nil
 	}
 
-	m := s.lookupModel(logEntry.ModelName)
+	m := s.lookupModel(logEntry.ModelName, "")
 	if m == nil {
 		return &StatusResult{Status: logEntry.Status, Error: "model not found for task " + logEntry.TaskID}, nil
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return &StatusResult{Status: logEntry.Status}, nil
 	}
@@ -1143,7 +1151,7 @@ func (s *Core) SyncAsset(modelName, fileID string) (*SyncAssetResult, error) {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
 
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}
@@ -1281,7 +1289,7 @@ func (s *Core) GallerySyncContent(items []ContentItem, modelName string) ([]Cont
 	if s.assetStore == nil {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}

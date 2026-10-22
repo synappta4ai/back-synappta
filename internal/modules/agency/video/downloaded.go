@@ -97,6 +97,23 @@ func (g *DownloadedGenerator) SetBridge(q BridgeQueue, tenantID int64) {
 // instead of the direct gRPC stream.
 func (g *DownloadedGenerator) bridgeMode() bool { return g.bridge != nil && g.addr == "" }
 
+// SetWorkerAddr sobreescribe la dirección del worker para este generador.
+// Útil como fallback global; se prefiere WorkerAddr del request (Option B).
+func (g *DownloadedGenerator) SetWorkerAddr(addr string) { g.addr = addr }
+
+// effectiveAddr devuelve la dirección del worker a usar: la del request si
+// se proporcionó (Option B), o la global del generador (BM_WORKER_ADDR), o la
+// global del paquete model como último recurso.
+func (g *DownloadedGenerator) effectiveAddr(reqAddr string) string {
+	if strings.TrimSpace(reqAddr) != "" {
+		return reqAddr
+	}
+	if g.addr != "" {
+		return g.addr
+	}
+	return model.WorkerAddr()
+}
+
 func (g *DownloadedGenerator) Name() string        { return g.label }
 func (g *DownloadedGenerator) ContentType() string { return "video" }
 
@@ -105,7 +122,7 @@ func (g *DownloadedGenerator) ContentType() string { return "video" }
 // la validación real (¿la GPU puede correrlo?) ocurre en Validate contra el
 // snapshot del registry y, finalmente, en el worker al ejecutar.
 func (g *DownloadedGenerator) Match(modelName string) bool {
-	m := agency.LookupModel(modelName)
+	m := agency.LookupModel(modelName, g.addr)
 	if m != nil {
 		return m.Type == model.TypeDownloaded
 	}
@@ -148,12 +165,13 @@ func (g *DownloadedGenerator) Validate(req *agency.GeneratorRequest) error {
 		}
 		return fmt.Errorf("la GPU conectada no tiene el modelo %q", req.Model)
 	}
-	if g.addr == "" {
+	addr := g.effectiveAddr(req.WorkerAddr)
+	if addr == "" {
 		return fmt.Errorf("inference worker not configured (BM_WORKER_ADDR)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	if err := g.client.Ping(ctx, g.addr); err != nil {
+	if err := g.client.Ping(ctx, addr); err != nil {
 		return fmt.Errorf("inference worker unreachable: %w", err)
 	}
 	return nil
@@ -217,9 +235,12 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		gReq.NumFrames = int32(clampInt(req.Duration*16, 8, 257)) // 16 fps
 	}
 
+	// Dirección del worker para este job: per-request (Option B) o global.
+	addr := g.effectiveAddr(req.WorkerAddr)
+
 	// Registro el task ANTES de arrancar cualquier goroutine/encolado: un
 	// poll inmediato no debe ver el estado "unknown".
-	g.store.init(jobID, req.Model)
+	g.store.init(jobID, req.Model, addr)
 
 	// ── Camino bridge: el trabajo queda en la DB y la GPU del usuario lo
 	// reclama por HTTP. El estado vive en worker_jobs, no en memoria.
@@ -255,7 +276,7 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 			cancel()
 			g.store.detachCancel(jobID)
 		}()
-		if err := g.streamJob(ctx, gReq); err != nil {
+		if err := g.streamJob(ctx, gReq, addr); err != nil {
 			log.Printf("[downloaded] job %s stream error: %v", jobID, err)
 			g.store.fail(jobID, fmt.Sprintf("stream lost: %v", err))
 		}
@@ -302,11 +323,11 @@ func shortWorker(id string) string {
 // streamJob consumes one GenerateMedia stream and mirrors every event into
 // the task store. On COMPLETED the artifact is pulled from the worker
 // (shared disk or artifact server) and re-hosted under Synapta's outputs.
-func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.MediaGenerationRequest) error {
+func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.MediaGenerationRequest, addr string) error {
 	sctx, scancel := context.WithTimeout(ctx, streamTimeout)
 	defer scancel()
 
-	return g.client.StreamGeneration(sctx, g.addr, req, func(ev worker.StreamEvent) {
+	return g.client.StreamGeneration(sctx, addr, req, func(ev worker.StreamEvent) {
 		switch ev.Status {
 		case "COMPLETED":
 			g.store.complete(req.JobId, ev.OutputPath)
@@ -435,9 +456,13 @@ func (g *DownloadedGenerator) CancelTask(taskID, apiKey, baseURL, endpoint strin
 	if cancel, ok := g.store.cancelFunc(taskID); ok {
 		cancel()
 	}
+	addr := g.store.workerAddr(taskID)
+	if addr == "" {
+		addr = g.addr
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	accepted, err := g.client.CancelGeneration(ctx, g.addr, taskID)
+	accepted, err := g.client.CancelGeneration(ctx, addr, taskID)
 	if err != nil {
 		return fmt.Errorf("worker cancel: %w", err)
 	}
@@ -466,6 +491,7 @@ func (g *DownloadedGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 // downloadedTask is the live state of one job, filled by the stream consumer.
 type downloadedTask struct {
 	Model        string
+	WorkerAddr   string // dirección del worker usada para este job (per-request o global)
 	Status       string // config.STATUS_RUNNING until terminal
 	StreamStatus string // worker-side: SUBMITTED | LOADING_MODEL | GENERATING | ...
 	Percent      float64
@@ -488,10 +514,20 @@ func newDownloadedTaskStore() *downloadedTaskStore {
 	}
 }
 
-func (s *downloadedTaskStore) init(jobID, model string) {
+func (s *downloadedTaskStore) init(jobID, model, workerAddr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[jobID] = &downloadedTask{Model: model, Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED"}
+	s.tasks[jobID] = &downloadedTask{Model: model, WorkerAddr: workerAddr, Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED"}
+}
+
+// workerAddr devuelve la dirección del worker registrada para un job (o "" si no hay).
+func (s *downloadedTaskStore) workerAddr(jobID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if t, ok := s.tasks[jobID]; ok {
+		return t.WorkerAddr
+	}
+	return ""
 }
 
 func (s *downloadedTaskStore) progress(jobID string, pct float64, streamStatus string) {
