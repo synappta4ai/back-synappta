@@ -1,16 +1,125 @@
-/**
- * Valida si un back resuelve modelos "downloaded" (SD-1.5) mediante el worker.
- *
- * Uso:
- *   node scripts/validate-worker-models.mjs
- *   node scripts/validate-worker-models.mjs --remote https://back-dev.synappta.cloud --local http://localhost:8099 --token <jwt>
- *
- * Salida: código 0 si ambos backs responden y resuelven SD-1.5; código 1 si el
- * remoto falla (binario viejo sin BM_WORKER_ADDR o worker inalcanzable).
- */
+// scripts/validate-worker-models.mjs
+// Diagnóstico irrefutable: back → worker para modelos downloaded (SD-1.5).
+// Solo requiere HTTP al back; no entra al servidor.
+//
+// Uso:
+//   node scripts/validate-worker-models.mjs --remote https://back-dev.synappta.cloud --token <jwt>
+//   node scripts/validate-worker-models.mjs --remote https://back-dev.synappta.cloud --local http://localhost:8099 --token <jwt> --generate
+//
+// Códigos de salida:
+//   0 = todos los checks pasaron
+//   1 = hay fallos (el back no alcanza al worker o SD-1.5 no está disponible)
+//   2 = error inesperado
 
 const REMOTE_DEFAULT = "https://back-dev.synappta.cloud";
 const LOCAL_DEFAULT = "http://localhost:8099";
+
+let passed = 0;
+let failed = 0;
+
+function check(name, ok, detail = "") {
+  const status = ok ? "PASS" : "FAIL";
+  console.log(`[${status}] ${name} ${detail ? "- " + detail : ""}`);
+  if (ok) passed++; else failed++;
+}
+
+async function fetchJson(url, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...opts.headers };
+  if (opts.token) headers["Authorization"] = `Bearer ${opts.token}`;
+  const res = await fetch(url, { ...opts, headers });
+  let body;
+  try { body = await res.json(); } catch { body = await res.text(); }
+  return { ok: res.ok, status: res.status, body };
+}
+
+function findSD15(models) {
+  if (!Array.isArray(models)) return null;
+  return models.find((m) => m && (m.key === "SD-1.5" || m.name === "SD-1.5"));
+}
+
+async function checkReadiness(base, token) {
+  try {
+    const { status, body } = await fetchJson(`${base}/readyz`, { token });
+    const ok = status === 200;
+    check("1. /readyz", ok, `HTTP ${status} ${ok ? "" : JSON.stringify(body)}`);
+    return ok;
+  } catch (e) {
+    check("1. /readyz", false, `ERROR: ${e.message}`);
+    return false;
+  }
+}
+
+async function checkDiagnostic(base, token) {
+  try {
+    const { status, body } = await fetchJson(`${base}/api/v1/worker/diagnostic`, { token });
+    if (status !== 200) {
+      check("2. /api/v1/worker/diagnostic", false, `HTTP ${status}`);
+      return false;
+    }
+    const configured = body.configured === true;
+    const connected = body.connected === true;
+    const ping = body.ping_ms ?? "?";
+    const modelCount = body.model_count ?? 0;
+    const sd = findSD15(body.models);
+    const sdAvailable = sd ? sd.available === true : false;
+    const sdDownloaded = sd ? sd.downloaded === true : false;
+    const sdSize = sd ? sd.size_bytes ?? 0 : 0;
+    const detail = `HTTP ${status} configured=${configured} connected=${connected} ping=${ping}ms models=${modelCount} SD-1.5 available=${sdAvailable} downloaded=${sdDownloaded} size=${sdSize}B`;
+    const ok = configured && connected && modelCount > 0 && sdAvailable;
+    check("2. /api/v1/worker/diagnostic", ok, detail);
+    return ok;
+  } catch (e) {
+    check("2. /api/v1/worker/diagnostic", false, `ERROR: ${e.message}`);
+    return false;
+  }
+}
+
+async function checkModelsDownloaded(base, token) {
+  try {
+    const { status, body } = await fetchJson(`${base}/api/v1/models?type=downloaded`, { token });
+    if (status !== 200) {
+      check("3. /api/v1/models?type=downloaded", false, `HTTP ${status}`);
+      return false;
+    }
+    const data = body.data ?? body.models ?? body ?? [];
+    const models = Array.isArray(data) ? data : [];
+    const sd = findSD15(models);
+    const ok = models.length > 0 && !!sd;
+    check("3. /api/v1/models?type=downloaded", ok, `HTTP ${status} modelos=${models.length} SD-1.5=${!!sd}`);
+    return ok;
+  } catch (e) {
+    check("3. /api/v1/models?type=downloaded", false, `ERROR: ${e.message}`);
+    return false;
+  }
+}
+
+async function checkGenerateSD15(base, token) {
+  const payload = {
+    model: "SD-1.5",
+    content: [{ type: "text", text: "perro ranchero" }],
+    ratio: "1:1",
+    resolution: "480p",
+    seed: "20",
+    event_id: "validate-" + crypto.randomUUID(),
+    piece_id: crypto.randomUUID(),
+    piece_code: "VAL-20261022",
+    generation_number: 1,
+  };
+  try {
+    const { status, body } = await fetchJson(`${base}/api/v1/agency/image/generate`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+      token,
+    });
+    const ok = status === 200 && body.success === true;
+    const taskId = (body.data && (body.data.taskId ?? body.data.id)) ?? "-";
+    check("4. POST /agency/image/generate (SD-1.5)", ok, `HTTP ${status} success=${body.success} taskId=${taskId} message=${body.message ?? "-"}`);
+    return ok;
+  } catch (e) {
+    check("4. POST /agency/image/generate (SD-1.5)", false, `ERROR: ${e.message}`);
+    return false;
+  }
+}
 
 function parseArgs(argv) {
   const args = { remote: REMOTE_DEFAULT, local: LOCAL_DEFAULT, token: undefined, generate: false };
@@ -28,139 +137,40 @@ function parseArgs(argv) {
   return args;
 }
 
-async function fetchJson(url, opts = {}) {
-  const headers = { "Content-Type": "application/json", ...opts.headers };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
-  const res = await fetch(url, { ...opts, headers });
-  let body;
-  try { body = await res.json(); } catch (_) { body = await res.text(); }
-  return { ok: res.ok, status: res.status, body, headers: res.headers };
-}
-
-function pad(s, n) {
-  s = String(s);
-  return s.length >= n ? s : s + " ".repeat(n - s.length);
-}
-
-async function checkReadyz(base, label, token) {
-  const { status, body } = await fetchJson(`${base}/readyz`, { token });
-  return { label, endpoint: "/readyz", status, body };
-}
-
-async function checkDiagnostic(base, label, token) {
-  const { status, body } = await fetchJson(`${base}/api/v1/worker/diagnostic`, { token });
-  return { label, endpoint: "/api/v1/worker/diagnostic", status, body };
-}
-
-async function checkModelsDownloaded(base, label, token) {
-  const { status, body } = await fetchJson(`${base}/api/v1/models?type=downloaded`, { token });
-  return { label, endpoint: "/api/v1/models?type=downloaded", status, body };
-}
-
-async function tryGenerateSD15(base, label, token) {
-  const payload = {
-    model: "SD-1.5",
-    content: [{ type: "text", text: "crea un perro ranchero" }],
-    ratio: "1:1",
-    resolution: "480p",
-    seed: "20",
-    event_id: "validate-" + crypto.randomUUID(),
-    piece_id: crypto.randomUUID(),
-    piece_code: "VAL-20261022",
-    generation_number: 1,
-  };
-  const { status, body } = await fetchJson(`${base}/api/v1/agency/image/generate`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-    token,
-  });
-  return { label, endpoint: "POST /api/v1/agency/image/generate (SD-1.5)", status, body };
-}
-
-function summarize(result) {
-  const lines = [];
-  lines.push(`  ${result.endpoint} → HTTP ${result.status}`);
-  const b = result.body;
-  if (b && typeof b === "object") {
-    if (b.success !== undefined) lines.push(`    success=${b.success} message=${b.message ?? "-"}`);
-    if (b.configured !== undefined) lines.push(`    worker.configured=${b.configured} connected=${b.connected} ping_ms=${b.ping_ms ?? "-"}`);
-    if (b.models && Array.isArray(b.models)) {
-      const sd = b.models.find((m) => m.key === "SD-1.5" || m.name === "SD-1.5");
-      lines.push(`    modelos downloaded=${b.models.length}`);
-      if (sd) lines.push(`    SD-1.5: available=${sd.available} downloaded=${sd.downloaded} size_bytes=${sd.size_bytes} path=${sd.download_path ?? "-"}`);
-      else lines.push(`    SD-1.5: NO APARECE en el catálogo`);
-    }
-    if (b.error) lines.push(`    error=${b.error}`);
-    if (b.state) lines.push(`    state=${b.state}`);
-  } else if (typeof b === "string") {
-    lines.push(`    body=${b.slice(0, 200)}`);
-  }
-  return lines.join("\n");
-}
-
 async function main() {
   const args = parseArgs(process.argv);
-  console.log("=== Validación de resolución de modelos downloaded (worker) ===\n");
+  console.log("=== Diagnóstico irrefutable: back → worker (modelos downloaded) ===\n");
   console.log(`Remoto : ${args.remote}`);
-  console.log(`Local  : ${args.local}\n`);
+  if (args.local) console.log(`Local  : ${args.local}`);
+  if (!args.token) console.log("Token : (no proporcionado - solo /readyz se probará)");
+  console.log("");
 
-  let failures = 0;
+  let allOk = true;
 
-  for (const [base, label] of [[args.remote, "REMOTO"], [args.local, "LOCAL"]]) {
+  const targets = args.local ? [[args.remote, "REMOTO"], [args.local, "LOCAL"]] : [[args.remote, "REMOTO"]];
+
+  for (const [base, label] of targets) {
     console.log(`───── ${label} (${base}) ─────`);
-
-    // 1. readyz
-    let r;
-    try { r = await checkReadyz(base, label, args.token); } catch (e) {
-      console.log(`  /readyz → ERROR: ${e.message}`);
-      failures++;
-      continue;
-    }
-    console.log(summarize(r));
-
-    // 2. diagnostic (sólo si hay token)
+    const r1 = await checkReadiness(base, args.token);
     if (args.token) {
-      let d;
-      try {
-        d = await checkDiagnostic(base, label, args.token);
-        console.log(summarize(d));
-      } catch (e) {
-        console.log(`  /api/v1/worker/diagnostic → ERROR: ${e.message}`);
-        failures++;
-      }
-
-      // 3. modelos downloaded
-      let m;
-      try {
-        m = await checkModelsDownloaded(base, label, args.token);
-        console.log(summarize(m));
-      } catch (e) {
-        console.log(`  /api/v1/models?type=downloaded → ERROR: ${e.message}`);
-        failures++;
-      }
-
-      // 4. intento de generación con SD-1.5 (opcional)
-      if (args.generate) {
-        let g;
-        try {
-          g = await tryGenerateSD15(base, label, args.token);
-          console.log(summarize(g));
-        } catch (e) {
-          console.log(`  POST /agency/image/generate (SD-1.5) → ERROR: ${e.message}`);
-          failures++;
-        }
-      }
+      const r2 = await checkDiagnostic(base, args.token);
+      const r3 = await checkModelsDownloaded(base, args.token);
+      if (args.generate) await checkGenerateSD15(base, args.token);
+      if (!r1 || !r2 || !r3) allOk = false;
+    } else {
+      if (!r1) allOk = false;
     }
     console.log("");
   }
 
-  console.log("=== Veredicto ===");
-  if (failures === 0) {
-    console.log("Ambos backs responden y resuelven modelos downloaded.");
+  console.log("=== RESUMEN ===");
+  console.log(`Checks pasados: ${passed} | Checks fallidos: ${failed}`);
+  if (allOk && failed === 0) {
+    console.log("RESULTADO: TODOS LOS CHECKS PASARON. El back resuelve modelos downloaded correctamente.");
     process.exit(0);
   } else {
-    console.log(`Se detectaron ${failures} fallo(s). El remoto probablemente corre un binario viejo`);
-    console.log("sin BM_WORKER_ADDR o sin alcanzar al worker. Redeployá con deploy-sslip.sh.");
+    console.log("RESULTADO: HAY FALLOS. El back no alcanza al worker o SD-1.5 no está disponible.");
+    console.log("Acción: revisá BM_WORKER_ADDR en el back, que el worker responda en :50051, y redeploy si es necesario.");
     process.exit(1);
   }
 }
