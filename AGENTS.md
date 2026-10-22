@@ -158,5 +158,11 @@ Si tocás un archivo de este repo, **actualizá la versión antes de hacer push*
   wait for `readyz=200`. Build first with
   `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/synapta-linux .`.
   Needs the SSH key authorized on the target host.
+- `validate-worker-models.mjs` — valida si un back resuelve modelos
+  "downloaded" (SD-1.5) vía el worker. Chequea `/readyz`,
+  `/api/v1/worker/diagnostic`, `/api/v1/models?type=downloaded` y, opcional,
+  `POST /api/v1/agency/image/generate`. Úsalo para comparar remoto vs local:
+  `node scripts/validate-worker-models.mjs --remote <url> --local <url>
+  --token <jwt>`.
 - Never commit `.env`, `.env.e2e` or `*.log`; `bin/` and `*.log` are
   gitignored.
