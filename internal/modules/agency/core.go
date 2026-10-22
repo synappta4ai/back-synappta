@@ -128,9 +128,14 @@ func (s *Core) pickGenerator(modelName string, workerAddr string) PipelineRunner
 	for _, g := range s.pipelineGens {
 		// Los generators que soporten worker_addr per-request lo reciben antes
 		// de Match, para que DownloadedGenerator resuelva contra el worker
-		// correcto (Option B) o contra el global (BM_WORKER_ADDR).
-		if setter, ok := g.(interface{ SetWorkerAddr(string) }); ok {
-			setter.SetWorkerAddr(workerAddr)
+		// correcto (Option B) o contra el global (BM_WORKER_ADDR). Solo se
+		// propaga un valor no vacío: un request sin worker_addr no debe
+		// borrar la dirección global del generator (multi-usuario: cada
+		// request comparte el mismo generator del tenant).
+		if workerAddr != "" {
+			if setter, ok := g.(interface{ SetWorkerAddr(string) }); ok {
+				setter.SetWorkerAddr(workerAddr)
+			}
 		}
 		if g.Match(modelName) {
 			return g

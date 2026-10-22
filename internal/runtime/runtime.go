@@ -363,12 +363,17 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	//     restarts on both sides).
 	dlGen := agencyvideo.NewDownloadedGenerator(
 		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir)
-	if m.workerBridgeStore != nil && m.cfg.WorkerAddr == "" {
+	// Bridge siempre activo cuando hay store: cada usuario puede emparejar
+	// su propia GPU (multi-usuario) y generar aunque haya un worker
+	// central configurado. El generator prefiere el central cuando está
+	// vivo y cae al bridge cuando no lo está o no tiene el modelo.
+	if m.workerBridgeStore != nil {
 		dlGen.SetBridge(m.workerBridgeStore, t.ID)
-		// Sin worker central, los snapshots de las GPUs emparejadas son la
-		// única fuente viva de modelos "downloaded": el core los resuelve
-		// para generar (modalidad incluida) en vez de responder "model not
-		// found" a todo modelo que sólo vive en la máquina del usuario.
+		// Los snapshots de las GPUs emparejadas del tenant son fuente viva
+		// de modelos "downloaded" junto al worker central: el core los
+		// resuelve para generar (modalidad incluida) en vez de responder
+		// "model not found" a todo modelo que sólo vive en la máquina del
+		// usuario.
 		core.SetBridgeModels(bridgeModelResolver(m.workerBridgeStore, t.ID))
 	}
 	core.RegisterGenerator(dlGen)

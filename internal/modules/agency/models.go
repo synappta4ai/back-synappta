@@ -108,7 +108,7 @@ func LookupModel(name string, workerAddr string) *modelEntry {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	live, err := model.ListUsable(ctx, workerAddr)
+	live, err := model.ListUsable(ctx, addr)
 	if err != nil {
 		log.Printf("[agency] live model lookup for %q failed: %v", name, err)
 		return nil
