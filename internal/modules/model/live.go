@@ -55,6 +55,21 @@ func workerAddr() string {
 // (agency live model resolution).
 func WorkerAddr() string { return workerAddr() }
 
+// WorkerPing comprueba que el worker responde (GpuTelemetry) dentro del
+// timeout. Se usa para readyz y diagnósticos: si el worker no contesta, el
+// back no se presenta como listo y el panel ve "model not found" con causa.
+func WorkerPing(ctx context.Context) error {
+	c := workerClientOrNil()
+	if c == nil {
+		return fmt.Errorf("%w: worker client not wired", ErrWorkerUnreachable)
+	}
+	addr := workerAddr()
+	if addr == "" {
+		return ErrWorkerUnreachable
+	}
+	return c.Ping(ctx, addr)
+}
+
 // workerArtifactBase holds the configured BM_WORKER_ARTIFACT_BASE (set once at
 // startup). Used to proxy artifact list/delete to the worker's artifact server.
 var workerArtifactBase atomic.Value // string

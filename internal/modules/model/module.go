@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc/codes"
@@ -81,6 +82,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 	w.Use(authMw, tenantMw)
 	{
 		w.GET("/status", m.WorkerStatus)
+		w.GET("/diagnostic", m.WorkerDiagnostic)
 
 		admin := w.Group("", adminMw)
 		{
@@ -250,6 +252,130 @@ func (m *Module) WorkerStatus(c *gin.Context) {
 		return
 	}
 	utils.Success(c, st)
+}
+
+// WorkerDiagnostic es una lectura en vivo y verídica del worker: alcance,
+// latencia del ping, telemetría de GPU y estado de pesos de cada modelo. Sirve
+// para diagnosticar "model not found" sin dependir de cachés: todo se lee
+// directo del worker por gRPC en cada llamada.
+// GET /api/v1/worker/diagnostic (auth + tenant; no requiere admin).
+func (m *Module) WorkerDiagnostic(c *gin.Context) {
+	ctx := c.Request.Context()
+	addr := workerAddr()
+	diag := &WorkerDiagnostic{Configured: addr != ""}
+	if addr == "" {
+		utils.Success(c, diag)
+		return
+	}
+	client := workerClientOrNil()
+	if client == nil {
+		diag.PingError = "worker client not wired"
+		utils.Success(c, diag)
+		return
+	}
+
+	// Ping con latencia: el back usa este mismo llamado para readyz.
+	start := time.Now()
+	if err := client.Ping(ctx, addr); err != nil {
+		diag.Connected = false
+		diag.PingMs = int64(time.Since(start).Milliseconds())
+		diag.PingError = err.Error()
+		utils.Success(c, diag)
+		return
+	}
+	diag.Connected = true
+	diag.PingMs = int64(time.Since(start).Milliseconds())
+
+	// Telemetría de GPU.
+	gt, gerr := client.GpuTelemetry(ctx, addr)
+	if gerr != nil {
+		diag.TelemetryError = gerr.Error()
+	} else if gt != nil {
+		diag.Telemetry = &WorkerTelemetryView{
+			DeviceName:     gt.DeviceName,
+			TotalVramMb:    int64(gt.TotalVramMb),
+			UsedVramMb:     int64(gt.UsedVramMb),
+			FreeVramMb:     int64(gt.FreeVramMb),
+			GpuUtilization: float64(gt.GpuUtilization),
+			TemperatureC:   float64(gt.TemperatureC),
+		}
+	}
+
+	// Catálogo vivo con estado de pesos.
+	lm, lerr := client.ListModels(ctx, addr)
+	if lerr != nil {
+		diag.ListError = lerr.Error()
+		utils.Success(c, diag)
+		return
+	}
+	if lm != nil {
+		diag.ModelCount = len(lm.Models)
+		for _, m2 := range lm.Models {
+			if m2 == nil {
+				continue
+			}
+			diag.Models = append(diag.Models, WorkerModelView{
+				Key:          m2.Key,
+				Label:        m2.Label,
+				Mode:         m2.Mode,
+				Engine:       m2.Engine,
+				Available:    m2.Available,
+				Downloaded:   m2.Downloaded,
+				Downloading:  m2.Downloading,
+				SizeBytes:    m2.SizeBytes,
+				Progress:     float64(m2.DownloadPercent),
+				Error:        m2.DownloadError,
+				DownloadPath: m2.DownloadPath,
+			})
+		}
+	}
+
+	// Estado de pesos (bytes totales en disco).
+	gs, gserr := client.GetModelState(ctx, addr, "")
+	if gserr != nil {
+		diag.StateError = gserr.Error()
+	} else if gs != nil {
+		diag.DiskBytes = gs.BytesOnDisk
+	}
+	utils.Success(c, diag)
+}
+
+// WorkerDiagnostic es una lectura en vivo y verídica del worker.
+type WorkerDiagnostic struct {
+	Configured     bool                `json:"configured"`
+	Connected      bool                `json:"connected"`
+	PingMs         int64               `json:"ping_ms"`
+	PingError      string              `json:"ping_error,omitempty"`
+	Telemetry      *WorkerTelemetryView `json:"telemetry,omitempty"`
+	TelemetryError string              `json:"telemetry_error,omitempty"`
+	ModelCount     int                 `json:"model_count"`
+	Models         []WorkerModelView   `json:"models"`
+	ListError      string              `json:"list_error,omitempty"`
+	DiskBytes      int64               `json:"disk_bytes"`
+	StateError     string              `json:"state_error,omitempty"`
+}
+
+type WorkerTelemetryView struct {
+	DeviceName     string  `json:"device_name"`
+	TotalVramMb    int64   `json:"total_vram_mb"`
+	UsedVramMb     int64   `json:"used_vram_mb"`
+	FreeVramMb     int64   `json:"free_vram_mb"`
+	GpuUtilization float64 `json:"gpu_utilization"`
+	TemperatureC   float64 `json:"temperature_c"`
+}
+
+type WorkerModelView struct {
+	Key          string  `json:"key"`
+	Label        string  `json:"label"`
+	Mode         string  `json:"mode"`
+	Engine       string  `json:"engine"`
+	Available    bool    `json:"available"`
+	Downloaded   bool    `json:"downloaded"`
+	Downloading  bool    `json:"downloading"`
+	SizeBytes    int64   `json:"size_bytes"`
+	Progress     float64 `json:"progress"`
+	Error        string  `json:"error,omitempty"`
+	DownloadPath string  `json:"download_path,omitempty"`
 }
 
 // WorkerModels handles GET /api/v1/worker/models — the full management view:

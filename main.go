@@ -303,6 +303,13 @@ func main() {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "error": err.Error()})
 			return
 		}
+		if cfg.WorkerAddr != "" {
+			if err := model.WorkerPing(ctx); err != nil {
+				c.JSON(http.StatusServiceUnavailable,
+					gin.H{"status": "degraded", "error": "worker: " + err.Error()})
+				return
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 	router.GET("/", func(c *gin.Context) {
