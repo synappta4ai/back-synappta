@@ -617,9 +617,9 @@ func TestListImageMerged(t *testing.T) {
 	m.ListByModality(c)
 	env, code := decode(t, w)
 
-	// Static image models (2 gemini + seedream + 3 higgsfield) + live Wan image.
-	if code != http.StatusOK || len(env.Data) < 6 {
-		t.Fatalf("image merged: want >= 6, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	// Static image models (3 gemini + seedream + 7 higgsfield) + live Wan image.
+	if code != http.StatusOK || len(env.Data) < 10 {
+		t.Fatalf("image merged: want >= 10, got %d (status %d): %s", len(env.Data), code, w.Body.String())
 	}
 	hf := 0
 	for _, mm := range env.Data {
@@ -627,8 +627,8 @@ func TestListImageMerged(t *testing.T) {
 			hf++
 		}
 	}
-	if hf != 3 {
-		t.Fatalf("image merged: want 3 higgsfield models, got %d", hf)
+	if hf != 7 {
+		t.Fatalf("image merged: want 7 higgsfield models, got %d", hf)
 	}
 }
 

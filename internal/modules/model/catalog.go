@@ -227,6 +227,50 @@ var catalog = []Model{
 			Resolutions: []string{"1K"},
 		},
 	},
+	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai
+	// and the official JS/Python SDK examples (2026-10). They share the
+	// generic payload (prompt + aspect_ratio); the generator adds
+	// family-specific fields only for soul/ideogram/recraft.
+	{
+		Name: "higgsfield-flux-kontext-max", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/flux-pro/kontext/max/text-to-image",
+		DisplayName: "Flux Kontext Max",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"},
+		},
+	},
+	{
+		Name: "higgsfield-seedream-4-0", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/bytedance/seedream/v4/text-to-image",
+		DisplayName: "Seedream 4.0",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"},
+		},
+	},
+	{
+		Name: "higgsfield-marketing-studio", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/marketing-studio/image",
+		DisplayName: "Marketing Studio Image",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
+		},
+	},
+	{
+		Name: "higgsfield-marketing-sunburst", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/marketing-studio/image/sunburst",
+		DisplayName: "Marketing Studio Sunburst",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
+		},
+	},
 	{
 		Name: "dola-seedream-5-0-pro-260628", Modality: ModalityImage,
 		Generator: "seedream", CredentialProvider: ProviderBytePlus,
