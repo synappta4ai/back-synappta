@@ -353,6 +353,11 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	// generator.
 	core.RegisterGenerator(agencyimage.NewHiggsfieldImageGenerator())
 	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	// OpenRouter dedicated video API (Veo, Kling, Wan, Seedance, Hailuo…):
+	// async submit/poll/download. Registered after Higgsfield so the
+	// curated catalog keeps precedence on overlapping names (there is none:
+	// hosted names are provider-namespaced).
+	core.RegisterGenerator(agencyvideo.NewOpenRouterVideoGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API

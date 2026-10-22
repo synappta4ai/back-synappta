@@ -54,6 +54,11 @@ const (
 	GeneratorOpenAIText  = "openai-text"
 	GeneratorOpenAIImage = "openai-image"
 	GeneratorRunPod      = "runpod"
+	// GeneratorOpenRouterVideo serves OpenRouter video models through the
+	// dedicated async API (POST /videos, poll /videos/{id}, download
+	// /videos/{id}/content). It is the only hosted video route: no other
+	// provider in the registry exposes video generation.
+	GeneratorOpenRouterVideo = "openrouter-video"
 )
 
 // inferenceProviderSpec describes one hosted provider: where its
@@ -176,6 +181,15 @@ func InferenceProviderBaseURL(p CredentialProvider) string { return inferencePro
 // when the provider has none.
 func InferenceImagePath(p CredentialProvider) string { return inferenceProviders[p].ImagePath }
 
+// InferenceVideoPath returns the provider's video generation route, "" when
+// the provider has none. Today only OpenRouter exposes one (POST /videos).
+func InferenceVideoPath(p CredentialProvider) string {
+	if p == ProviderOpenRouter {
+		return "/videos"
+	}
+	return ""
+}
+
 // InferenceModelName builds the catalog name for an inference model:
 // "<provider>/<model id>".
 func InferenceModelName(p CredentialProvider, id string) string {
@@ -199,13 +213,31 @@ func ParseInferenceModel(name string) (CredentialProvider, string, bool) {
 	return p, id, true
 }
 
+// inferenceVideoMarkers are the model-id fragments that identify a
+// text-to-video model on providers with a video generation route (today
+// only OpenRouter). Checked before the image markers: families like Flux
+// ship both image models (flux-3-image) and video ones (flux-video-edit).
+// Verified 2026-10 against the live OpenRouter catalogs (61 image + 30
+// video models): no text-model id matches these, and every video id matches
+// at least one. Hyphenated forms (kling-, wan-) avoid false positives like
+// thinkingmachines/inkling.
+var inferenceVideoMarkers = []string{
+	"veo", "hailuo", "wan-", "seedance", "/kling", "heygen", "runway",
+	"aleph", "happyhorse", "grok-imagine-video", "flux-video", "video",
+}
+
 // inferenceImageMarkers are the model-id fragments that identify a
 // text-to-image model. Providers' /models listings rarely declare a modality,
 // so classification is name-based; it must stay deterministic so discovery
 // and generation routing agree without persisting anything.
+// The generic "image" fragment is data-backed: in the 2026-10 OpenRouter
+// catalog every id containing "image" generates images and none is
+// text-only. Family fragments cover image models without "image" in the id
+// (Google's Nano Banana, Krea, Sourceful Riverflow).
 var inferenceImageMarkers = []string{
 	"flux", "stable-diffusion", "sdxl", "sd3", "sd-1", "sd-2", "sd-3",
-	"seedream", "imagen", "gpt-image", "dall-e", "kolors", "recraft",
+	"seedream", "imagen", "gpt-image", "image", "nano-banana", "krea",
+	"riverflow", "dall-e", "kolors", "recraft",
 	"ideogram", "cogview", "photon", "qwen-image", "playground-v2", "hidream",
 }
 
@@ -219,15 +251,33 @@ var inferenceNoiseMarkers = []string{
 }
 
 // ClassifyInferenceModel maps a provider-side model id to a generation
-// modality. Only text and image are supported by the hosted generators.
+// modality. Video is checked first so dual families (flux image vs video)
+// route correctly.
 func ClassifyInferenceModel(id string) Modality {
 	lower := strings.ToLower(id)
+	for _, marker := range inferenceVideoMarkers {
+		if strings.Contains(lower, marker) {
+			return ModalityVideo
+		}
+	}
 	for _, marker := range inferenceImageMarkers {
 		if strings.Contains(lower, marker) {
 			return ModalityImage
 		}
 	}
 	return ModalityText
+}
+
+// ResolveInferenceModality is the modality discovery and generation routing
+// must agree on. Hosted video generation only exists on OpenRouter; on every
+// other provider a video-named id stays text (usually a video-input chat
+// model), preserving the historical behavior.
+func ResolveInferenceModality(provider CredentialProvider, id string) Modality {
+	m := ClassifyInferenceModel(id)
+	if m == ModalityVideo && provider != ProviderOpenRouter {
+		return ModalityText
+	}
+	return m
 }
 
 // isInferenceNoise reports whether a listed model is not a generation model.
@@ -242,10 +292,15 @@ func isInferenceNoise(id string) bool {
 }
 
 // InferenceModelEndpoint returns the route a discovered inference model should
-// be submitted to: the OpenAI chat route or the provider's images route.
+// be submitted to: the OpenAI chat route or the provider's images/videos route.
 func InferenceModelEndpoint(p CredentialProvider, modality Modality) string {
 	if modality == ModalityImage {
 		if path := InferenceImagePath(p); path != "" {
+			return path
+		}
+	}
+	if modality == ModalityVideo {
+		if path := InferenceVideoPath(p); path != "" {
 			return path
 		}
 	}
@@ -342,7 +397,12 @@ func DiscoverInferenceModels(
 		if id == "" || isInferenceNoise(id) {
 			continue
 		}
-		modality := ClassifyInferenceModel(id)
+		modality := ResolveInferenceModality(provider, id)
+		if modality == ModalityVideo && InferenceVideoPath(provider) == "" {
+			// Listed as a video model by id, but this provider has no
+			// video generation route: offering it would fail on submit.
+			continue
+		}
 		endpoint := InferenceModelEndpoint(provider, modality)
 		if modality == ModalityImage && spec.ImagePath == "" {
 			// Listed as an image model by id, but this provider has no
@@ -354,7 +414,7 @@ func DiscoverInferenceModels(
 			Name:               InferenceModelName(provider, id),
 			DisplayName:        id,
 			Modality:           modality,
-			Generator:          generatorForModality(modality),
+			Generator:          generatorForProviderModality(provider, modality),
 			CredentialProvider: provider,
 			Type:               TypeAPI,
 			BaseURL:            base,
@@ -362,7 +422,190 @@ func DiscoverInferenceModels(
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DisplayName < out[j].DisplayName })
+
+	// OpenRouter also publishes dedicated image/video catalogs with
+	// capabilities (supported resolutions, durations, aspect ratios). They
+	// are authoritative for modality and enrich the entries; the /models
+	// read above still supplies every text model. Dedicated entries go
+	// first so they win the dedupe below.
+	if provider == ProviderOpenRouter {
+		out = append(discoverOpenRouterMediaModels(base, apiKey), out...)
+		out = dedupeModels(out)
+	}
 	return out, nil
+}
+
+// openRouterImageTiers are the resolution tiers the OpenRouter Image API
+// accepts and our image validation understands (ValidResolutionsImage).
+var openRouterImageTiers = map[string]bool{"1K": true, "2K": true, "4K": true}
+
+// openRouterImageRatios is the fallback ratio set for Image API models: the
+// endpoint clamps to each model's subset, so a standard set is safe and the
+// per-model capabilities endpoint remains the source of truth.
+var openRouterImageRatios = []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
+
+// openRouterVideoResolutions / Ratios are the values the OpenRouter Video API
+// documents. Entries from /videos/models are filtered to these so our
+// generator validation and the UI never offer a value the API rejects.
+var openRouterVideoResolutions = map[string]bool{
+	"480p": true, "720p": true, "768p": true, "1080p": true,
+	"1K": true, "2K": true, "4K": true,
+}
+
+var openRouterVideoRatios = map[string]bool{
+	"16:9": true, "9:16": true, "1:1": true, "4:3": true, "3:4": true,
+	"3:2": true, "2:3": true, "21:9": true, "9:21": true,
+}
+
+// discoverOpenRouterMediaModels reads OpenRouter's dedicated image and video
+// catalogs (GET /images/models, GET /videos/models, no auth required) and
+// maps them with their real capabilities. Fresh bounded contexts: the
+// caller's listing deadline already covers /models, and these two reads must
+// not inherit its leftovers.
+func discoverOpenRouterMediaModels(base, apiKey string) []Model {
+	out := []Model{}
+	out = append(out, discoverOpenRouterImages(base, apiKey)...)
+	out = append(out, discoverOpenRouterVideos(base, apiKey)...)
+	return out
+}
+
+// openRouterGet fetches a JSON document from the OpenRouter API with auth
+// when a key is configured (quotas/throughput) and a hard timeout.
+func openRouterGet(base, path, apiKey string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(strings.TrimSpace(base), "/")+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	}
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openrouter %s: %s", path, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+}
+
+// discoverOpenRouterImages maps GET /images/models to image entries.
+func discoverOpenRouterImages(base, apiKey string) []Model {
+	body, err := openRouterGet(base, "/images/models", apiKey, inferenceModelsTimeout)
+	if err != nil {
+		log.Printf("[model] openrouter images catalog unavailable: %v", err)
+		return nil
+	}
+	var payload struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Params struct {
+				Resolution struct {
+					Values []string `json:"values"`
+				} `json:"resolution"`
+			} `json:"supported_parameters"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("[model] openrouter images catalog parse: %v", err)
+		return nil
+	}
+	out := make([]Model, 0, len(payload.Data))
+	for _, entry := range payload.Data {
+		id := strings.TrimSpace(entry.ID)
+		if id == "" || isInferenceNoise(id) {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = id
+		}
+		resolutions := []string{}
+		for _, v := range entry.Params.Resolution.Values {
+			if openRouterImageTiers[v] {
+			resolutions = append(resolutions, v)
+			}
+		}
+		out = append(out, Model{
+			Name:               InferenceModelName(ProviderOpenRouter, id),
+			DisplayName:        name,
+			Modality:           ModalityImage,
+			Generator:          GeneratorOpenAIImage,
+			CredentialProvider: ProviderOpenRouter,
+			Type:               TypeAPI,
+			BaseURL:            strings.TrimRight(strings.TrimSpace(base), "/"),
+			Endpoint:           "/images",
+			Defaults:           Defaults{Ratios: openRouterImageRatios, Resolutions: resolutions},
+		})
+	}
+	return out
+}
+
+// discoverOpenRouterVideos maps GET /videos/models to video entries with
+// the exact durations, resolutions and aspect ratios each model supports.
+func discoverOpenRouterVideos(base, apiKey string) []Model {
+	body, err := openRouterGet(base, "/videos/models", apiKey, inferenceModelsTimeout)
+	if err != nil {
+		log.Printf("[model] openrouter videos catalog unavailable: %v", err)
+		return nil
+	}
+	var payload struct {
+		Data []struct {
+			ID           string   `json:"id"`
+			Name         string   `json:"name"`
+			Durations    []int    `json:"supported_durations"`
+			Resolutions  []string `json:"supported_resolutions"`
+			AspectRatios []string `json:"supported_aspect_ratios"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		log.Printf("[model] openrouter videos catalog parse: %v", err)
+		return nil
+	}
+	out := make([]Model, 0, len(payload.Data))
+	for _, entry := range payload.Data {
+		id := strings.TrimSpace(entry.ID)
+		if id == "" || isInferenceNoise(id) {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name)
+		if name == "" {
+			name = id
+		}
+		resolutions := []string{}
+		for _, v := range entry.Resolutions {
+			if openRouterVideoResolutions[strings.TrimSpace(v)] {
+				resolutions = append(resolutions, strings.TrimSpace(v))
+			}
+		}
+		ratios := []string{}
+		for _, v := range entry.AspectRatios {
+			if openRouterVideoRatios[strings.TrimSpace(v)] {
+				ratios = append(ratios, strings.TrimSpace(v))
+			}
+		}
+		out = append(out, Model{
+			Name:               InferenceModelName(ProviderOpenRouter, id),
+			DisplayName:        name,
+			Modality:           ModalityVideo,
+			Generator:          GeneratorOpenRouterVideo,
+			CredentialProvider: ProviderOpenRouter,
+			Type:               TypeAPI,
+			BaseURL:            strings.TrimRight(strings.TrimSpace(base), "/"),
+			Endpoint:           "/videos",
+			Defaults: Defaults{
+				Ratios:      ratios,
+				Resolutions: resolutions,
+			Durations:   entry.Durations,
+			},
+		})
+	}
+	return out
 }
 
 // DiscoverAllInferenceModels queries every configured provider concurrently
@@ -419,4 +662,35 @@ func generatorForModality(modality Modality) string {
 		return GeneratorOpenAIImage
 	}
 	return GeneratorOpenAIText
+}
+
+// generatorForProviderModality maps a (provider, modality) pair to its
+// generator. Video generation only exists on OpenRouter.
+func generatorForProviderModality(provider CredentialProvider, modality Modality) string {
+	if modality == ModalityVideo && provider == ProviderOpenRouter {
+		return GeneratorOpenRouterVideo
+	}
+	return generatorForModality(modality)
+}
+
+// dedupeModels keeps one entry per model name (first occurrence wins) and
+// returns the deterministic provider-then-name order.
+func dedupeModels(models []Model) []Model {
+	seen := map[string]bool{}
+	out := make([]Model, 0, len(models))
+	for _, m := range models {
+		key := strings.ToLower(m.Name)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CredentialProvider != out[j].CredentialProvider {
+			return out[i].CredentialProvider < out[j].CredentialProvider
+		}
+		return out[i].DisplayName < out[j].DisplayName
+	})
+	return out
 }

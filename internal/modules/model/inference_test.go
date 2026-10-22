@@ -50,21 +50,73 @@ func TestClassifyInferenceModel(t *testing.T) {
 		"bytedance/seedream-4.0",
 		"google/imagen-4.0",
 		"openai/gpt-image-1",
+		// Live OpenRouter image ids (2026-10): generic "image" fragment
+		// plus families without it.
+		"google/gemini-3-pro-image",
+		"openai/gpt-5.4-image-2",
+		"google/gemini-nano-banana-2.1",
+		"tencent/hy-image-v3.5-preview",
+		"krea/krea-2-medium",
+		"sourceful/riverflow-v2.5-pro",
+		"black-forest-labs/flux-3-image-klein",
+		"x-ai/grok-imagine-image-2.0",
 	}
 	for _, id := range images {
 		if got := ClassifyInferenceModel(id); got != ModalityImage {
 			t.Errorf("ClassifyInferenceModel(%q) = %q, want image", id, got)
 		}
 	}
+	videos := []string{
+		// Live OpenRouter video ids (2026-10): video wins over the
+		// image markers (flux-video-edit contains "flux").
+		"google/veo-3.1",
+		"minimax/hailuo-3",
+		"alibaba/wan-3.0",
+		"bytedance/seedance-2.5",
+		"kwaivgi/kling-v3.0-std",
+		"runway/gen-4.5",
+		"x-ai/grok-imagine-video-1.5",
+		"heygen/heygen-video-1",
+		"heygen/avatar-iv",
+		"black-forest-labs/flux-video-edit",
+		"alibaba/happyhorse-1.1",
+	}
+	for _, id := range videos {
+		if got := ClassifyInferenceModel(id); got != ModalityVideo {
+			t.Errorf("ClassifyInferenceModel(%q) = %q, want video", id, got)
+		}
+	}
 	texts := []string{
 		"meta-llama/Llama-3.3-70B-Instruct",
 		"anthropic/claude-sonnet-4.5",
 		"qwen/qwen3-235b-a22b",
+		// Near-misses that must stay text (notably inkling-small: "kling-"
+		// would match it, so the marker requires the org slash).
+		"thinkingmachines/inkling",
+		"thinkingmachines/inkling-small",
+		"tencent/hunyuan-a13b-instruct",
+		"minimax/minimax-m2.5",
+		"openrouter/auto",
 	}
 	for _, id := range texts {
 		if got := ClassifyInferenceModel(id); got != ModalityText {
 			t.Errorf("ClassifyInferenceModel(%q) = %q, want text", id, got)
 		}
+	}
+}
+
+func TestResolveInferenceModalityIsProviderScoped(t *testing.T) {
+	// Hosted video generation only exists on OpenRouter: elsewhere a
+	// video-named id keeps working as text (usually a video-input chat
+	// model), exactly like before video support existed.
+	if got := ResolveInferenceModality(ProviderOpenRouter, "google/veo-3.1"); got != ModalityVideo {
+		t.Errorf("openrouter veo = %q, want video", got)
+	}
+	if got := ResolveInferenceModality(ProviderTogether, "google/veo-3.1"); got != ModalityText {
+		t.Errorf("together veo = %q, want text", got)
+	}
+	if got := ResolveInferenceModality(ProviderOpenRouter, "google/gemini-3-pro-image"); got != ModalityImage {
+		t.Errorf("openrouter gemini image = %q, want image", got)
 	}
 }
 
@@ -121,6 +173,75 @@ func TestDiscoverInferenceModelsOpenAICompatible(t *testing.T) {
 	}
 	if image.BaseURL != srv.URL+"/v1" {
 		t.Fatalf("image base url = %q, want the tenant override", image.BaseURL)
+	}
+}
+
+func TestDiscoverOpenRouterMediaCatalogs(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The generic listing also names the media models: the dedicated
+		// catalogs below must win (modality + capabilities).
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"google/gemini-3-pro-image"},
+			{"id":"google/veo-3.1"},
+			{"id":"meta-llama/Llama-3.3-70B-Instruct"}
+		]}`))
+	})
+	mux.HandleFunc("/v1/images/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"google/gemini-3-pro-image","name":"Google: Gemini 3 Pro Image",
+			 "supported_parameters":{"resolution":{"type":"enum","values":["1K","2K"]}}},
+			{"id":"bytedance-seed/seedream-4.5","name":"Seedream 4.5"}
+		]}`))
+	})
+	mux.HandleFunc("/v1/videos/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"google/veo-3.1","name":"Google: Veo 3.1",
+			 "supported_durations":[4,6,8],
+			 "supported_resolutions":["720p","1080p"],
+			 "supported_aspect_ratios":["16:9","9:16"]}
+		]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	models, err := DiscoverInferenceModels(context.Background(), ProviderOpenRouter, srv.URL+"/v1", "key", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]Model{}
+	for _, m := range models {
+		byName[m.Name] = m
+	}
+
+	img, ok := byName["openrouter/google/gemini-3-pro-image"]
+	if !ok {
+		t.Fatalf("image model missing: %+v", models)
+	}
+	if img.Modality != ModalityImage || img.Generator != GeneratorOpenAIImage || img.Endpoint != "/images" {
+		t.Fatalf("image entry = %+v", img)
+	}
+	if len(img.Defaults.Resolutions) != 2 || img.DisplayName != "Google: Gemini 3 Pro Image" {
+		t.Fatalf("image capabilities = %+v", img)
+	}
+
+	vid, ok := byName["openrouter/google/veo-3.1"]
+	if !ok {
+		t.Fatalf("video model missing: %+v", models)
+	}
+	if vid.Modality != ModalityVideo || vid.Generator != GeneratorOpenRouterVideo || vid.Endpoint != "/videos" {
+		t.Fatalf("video entry = %+v", vid)
+	}
+	if len(vid.Defaults.Durations) != 3 || len(vid.Defaults.Resolutions) != 2 || len(vid.Defaults.Ratios) != 2 {
+		t.Fatalf("video capabilities = %+v", vid)
+	}
+
+	text, ok := byName["openrouter/meta-llama/Llama-3.3-70B-Instruct"]
+	if !ok || text.Modality != ModalityText {
+		t.Fatalf("text entry = %+v", text)
 	}
 }
 

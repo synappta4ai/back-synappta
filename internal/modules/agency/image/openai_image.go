@@ -98,8 +98,12 @@ func (g *OpenAIImageGenerator) Validate(req *agency.GeneratorRequest) error {
 // response_format is intentionally omitted: DeepInfra and OpenRouter answer
 // b64_json, Together answers url by default, and not every provider accepts
 // the field. Generate reads both shapes.
+//
+// OpenRouter's Image API additionally understands resolution tiers and
+// aspect_ratio, so they are sent for that provider only: other clouds
+// validate strictly and would reject unknown fields.
 func (g *OpenAIImageGenerator) BuildPayload(req *agency.GeneratorRequest) map[string]interface{} {
-	_, modelID, _ := model.ParseInferenceModel(req.Model)
+	provider, modelID, _ := model.ParseInferenceModel(req.Model)
 	if modelID == "" {
 		modelID = req.Model
 	}
@@ -108,6 +112,15 @@ func (g *OpenAIImageGenerator) BuildPayload(req *agency.GeneratorRequest) map[st
 		"model":  modelID,
 		"prompt": agency.CompileContentText(req.Content),
 		"size":   ImageSizeForRatio(req.Ratio),
+	}
+	if provider == model.ProviderOpenRouter {
+		if req.Ratio != "" {
+			payload["aspect_ratio"] = req.Ratio
+		}
+		switch req.Resolution {
+		case "1K", "2K", "4K":
+			payload["resolution"] = req.Resolution
+		}
 	}
 	if req.Quantity > 1 {
 		payload["n"] = req.Quantity

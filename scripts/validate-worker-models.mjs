@@ -25,7 +25,12 @@ function check(name, ok, detail = "") {
 
 async function fetchJson(url, opts = {}) {
   const headers = { "Content-Type": "application/json", ...opts.headers };
-  if (opts.token) headers["Authorization"] = `Bearer ${opts.token}`;
+  if (opts.token) {
+    const tok = opts.token.startsWith("Bearer ")
+      ? opts.token
+      : `Bearer ${opts.token}`;
+    headers["Authorization"] = tok;
+  }
   const res = await fetch(url, { ...opts, headers });
   let body;
   try { body = await res.json(); } catch { body = await res.text(); }

@@ -7,17 +7,17 @@ catálogo lista **en vivo** los modelos que esa key alcanza y no se cachea nada.
 
 ## Providers soportados
 
-| Provider (slug) | Base URL por defecto | Texto | Imagen | Cómo lista modelos |
-|---|---|---|---|---|
-| `runpod` | `https://api.runpod.ai` | — | ✅ | Sin listado: cada **Serverless Endpoint** es un modelo |
-| `together` | `https://api.together.xyz/v1` | ✅ | ✅ `/images/generations` | `GET /v1/models` |
-| `deepinfra` | `https://api.deepinfra.com/v1/openai` | ✅ | ✅ `/images/generations` | `GET …/models` |
-| `gmi` | `https://api.gmi-serving.com/v1` | ✅ | — | `GET /v1/models` |
-| `baseten` | `https://inference.baseten.co/v1` | ✅ | — | `GET /v1/models` |
-| `vultr` | `https://api.vultrinference.com/v1` | ✅ | — | `GET /v1/models` |
-| `digitalocean` | `https://inference.do-ai.run/v1` | ✅ | — | `GET /v1/models` |
-| `coreweave` | `https://api.inference.wandb.ai/v1` | ✅ | — | `GET /v1/models` |
-| `openrouter` | `https://openrouter.ai/api/v1` | ✅ | ✅ `/images` | `GET /v1/models` |
+| Provider (slug) | Base URL por defecto | Texto | Imagen | Video | Cómo lista modelos |
+|---|---|---|---|---|---|
+| `runpod` | `https://api.runpod.ai` | — | ✅ | — | Sin listado: cada **Serverless Endpoint** es un modelo |
+| `together` | `https://api.together.xyz/v1` | ✅ | ✅ `/images/generations` | — | `GET /v1/models` |
+| `deepinfra` | `https://api.deepinfra.com/v1/openai` | ✅ | ✅ `/images/generations` | — | `GET …/models` |
+| `gmi` | `https://api.gmi-serving.com/v1` | ✅ | — | — | `GET /v1/models` |
+| `baseten` | `https://inference.baseten.co/v1` | ✅ | — | — | `GET /v1/models` |
+| `vultr` | `https://api.vultrinference.com/v1` | ✅ | — | — | `GET /v1/models` |
+| `digitalocean` | `https://inference.do-ai.run/v1` | ✅ | — | — | `GET /v1/models` |
+| `coreweave` | `https://api.inference.wandb.ai/v1` | ✅ | — | — | `GET /v1/models` |
+| `openrouter` | `https://openrouter.ai/api/v1` | ✅ | ✅ `/images` | ✅ `/videos` (async) | `GET /v1/models` + `GET /images/models` + `GET /videos/models` |
 
 `gmi`, `baseten`, `vultr`, `digitalocean` y `coreweave` quedan como texto a
 propósito: su ruta de imagen no es la de OpenAI (GMI usa una ruta de consola,
@@ -51,9 +51,16 @@ runpod/abc12def34gh                           → imagen (endpoint de RunPod)
 ```
 
 - El id puede contener barras (`org/modelo`); el parser corta en la **primera**.
-- La modalidad se clasifica por nombre (`flux`, `seedream`, `imagen`,
-  `gpt-image`, `dall-e`, `sdxl`, … → imagen; el resto → texto). La misma
-  función clasifica al listar y al generar, así que nunca se desincronizan.
+- La modalidad se clasifica por nombre (video antes que imagen: `veo`,
+  `hailuo`, `wan-`, `kling`, … → video; `flux`, `seedream`, `image`,
+  `nano-banana`, `krea`, … → imagen; el resto → texto). La misma función
+  clasifica al listar y al generar, así que nunca se desincronizan. Video
+  solo existe en OpenRouter: en los demás providers un nombre con pinta de
+  video sigue siendo texto (suele ser un chat con entrada de video).
+- OpenRouter además publica catálogos dedicados (`/images/models`,
+  `/videos/models`) con capacidades reales (duraciones, resoluciones, aspect
+  ratios): esas entradas mandan sobre la clasificación por nombre y rellenan
+  los defaults del picker.
 - Entradas de embeddings, rerankers y moderación se filtran del listado.
 
 ## RunPod en detalle

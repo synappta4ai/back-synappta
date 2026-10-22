@@ -66,7 +66,7 @@ func LookupModel(name string, workerAddr string) *modelEntry {
 	// model id, exactly like the live catalog does, so routing and listing
 	// never disagree.
 	if provider, id, ok := model.ParseInferenceModel(name); ok {
-		modality := model.ClassifyInferenceModel(id)
+		modality := model.ResolveInferenceModality(provider, id)
 		generator := model.GeneratorOpenAIText
 		endpoint := "/chat/completions"
 		switch {
@@ -76,6 +76,12 @@ func LookupModel(name string, workerAddr string) *modelEntry {
 			modality = model.ModalityImage
 			generator = model.GeneratorRunPod
 			endpoint = "/v2/" + id
+		case modality == model.ModalityVideo:
+			// Only OpenRouter exposes a hosted video route; other
+			// providers cannot reach this branch (ResolveInferenceModality
+			// maps them back to text).
+			generator = model.GeneratorOpenRouterVideo
+			endpoint = model.InferenceVideoPath(provider)
 		case modality == model.ModalityImage:
 			if path := model.InferenceImagePath(provider); path != "" {
 				generator = model.GeneratorOpenAIImage
