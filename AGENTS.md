@@ -143,6 +143,10 @@ Key rules:
 - Clients render `cr` as provider credits (Higgsfield) next to the USD
   equivalent, with explanatory tooltips.
 
+## Versionamiento antes de push
+
+Si tocás un archivo de este repo, **actualizá la versión antes de hacer push**. No commitees código sin subir la versión correspondiente. Un cambio lógico por commit; la versión va en un commit `chore` separado del commit de código.
+
 ## Ops scripts (scripts/)
 
 - `e2e_http.py` — full HTTP E2E (login → models → generate → artifact).
