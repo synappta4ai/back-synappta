@@ -152,7 +152,7 @@ Si tocás un archivo de este repo, **actualizá la versión antes de hacer push*
 - `e2e_http.py` — full HTTP E2E (login → models → generate → artifact).
 - `sync-remote-media.mjs` — pull uploads/outputs that only exist on the
   remote deployment into local storage. Idempotent, `--dry-run` supported.
-  Requires creds in `../front-synapta/.env.e2e`.
+  Requires creds in `../front-synappta/.env.e2e`.
 - `deploy-sslip.sh` — deploy `bin/synapta-linux` to the remote host: scp,
   discover systemd vs bare process, back up the old binary, swap, restart,
   wait for `readyz=200`. Build first with
