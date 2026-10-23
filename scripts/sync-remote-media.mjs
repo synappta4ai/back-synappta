@@ -10,7 +10,8 @@
  * existe el archivo fuente.
  *
  * Uso: node scripts/sync-remote-media.mjs [--dry-run]
- * Credenciales: lee ../front-synapta/.env.e2e (E2E_USER / E2E_PASSWORD).
+ * Credenciales: lee ../front-synapta/.env.e2e o ../front-synapta/env.e2e
+ * (E2E_USER / E2E_PASSWORD).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,15 +20,23 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DRY = process.argv.includes('--dry-run');
 const LOCAL = 'http://localhost:8099/api/v1';
-const REMOTE_ORIGIN = 'https://drako-synaptaback-i2at0w-5d9ff3-187-124-148-219.sslip.io';
+const REMOTE_ORIGIN = process.env.SYNC_REMOTE_ORIGIN || 'https://back-dev.synappta.cloud';
 const REMOTE = REMOTE_ORIGIN + '/api/v1';
 const TENANT_SLUG = 'synapta';
 const UPLOADS = path.join(ROOT, 'uploads');
 const OUTPUTS = path.join(ROOT, 'outputs');
 
+const envCandidates = [
+  path.join(ROOT, '../front-synappta/.env.e2e'),
+  path.join(ROOT, '../front-synappta/env.e2e'),
+];
+const envFile = envCandidates.find((candidate) => fs.existsSync(candidate));
+if (!envFile) {
+  throw new Error('no se encontró ../front-synapta/.env.e2e ni ../front-synapta/env.e2e');
+}
 const env = Object.fromEntries(
   fs
-    .readFileSync(path.join(ROOT, '../front-synapta/.env.e2e'), 'utf8')
+    .readFileSync(envFile, 'utf8')
     .split(/\r?\n/)
     .filter((l) => l.includes('=') && !l.startsWith('#'))
     .map((l) => [l.slice(0, l.indexOf('=')).trim(), l.slice(l.indexOf('=') + 1).trim()]),
