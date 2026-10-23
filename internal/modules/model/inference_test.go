@@ -192,7 +192,7 @@ func TestDiscoverOpenRouterMediaCatalogs(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
 			{"id":"google/gemini-3-pro-image","name":"Google: Gemini 3 Pro Image",
-			 "supported_parameters":{"resolution":{"type":"enum","values":["1K","2K"]}}},
+			 "supported_parameters":{"resolution":{"type":"enum","values":["1K","2K"]},"aspect_ratio":{"type":"enum","values":["1:1","16:9","3:2","auto"]},"input_references":{"type":"range","min":0,"max":14}}},
 			{"id":"bytedance-seed/seedream-4.5","name":"Seedream 4.5"}
 		]}`))
 	})
@@ -226,6 +226,15 @@ func TestDiscoverOpenRouterMediaCatalogs(t *testing.T) {
 	}
 	if len(img.Defaults.Resolutions) != 2 || img.DisplayName != "Google: Gemini 3 Pro Image" {
 		t.Fatalf("image capabilities = %+v", img)
+	}
+	if got := strings.Join(img.Defaults.Ratios, ","); got != "1:1,16:9,3:2" {
+		t.Fatalf("image ratios = %q, want the model's advertised set", got)
+	}
+	if img.MaxReferences != 14 {
+		t.Fatalf("image max references = %d, want 14", img.MaxReferences)
+	}
+	if second := byName["openrouter/bytedance-seed/seedream-4.5"]; second.MaxReferences != 0 {
+		t.Fatalf("model without input_references = %d, want 0", second.MaxReferences)
 	}
 
 	vid, ok := byName["openrouter/google/veo-3.1"]

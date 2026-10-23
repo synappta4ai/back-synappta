@@ -79,6 +79,10 @@ type Model struct {
 	// GallerySync: uploads reference files to the BytePlus asset library
 	// before generation and references them as asset://<id>.
 	GallerySync bool `json:"gallery_sync"`
+	// MaxReferences is how many input reference images the model accepts.
+	// Zero means the model is text-only (or the capability is unknown), so
+	// tools that depend on reference images can filter it out.
+	MaxReferences int `json:"max_references,omitempty"`
 	// DisplayName for UIs.
 	DisplayName string `json:"display_name"`
 	// Defaults the UI can offer (ratios, resolutions, durations).
@@ -199,7 +203,7 @@ var catalog = []Model{
 		Endpoint:    "/higgsfield-ai/soul/v2/standard",
 		DisplayName: "Soul 2",
 		Defaults: Defaults{
-			Ratios:      []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
+			Ratios: []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
 			// The standard tier only accepts 720p/1080p (the provider rejects
 			// 2K/4K here with "resolution: '2K' is not one of [...]").
 			Resolutions: []string{"720p", "1080p"},
@@ -208,9 +212,10 @@ var catalog = []Model{
 	{
 		Name: "higgsfield-ideogram-4-0", Modality: ModalityImage,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/ideogram/v4.0",
-		DisplayName: "Ideogram 4.0",
+		BaseURL:       "https://api.higgsfield.ai",
+		Endpoint:      "/ideogram/v4.0",
+		DisplayName:   "Ideogram 4.0",
+		MaxReferences: 1,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
 			Resolutions: nil, // no resolution tier: rendering_speed-driven
@@ -274,9 +279,10 @@ var catalog = []Model{
 	{
 		Name: "dola-seedream-5-0-pro-260628", Modality: ModalityImage,
 		Generator: "seedream", CredentialProvider: ProviderBytePlus,
-		BaseURL:     "https://ark.ap-southeast.bytepluses.com/api/v3",
-		Endpoint:    "/images/generations",
-		DisplayName: "Dola Seedream 5.0 Pro",
+		BaseURL:       "https://ark.ap-southeast.bytepluses.com/api/v3",
+		Endpoint:      "/images/generations",
+		DisplayName:   "Dola Seedream 5.0 Pro",
+		MaxReferences: 10,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p", "2K"},
@@ -285,9 +291,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-nano-banana", Modality: ModalityImage,
 		Generator: "gemini-nano", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-nano-banana:generateContent",
-		DisplayName: "Gemini Nano Banana",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-nano-banana:generateContent",
+		DisplayName:   "Gemini Nano Banana",
+		MaxReferences: 3,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},
@@ -296,9 +303,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-3-pro-image-preview", Modality: ModalityImage,
 		Generator: "gemini-nano-pro", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-3-pro-image-preview:generateContent",
-		DisplayName: "Gemini 3 Pro Image",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-3-pro-image-preview:generateContent",
+		DisplayName:   "Gemini 3 Pro Image",
+		MaxReferences: 14,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},
@@ -307,9 +315,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-3.1-flash-image-preview", Modality: ModalityImage,
 		Generator: "gemini-nano", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
-		DisplayName: "Gemini 3.1 Flash Image",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
+		DisplayName:   "Gemini 3.1 Flash Image",
+		MaxReferences: 14,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},

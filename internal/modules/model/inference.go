@@ -444,6 +444,26 @@ var openRouterImageTiers = map[string]bool{"1K": true, "2K": true, "4K": true}
 // per-model capabilities endpoint remains the source of truth.
 var openRouterImageRatios = []string{"1:1", "16:9", "9:16", "4:3", "3:4"}
 
+// openRouterImageRatioValues keeps the ratios a model advertises, dropping
+// "auto" and malformed values. It falls back to the standard set when the
+// endpoint publishes no aspect_ratio capability.
+func openRouterImageRatioValues(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" || strings.EqualFold(v, "auto") || !strings.Contains(v, ":") || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return openRouterImageRatios
+	}
+	return out
+}
+
 // openRouterVideoResolutions / Ratios are the values the OpenRouter Video API
 // documents. Entries from /videos/models are filtered to these so our
 // generator validation and the UI never offer a value the API rejects.
@@ -508,6 +528,12 @@ func discoverOpenRouterImages(base, apiKey string) []Model {
 				Resolution struct {
 					Values []string `json:"values"`
 				} `json:"resolution"`
+				AspectRatio struct {
+					Values []string `json:"values"`
+				} `json:"aspect_ratio"`
+				InputReferences struct {
+					Max int `json:"max"`
+				} `json:"input_references"`
 			} `json:"supported_parameters"`
 		} `json:"data"`
 	}
@@ -528,9 +554,10 @@ func discoverOpenRouterImages(base, apiKey string) []Model {
 		resolutions := []string{}
 		for _, v := range entry.Params.Resolution.Values {
 			if openRouterImageTiers[v] {
-			resolutions = append(resolutions, v)
+				resolutions = append(resolutions, v)
 			}
 		}
+		ratios := openRouterImageRatioValues(entry.Params.AspectRatio.Values)
 		out = append(out, Model{
 			Name:               InferenceModelName(ProviderOpenRouter, id),
 			DisplayName:        name,
@@ -540,7 +567,8 @@ func discoverOpenRouterImages(base, apiKey string) []Model {
 			Type:               TypeAPI,
 			BaseURL:            strings.TrimRight(strings.TrimSpace(base), "/"),
 			Endpoint:           "/images",
-			Defaults:           Defaults{Ratios: openRouterImageRatios, Resolutions: resolutions},
+			MaxReferences:      entry.Params.InputReferences.Max,
+			Defaults:           Defaults{Ratios: ratios, Resolutions: resolutions},
 		})
 	}
 	return out
@@ -601,7 +629,7 @@ func discoverOpenRouterVideos(base, apiKey string) []Model {
 			Defaults: Defaults{
 				Ratios:      ratios,
 				Resolutions: resolutions,
-			Durations:   entry.Durations,
+				Durations:   entry.Durations,
 			},
 		})
 	}

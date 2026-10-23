@@ -11,9 +11,11 @@ package agencyimage
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,6 +29,12 @@ import (
 // openAIImageTimeout is generous: hosted FLUX/SDXL endpoints queue jobs and
 // the pipeline submits synchronously.
 const openAIImageTimeout = 180 * time.Second
+
+// openRouterInlineBudget is the base64 budget for every reference image in an
+// OpenRouter Image API request. Its gateway rejects bodies over ~8 MB (the
+// error surfaces as "The total text input size exceeds 8 MB") and base64
+// inflates the raw bytes by ~33%, so references are compacted to fit.
+const openRouterInlineBudget = 7 << 20
 
 // OpenAIImageGenerator runs image generation through an OpenAI-compatible
 // images route.
@@ -77,13 +85,17 @@ func (g *OpenAIImageGenerator) Validate(req *agency.GeneratorRequest) error {
 	if req.Resolution != "" && !ValidResolutionsImage[req.Resolution] {
 		errs.Add("resolution", "must be one of: 480p, 720p, 1080p, 1K, 2K, 4K")
 	}
-	for _, item := range req.Content {
-		if item.Type == "image" && item.DataURL != "" {
-			// The shared OpenAI images route has no documented reference
-			// image field; sending one would be silently dropped by some
-			// providers. Fail loudly instead of ignoring the user's input.
+	provider, _, _ := model.ParseInferenceModel(req.Model)
+	references := countReferenceImages(req.Content)
+	if references > 0 {
+		// OpenRouter's dedicated Image API takes input_references (URL or
+		// base64, up to 16 per request). The other OpenAI-compatible clouds
+		// have no documented field: sending one would be silently dropped,
+		// so fail loudly instead of ignoring the user's input.
+		if provider != model.ProviderOpenRouter {
 			errs.Add("content", "reference images are not supported by this provider's image route yet")
-			break
+		} else if references > 16 {
+			errs.Add("content", "OpenRouter image models accept at most 16 reference images")
 		}
 	}
 	if errs.HasErrors() {
@@ -111,9 +123,11 @@ func (g *OpenAIImageGenerator) BuildPayload(req *agency.GeneratorRequest) map[st
 	payload := map[string]interface{}{
 		"model":  modelID,
 		"prompt": agency.CompileContentText(req.Content),
-		"size":   ImageSizeForRatio(req.Ratio),
 	}
 	if provider == model.ProviderOpenRouter {
+		// OpenRouter normalizes aspect_ratio/resolution per model. An
+		// explicit pixel `size` is authoritative and is rejected when it
+		// disagrees with them, so the two forms never travel together.
 		if req.Ratio != "" {
 			payload["aspect_ratio"] = req.Ratio
 		}
@@ -121,14 +135,89 @@ func (g *OpenAIImageGenerator) BuildPayload(req *agency.GeneratorRequest) map[st
 		case "1K", "2K", "4K":
 			payload["resolution"] = req.Resolution
 		}
+		switch strings.ToLower(strings.TrimSpace(req.Quality)) {
+		case "auto", "low", "medium", "high":
+			payload["quality"] = strings.ToLower(strings.TrimSpace(req.Quality))
+		}
+		if refs := openRouterReferences(req.Content); len(refs) > 0 {
+			payload["input_references"] = refs
+		}
+	} else {
+		payload["size"] = ImageSizeForRatio(req.Ratio)
 	}
 	if req.Quantity > 1 {
-		payload["n"] = req.Quantity
+		quantity := req.Quantity
+		if provider == model.ProviderOpenRouter && quantity > 10 {
+			quantity = 10
+		}
+		payload["n"] = quantity
 	}
 	if seed, err := strconv.Atoi(strings.TrimSpace(req.Seed)); err == nil {
 		payload["seed"] = seed
 	}
 	return payload
+}
+
+// countReferenceImages reports how many content items carry a usable image
+// reference: a base64 data URL or a hosted asset URL.
+func countReferenceImages(content []agency.ContentItem) int {
+	count := 0
+	for _, item := range content {
+		if item.Type == "image" && (strings.TrimSpace(item.DataURL) != "" || strings.TrimSpace(item.ID) != "") {
+			count++
+		}
+	}
+	return count
+}
+
+// openRouterReferences maps the request's reference images to OpenRouter's
+// input_references content parts. Images are re-encoded as base64 data URLs,
+// shrinking oversized ones so the whole request stays under the gateway cap.
+func openRouterReferences(content []agency.ContentItem) []map[string]interface{} {
+	urls := make([]string, 0, len(content))
+	for _, item := range content {
+		if item.Type != "image" {
+			continue
+		}
+		url := strings.TrimSpace(item.DataURL)
+		if url == "" {
+			url = strings.TrimSpace(item.ID)
+		}
+		if url != "" {
+			urls = append(urls, url)
+		}
+	}
+	if len(urls) == 0 {
+		return nil
+	}
+
+	// Split the budget evenly so every reference fits regardless of how many
+	// the user attached.
+	perImage := openRouterInlineBudget
+	if len(urls) > 1 {
+		perImage = openRouterInlineBudget / len(urls)
+	}
+
+	refs := make([]map[string]interface{}, 0, len(urls))
+	for _, url := range urls {
+		raw, mimeType, err := readImageBytes(url)
+		if err != nil {
+			log.Printf("[openrouter] reference image skipped: %v", err)
+			continue
+		}
+		raw, mimeType = compactImage(raw, mimeType, perImage)
+		if base64.StdEncoding.EncodedLen(len(raw)) > perImage {
+			log.Printf("[openrouter] reference image skipped: %d base64 bytes exceed the %d-byte budget", base64.StdEncoding.EncodedLen(len(raw)), perImage)
+			continue
+		}
+		refs = append(refs, map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw),
+			},
+		})
+	}
+	return refs
 }
 
 // Generate submits the image request and collects URLs or base64 payloads.
