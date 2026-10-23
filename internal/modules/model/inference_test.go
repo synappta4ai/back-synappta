@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -251,6 +252,62 @@ func TestDiscoverOpenRouterMediaCatalogs(t *testing.T) {
 	text, ok := byName["openrouter/meta-llama/Llama-3.3-70B-Instruct"]
 	if !ok || text.Modality != ModalityText {
 		t.Fatalf("text entry = %+v", text)
+	}
+}
+
+func TestDiscoverInferenceModelsMarksReasoningAndDeclaredOutputs(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"openai/gpt-5.5","supported_parameters":["reasoning","include_reasoning","tools"]},
+			{"id":"meta-llama/Llama-3.3-70B-Instruct"},
+			{"id":"acme/mystery-visual","architecture":{"output_modalities":["image","text"]}},
+			{"id":"acme/mystery-clip","architecture":{"output_modalities":["video"]}},
+			{"id":"auto","architecture":{"output_modalities":["text","image"]}}
+		]}`))
+	})
+	for _, path := range []string{"/v1/images/models", "/v1/videos/models"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		})
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	models, err := DiscoverInferenceModels(context.Background(), ProviderOpenRouter, srv.URL+"/v1", "key", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]Model{}
+	for _, m := range models {
+		byName[m.Name] = m
+	}
+
+	brain := byName["openrouter/openai/gpt-5.5"]
+	if brain.Modality != ModalityText || !brain.Reasoning {
+		t.Fatalf("reasoning model = %+v, want text+reasoning", brain)
+	}
+	plain := byName["openrouter/meta-llama/Llama-3.3-70B-Instruct"]
+	if plain.Modality != ModalityText || plain.Reasoning {
+		t.Fatalf("plain text model = %+v, want text without reasoning", plain)
+	}
+	if got := byName["openrouter/acme/mystery-visual"]; got.Modality != ModalityImage || got.Reasoning {
+		t.Fatalf("declared image model = %+v", got)
+	}
+	if got := byName["openrouter/acme/mystery-clip"]; got.Modality != ModalityVideo {
+		t.Fatalf("declared video model = %+v", got)
+	}
+	if got := byName["openrouter/auto"]; got.Modality != ModalityText {
+		t.Fatalf("auto router = %+v, want text", got)
+	}
+
+	// Media catalogs declare capabilities as an object, not an array.
+	if !supportsReasoning(json.RawMessage(`{"reasoning":{"type":"boolean"}}`)) {
+		t.Fatal("object-form reasoning parameter not detected")
+	}
+	if supportsReasoning(json.RawMessage(`{"seed":{"type":"integer"}}`)) {
+		t.Fatal("unrelated object parameter detected as reasoning")
 	}
 }
 

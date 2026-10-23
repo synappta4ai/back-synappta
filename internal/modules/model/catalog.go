@@ -83,6 +83,10 @@ type Model struct {
 	// Zero means the model is text-only (or the capability is unknown), so
 	// tools that depend on reference images can filter it out.
 	MaxReferences int `json:"max_references,omitempty"`
+	// Reasoning reports that a text model accepts reasoning controls. The
+	// agency "brain" only offers text models with this flag, so image/video
+	// generators and plain chat models never leak into that picker.
+	Reasoning bool `json:"reasoning,omitempty"`
 	// DisplayName for UIs.
 	DisplayName string `json:"display_name"`
 	// Defaults the UI can offer (ratios, resolutions, durations).
@@ -332,6 +336,7 @@ var catalog = []Model{
 		BaseURL:     "https://api.anthropic.com",
 		Endpoint:    "/v1/messages",
 		DisplayName: "Claude Text",
+		Reasoning:   true,
 	},
 
 	// ─── Video (Higgsfield) ──────────────────────────────────

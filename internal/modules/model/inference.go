@@ -280,6 +280,73 @@ func ResolveInferenceModality(provider CredentialProvider, id string) Modality {
 	return m
 }
 
+// listedModality prefers the provider's declared output modalities over the
+// name heuristic. It only promotes an entry to a media modality the provider
+// can actually serve; a router that may answer with text+image keeps its text
+// classification so it does not show up as an image generator.
+func listedModality(provider CredentialProvider, id string, outputs []string) Modality {
+	has := func(want string) bool {
+		for _, v := range outputs {
+			if strings.EqualFold(strings.TrimSpace(v), want) {
+				return true
+			}
+		}
+		return false
+	}
+	if has("video") && InferenceVideoPath(provider) != "" {
+		return ModalityVideo
+	}
+	// Image generators also return text (captions), so text+image is still an
+	// image model. "auto" routers are the exception: they forward to any
+	// model and are not image generators themselves.
+	if has("image") && InferenceImagePath(provider) != "" && !isRoutingModel(id) {
+		return ModalityImage
+	}
+	return ResolveInferenceModality(provider, id)
+}
+
+func isRoutingModel(id string) bool {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "auto", "auto-beta", "openrouter/auto", "openrouter/auto-beta":
+		return true
+	}
+	return false
+}
+
+// supportsReasoning reads the provider's supported_parameters, which OpenRouter
+// publishes as an array of strings and its media catalogs as an object.
+func supportsReasoning(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		for _, p := range list {
+			if isReasoningParameter(p) {
+				return true
+			}
+		}
+		return false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err == nil {
+		for key := range object {
+			if isReasoningParameter(key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isReasoningParameter(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "reasoning", "include_reasoning", "reasoning_effort":
+		return true
+	}
+	return false
+}
+
 // isInferenceNoise reports whether a listed model is not a generation model.
 func isInferenceNoise(id string) bool {
 	lower := strings.ToLower(id)
@@ -383,8 +450,12 @@ func DiscoverInferenceModels(
 	// answer without re-reading the listing.
 	var payload struct {
 		Data []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
+			ID                  string          `json:"id"`
+			Type                string          `json:"type"`
+			SupportedParameters json.RawMessage `json:"supported_parameters"`
+			Architecture        struct {
+				OutputModalities []string `json:"output_modalities"`
+			} `json:"architecture"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -397,7 +468,7 @@ func DiscoverInferenceModels(
 		if id == "" || isInferenceNoise(id) {
 			continue
 		}
-		modality := ResolveInferenceModality(provider, id)
+		modality := listedModality(provider, id, entry.Architecture.OutputModalities)
 		if modality == ModalityVideo && InferenceVideoPath(provider) == "" {
 			// Listed as a video model by id, but this provider has no
 			// video generation route: offering it would fail on submit.
@@ -419,6 +490,7 @@ func DiscoverInferenceModels(
 			Type:               TypeAPI,
 			BaseURL:            base,
 			Endpoint:           endpoint,
+			Reasoning:          modality == ModalityText && supportsReasoning(entry.SupportedParameters),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DisplayName < out[j].DisplayName })
