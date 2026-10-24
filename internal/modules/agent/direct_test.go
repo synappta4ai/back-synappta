@@ -153,3 +153,23 @@ func TestDefaultLLMModel(t *testing.T) {
 		t.Errorf("openrouter=%q", got)
 	}
 }
+
+func TestNormalizeLLMModel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		provider string
+		model    string
+		want     string
+	}{
+		{credential.ProviderOpenRouter, "openrouter/anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5"},
+		{credential.ProviderOpenRouter, "openrouter/openrouter/auto", "openrouter/auto"},
+		{credential.ProviderOpenRouter, "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5"},
+		{credential.ProviderAnthropic, "anthropic/claude-sonnet-5.5", "claude-sonnet-5.5"},
+		{credential.ProviderAnthropic, "claude-text", "claude-text"},
+	}
+	for _, tc := range cases {
+		if got := normalizeLLMModel(tc.provider, tc.model); got != tc.want {
+			t.Errorf("normalizeLLMModel(%q, %q) = %q, want %q", tc.provider, tc.model, got, tc.want)
+		}
+	}
+}

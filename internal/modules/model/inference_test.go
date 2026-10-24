@@ -261,6 +261,7 @@ func TestDiscoverInferenceModelsMarksReasoningAndDeclaredOutputs(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
 			{"id":"openai/gpt-5.5","supported_parameters":["reasoning","include_reasoning","tools"]},
+			{"id":"anthropic/claude-opus-5.5:batch","supported_parameters":["reasoning"]},
 			{"id":"meta-llama/Llama-3.3-70B-Instruct"},
 			{"id":"acme/mystery-visual","architecture":{"output_modalities":["image","text"]}},
 			{"id":"acme/mystery-clip","architecture":{"output_modalities":["video"]}},
@@ -291,6 +292,9 @@ func TestDiscoverInferenceModelsMarksReasoningAndDeclaredOutputs(t *testing.T) {
 	plain := byName["openrouter/meta-llama/Llama-3.3-70B-Instruct"]
 	if plain.Modality != ModalityText || plain.Reasoning {
 		t.Fatalf("plain text model = %+v, want text without reasoning", plain)
+	}
+	if _, ok := byName["openrouter/anthropic/claude-opus-5.5:batch"]; ok {
+		t.Fatal("batch-only variant must not be offered")
 	}
 	if got := byName["openrouter/acme/mystery-visual"]; got.Modality != ModalityImage || got.Reasoning {
 		t.Fatalf("declared image model = %+v", got)
