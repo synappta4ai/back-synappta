@@ -212,9 +212,9 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	upstream.Header.Set("X-LLM-Key", cred.AuthKey())
 	upstream.Header.Set("X-LLM-Provider", req.Provider)
 	if model := strings.TrimSpace(req.Model); model != "" {
-		upstream.Header.Set("X-LLM-Model", model)
+		upstream.Header.Set("X-LLM-Model", normalizeLLMModel(req.Provider, model))
 	} else if model := modelFromExtra(cred.Extra); model != "" {
-		upstream.Header.Set("X-LLM-Model", model)
+		upstream.Header.Set("X-LLM-Model", normalizeLLMModel(req.Provider, model))
 	}
 	if cred.BaseURL != "" {
 		upstream.Header.Set("X-LLM-BaseURL", cred.BaseURL)

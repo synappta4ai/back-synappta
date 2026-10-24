@@ -420,11 +420,28 @@ func routeLLM(hdl *credential.Handler, req chatRequest, cred *credential.Resolve
 	if model == "" {
 		model = defaultLLMModel(provider)
 	}
+	model = normalizeLLMModel(provider, model)
 	// Alias del catálogo → ID real del provider.
 	if provider != credential.ProviderOpenRouter && (model == "claude-text" || model == "claude") {
 		model = anthropicModel
 	}
 	return provider, model, cred
+}
+
+// normalizeLLMModel strips the catalog's "<provider>/" prefix before calling
+// the provider API. OpenRouter model ids already carry their vendor prefix
+// ("anthropic/claude-sonnet-5.5"), so sending the catalog name
+// ("openrouter/anthropic/claude-sonnet-5.5") yields a 400 invalid-model error.
+func normalizeLLMModel(provider, model string) string {
+	model = strings.TrimSpace(model)
+	switch provider {
+	case credential.ProviderOpenRouter:
+		return strings.TrimPrefix(model, "openrouter/")
+	case credential.ProviderAnthropic:
+		return strings.TrimPrefix(model, "anthropic/")
+	default:
+		return model
+	}
 }
 
 // defaultLLMModel es el modelo de arranque cuando ni la petición ni la

@@ -242,11 +242,11 @@ var inferenceImageMarkers = []string{
 }
 
 // inferenceNoiseMarkers are the entries a generation picker should not offer:
-// embeddings, rerankers, guardrails and moderation models. The list covers the
-// common embedding families too (bge, e5, gte, voyage) since their ids often
-// do not contain the word "embed".
+// embeddings, rerankers, guardrails, moderation models and batch-only
+// variants. OpenRouter lists ":batch" ids in /models but rejects them on the
+// interactive chat route, so offering them only produces 400s.
 var inferenceNoiseMarkers = []string{
-	"embed", "rerank", "guard", "moderation", "classifier",
+	"embed", "rerank", "guard", "moderation", "classifier", ":batch",
 	"bge-", "bge_", "e5-", "e5_", "gte-", "gte_", "voyage-",
 }
 

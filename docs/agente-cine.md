@@ -196,7 +196,7 @@ Un solo movimiento de cámara por toma, descrito como ritmo: lento, suave, gradu
 2. Crea **exactamente `cantidad_vinetas`** viñetas con un arco claro: apertura, desarrollo y cierre.
 3. Cada viñeta tiene **una sola acción** (con su verbo, su objeto y un microgesto como máximo) y **un solo movimiento de cámara**.
 4. Para cada viñeta define el encuadre, dónde está cada personaje en la imagen (izquierda, centro o derecha; primer plano o fondo) y en qué parte real del espacio está (sentado a la mesa, apoyado en el marco de la puerta), tocando superficies reales.
-5. Reparte `duracion_total_s` según la importancia: la viñeta que sostiene el momento clave dura más. Ninguna dura menos que `duracion_minima_vineta_s`. La suma debe ser exacta.
+5. Reparte `duracion_total_s` en **partes iguales**: cada viñeta dura `duracion_total_s / cantidad_vinetas` (4 viñetas en 10 s = 2,5 s cada una; 4 en 8 s = 2 s). Todas las `duracion_s` son iguales, nunca menores que `duracion_minima_vineta_s`, y la suma es exacta.
 6. Si hay diálogo, cada línea cabe entera en su viñeta. Usa unas 2 palabras por segundo como referencia (el español puede necesitar menos) y recorta si no cabe. Nunca partas una línea con un corte.
 7. Si falta una imagen clave, no la inventes: anótala en `fotos_faltantes`.
 8. Escribe `prompt_hoja_storyboard`.
@@ -239,7 +239,11 @@ Un solo movimiento de cámara por toma, descrito como ritmo: lento, suave, gradu
 }
 ```
 
-**Cómo escribir `prompt_hoja_storyboard`:** una frase de estilo ("Hoja de storyboard dibujada a lápiz en blanco y negro, con N viñetas en cuadrícula, sin texto ni números") y luego la descripción visual de cada viñeta en orden, con encuadre, posiciones y miradas, indicando respetar la apariencia de las imágenes de referencia. Sin lenguaje de emoción: solo acciones físicas.
+**Cómo escribir `prompt_hoja_storyboard`:** solo los beats de la hoja. La app ya agrega el estilo (lápiz en blanco y negro), la cuadrícula, la lista de imágenes adjuntas y la orden de no dibujar texto: no los repitas. Escribe una frase por viñeta, en orden, con el formato `Viñeta N: <tipo de toma>, <ángulo de cámara>; <quién está dónde en la imagen y en qué superficie real>; <quién mira a quién>; <acción física>; respetar la apariencia de <archivo.jpg>.` Reglas:
+- Sin pronombres ambiguos: repite en cada viñeta los rasgos visibles del personaje (edad aproximada, pelo, ropa, tomados de la biblia de continuidad y las imágenes), nunca "él", "ella" ni "el mismo hombre". Lo mismo con la locación y la utilería.
+- Progresión lógica de planos (general, medio, primer plano, detalle) y ángulos variados (a nivel de los ojos, contrapicado, picado, sobre el hombro).
+- El tipo de toma y el ángulo van dentro de la frase, no como encabezado: la hoja no lleva texto, números ni leyendas dibujadas.
+- Sin lenguaje de emoción: solo acciones físicas.
 
 ---
 
@@ -295,6 +299,7 @@ Un solo movimiento de cámara por toma, descrito como ritmo: lento, suave, gradu
 - El texto va en español neutro, sin nombres de personajes, marcas ni herramientas.
 - Si `duracion_total_s` es 3 s o menos, usa una sola acción y un solo microgesto.
 - Los tiempos deben sumar `duracion_total_s`.
+- **Cortes directos e iguales.** Abre `prompt_video` con `Escena N, duración X segundos.` y declara el storyboard como guía lógica: "Toma la imagen @image1 como referencia lógica de la secuencia de cortes y encuadres del clip." Cada viñeta es un corte: `Viñeta N (primer corte, segundo corte...), duración D segundos: @imageK <plano>, <qué ocurre y quién lo hace>, <un solo movimiento de cámara>.` La duración se reparte en partes iguales, D = `duracion_total_s / cantidad_vinetas` (4 cortes en 10 s = 2,5 s cada uno; en 8 s = 2 s), y los tiempos del bloque Movimiento coinciden con esos cortes. No expliques el contexto de la historia ni el mensaje: di qué se ve en cada corte y con qué imagen.
 - No incluyas música, partitura ni letras en el prompt: la música va en `notas_editor`.
 - Cada línea hablada se dice completa dentro de su toma, nunca partida por un corte. Un hablante principal por toma.
 - Longitud orientativa: 280 a 400 palabras para un clip simple, hasta 600 si tiene varias tomas.

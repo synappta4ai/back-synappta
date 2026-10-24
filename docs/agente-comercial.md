@@ -190,7 +190,7 @@ Brief: "En la mesa, ella se agobia por el silencio. Él espera con paciencia."
 1. Crea **exactamente `cantidad_vinetas`** viñetas con un arco claro: apertura, desarrollo y cierre.
 2. Cada viñeta tiene **una sola acción** (con su verbo, su objeto y un microgesto como máximo) y **un solo movimiento de cámara**.
 3. Para cada viñeta define el encuadre, dónde está cada personaje en la imagen (izquierda, centro o derecha; primer plano o fondo), y en qué parte del espacio real está (sentado a la mesa, apoyado en el mostrador, junto a la puerta).
-4. Reparte `duracion_total_s` según la importancia: la viñeta que sostiene la idea principal dura más. Ninguna dura menos que `duracion_minima_vineta_s`. La suma debe ser exacta.
+4. Reparte `duracion_total_s` en **partes iguales**: cada viñeta dura `duracion_total_s / cantidad_vinetas` (4 viñetas en 10 s = 2,5 s cada una). Todas las `duracion_s` son iguales, nunca menores que `duracion_minima_vineta_s`, y la suma es exacta.
 5. Si una línea de diálogo va en una viñeta, cabe entera en ella. Calcula unas 2 palabras por segundo como referencia (el español puede necesitar menos) y recorta si no cabe.
 6. Si falta una imagen clave, no la inventes: anótala en `fotos_faltantes`.
 7. Escribe `prompt_hoja_storyboard`.
