@@ -26,6 +26,10 @@ const (
 // contra el total pedido (redondeos del modelo).
 const durTolerance = 0.01
 
+// equalDurTolerance: tolerancia al exigir viñetas de igual duración (10 s / 3
+// = 3,33 s redondeado a dos decimales).
+const equalDurTolerance = 0.05
+
 // timeRangeRe detecta rangos de tiempo estilo "0-3 s" / "3.5-5 segundos"
 // dentro de un prompt_video para verificar que cubran el total.
 var timeRangeRe = regexp.MustCompile(`(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)\s*s`)
@@ -249,6 +253,17 @@ func validateStoryboard(data, payload map[string]any) []string {
 	}
 	if hasTotal && abs(sum-total) > durTolerance {
 		warns = append(warns, fmt.Sprintf("las duraciones suman %.2f s y el total pedido es %.2f s", sum, total))
+	}
+	// La duración se reparte en partes iguales: total / cantidad de viñetas
+	// (4 viñetas en 10 s = 2,5 s cada una).
+	if hasTotal {
+		each := total / float64(len(vinetas))
+		for i, v := range vinetas {
+			if d, ok := numField(v, "duracion_s"); ok && abs(d-each) > equalDurTolerance {
+				warns = append(warns, fmt.Sprintf("las viñetas deben durar lo mismo: %.2f s cada una (%.2f s / %d viñetas) y la %d dura %.2f s", each, total, len(vinetas), i+1, d))
+				break
+			}
+		}
 	}
 	if strField(data, "prompt_hoja_storyboard") == "" {
 		warns = append(warns, "falta \"prompt_hoja_storyboard\"")

@@ -257,17 +257,17 @@ func TestValidateStoryboard(t *testing.T) {
 
 	okData := map[string]any{
 		"estado":                 "ok",
-		"duracion_total_s":       float64(8),
+		"duracion_total_s":       float64(9),
 		"prompt_hoja_storyboard": "Hoja de storyboard a lápiz…",
 		"vinetas": []any{
 			map[string]any{"n": float64(1), "duracion_s": float64(3)},
-			map[string]any{"n": float64(2), "duracion_s": float64(2)},
+			map[string]any{"n": float64(2), "duracion_s": float64(3)},
 			map[string]any{"n": float64(3), "duracion_s": float64(3)},
 		},
 	}
 	payload := map[string]any{
 		"cantidad_vinetas":         float64(3),
-		"duracion_total_s":         float64(8),
+		"duracion_total_s":         float64(9),
 		"duracion_minima_vineta_s": float64(1.5),
 	}
 
@@ -303,6 +303,15 @@ func TestValidateStoryboard(t *testing.T) {
 				map[string]any{"n": float64(3), "duracion_s": float64(4)},
 			}),
 			wantInAny: "mínimo",
+		},
+		{
+			name: "duraciones desiguales",
+			data: withMap(okData, "vinetas", []any{
+				map[string]any{"n": float64(1), "duracion_s": float64(4)},
+				map[string]any{"n": float64(2), "duracion_s": float64(3)},
+				map[string]any{"n": float64(3), "duracion_s": float64(2)},
+			}),
+			wantInAny: "lo mismo",
 		},
 		{
 			name:      "sin hoja",
