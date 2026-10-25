@@ -69,11 +69,21 @@ type CredentialResolver func(c *gin.Context) (CredentialLister, bool)
 type Module struct {
 	resolve     CredentialResolver
 	outputsDir  string // carpeta donde se guarda el payload del worker para auto-update
+	masterPrefs MasterPrefsAccess
+	tenantPrefs TenantPrefsSource
 }
 
 func NewModule(resolve CredentialResolver, outputsDir string) *Module {
 	return &Module{resolve: resolve, outputsDir: outputsDir}
 }
+
+// SetMasterPrefsStore wires the platform curation source (system schema).
+// Nil (tests, unwired deploys) disables master filtering.
+func (m *Module) SetMasterPrefsStore(s MasterPrefsAccess) { m.masterPrefs = s }
+
+// SetTenantPrefsSource wires the per-request tenant curation source.
+// Nil disables tenant overrides.
+func (m *Module) SetTenantPrefsSource(src TenantPrefsSource) { m.tenantPrefs = src }
 
 func (m *Module) Name() string { return "models" }
 
@@ -83,6 +93,17 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 	{
 		g.GET("", m.List)
 		g.GET("/:modality", m.ListByModality)
+	}
+	// ─── Curaduría del catálogo (maestro + tenant) ───────────
+	master := g.Group("/master", platformSuperadminOnly())
+	{
+		master.GET("", m.MasterPrefs)
+		master.PUT("", m.MasterUpsertPrefs)
+	}
+	prefs := g.Group("/prefs", adminMw)
+	{
+		prefs.GET("", m.TenantPrefs)
+		prefs.PUT("", m.TenantUpsertPrefs)
 	}
 	w := rg.Group("/worker")
 	w.Use(authMw, tenantMw)
@@ -146,7 +167,21 @@ func (m *Module) List(c *gin.Context) {
 	}
 	live := m.liveUsable(c)
 	models = append(models, filterByModalityOrAll(live, modality)...)
-	utils.Success(c, models)
+	utils.Success(c, m.withPrefs(c, models))
+}
+
+// platformSuperadminOnly aborts unless role_level == 0 (same gate the
+// tenants module uses: inline check, no middleware import, no cycle).
+func platformSuperadminOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, _ := c.Get("role_level")
+		level, ok := raw.(float64)
+		if !ok || int(level) != 0 {
+			c.AbortWithStatusJSON(403, gin.H{"success": false, "message": "platform superadmin only"})
+			return
+		}
+		c.Next()
+	}
 }
 
 // ListByModality handles GET /api/v1/models/:modality
@@ -177,7 +212,7 @@ func (m *Module) ListByModality(c *gin.Context) {
 	}
 	live := m.liveUsable(c)
 	models = append(models, filterByModalityOrAll(live, modality)...)
-	utils.Success(c, models)
+	utils.Success(c, m.withPrefs(c, models))
 }
 
 // liveUsable returns the downloaded models a tenant can run right now, merged
@@ -517,7 +552,7 @@ func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Mode
 		if handled {
 			return nil, true
 		}
-		return models, false
+		return m.withPrefs(c, models), false
 	}
 	// "downloaded" is the union of both dispatch paths (central worker +
 	// paired GPUs). The worker is optional: an unreachable one (or a dead
@@ -525,7 +560,30 @@ func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Mode
 	// still a truthful answer, and failing here would break the panel for a
 	// deployment that simply has no worker yet.
 	models := m.liveUsable(c)
-	return filterByModalityOrAll(models, modality), false
+	return m.withPrefs(c, filterByModalityOrAll(models, modality)), false
+}
+
+// withPrefs filters and orders a public listing through both curation
+// levels. Unwired stores (or empty tables) pass the listing through, so
+// existing tests and pre-migration deploys behave exactly as before.
+func (m *Module) withPrefs(c *gin.Context, models []Model) []Model {
+	if m.masterPrefs == nil && m.tenantPrefs == nil {
+		return models
+	}
+	master := map[string]MasterPref{}
+	if m.masterPrefs != nil {
+		master = prefsOrEmpty("master", m.masterPrefs.All)
+	}
+	tenant := map[string]TenantPref{}
+	if m.tenantPrefs != nil {
+		if access, ok := m.tenantPrefs(c); ok && access != nil {
+			tenant = prefsOrEmpty("tenant", access.All)
+		}
+	}
+	if len(master) == 0 && len(tenant) == 0 {
+		return models
+	}
+	return ApplyPrefs(models, master, tenant)
 }
 
 // usableAPIModels returns the static catalog entries whose provider has a

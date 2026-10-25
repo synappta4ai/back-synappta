@@ -78,7 +78,10 @@ type Core struct {
 	// tenant (nil en deploys con worker central, donde el catálogo vivo por
 	// gRPC es la única fuente "downloaded").
 	bridgeModels BridgeModelResolver
-	mu           sync.RWMutex
+	// modelPrefsCheck vets a model name against the master + tenant curation
+	// (nil = unwired, everything routable passes).
+	modelPrefsCheck func(modelName string) error
+	mu              sync.RWMutex
 }
 
 // NewCore builds the per-tenant orchestration core.
@@ -299,6 +302,15 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
 	modelName = m.Name
+
+	// Curaduría maestro + tenant: un modelo desactivado no genera aunque se
+	// invoque por nombre directo (el listado ya lo oculta).
+	if s.modelPrefsCheck != nil {
+		if err := s.modelPrefsCheck(m.Name); err != nil {
+			errLog = err.Error()
+			return nil, err
+		}
+	}
 
 	// Resolve per-tenant credentials (API models only: downloaded models run
 	// on our own inference worker and need no external provider).

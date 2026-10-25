@@ -51,6 +51,10 @@ type Manager struct {
 	// sistema). nil → los generators downloaded viven solo del gRPC directo.
 	workerBridgeStore *workerbridge.Store
 
+	// modelMaster es la curaduría de plataforma (schema de sistema). nil →
+	// sin veto del maestro: solo aplican las prefs del tenant.
+	modelMaster *model.MasterPrefsStore
+
 	mu      sync.Mutex
 	bundles map[string]*Bundle // slug → bundle
 }
@@ -86,6 +90,27 @@ func NewManager(cfg *config.Config, reg *tenancy.Registry) *Manager {
 // NAT) en los generators downloaded de todos los tenants.
 func (m *Manager) SetWorkerBridge(store *workerbridge.Store) {
 	m.workerBridgeStore = store
+}
+
+// SetModelMasterPrefs wire la curaduría de plataforma (veto + badges) en
+// listados y generación de todos los tenants.
+func (m *Manager) SetModelMasterPrefs(store *model.MasterPrefsStore) {
+	m.modelMaster = store
+}
+
+// TenantPoolFor returns the tenant-schema pool for the request's tenant.
+// False means no tenant context, so per-tenant prefs are skipped.
+func (m *Manager) TenantPoolFor(c *gin.Context) (*sql.DB, bool) {
+	t := tenancy.FromContext(c.Request.Context())
+	if t == nil {
+		return nil, false
+	}
+	pool, err := m.reg.Pool(t.Slug)
+	if err != nil {
+		log.Printf("[runtime] tenant pool for model prefs %q: %v", t.Slug, err)
+		return nil, false
+	}
+	return pool, true
 }
 
 // Resolve returns the bundle for the request's tenant (set by the tenancy
@@ -313,6 +338,28 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 
 	// Agency orchestration core (per-tenant task tracking + logs).
 	core := agency.NewCore(m.cfg, fileSvc, credStore, m.cfg.BaseURL, t.Slug)
+	// Curaduría maestro + tenant también en generación directa por nombre:
+	// el listado oculta, pero el veto real vive aquí.
+	master := m.modelMaster
+	core.SetModelPrefsCheck(func(modelName string) error {
+		var masterMap map[string]model.MasterPref
+		if master != nil {
+			var err error
+			masterMap, err = master.All()
+			if err != nil {
+				log.Printf("[runtime] master prefs for generation: %v", err)
+				masterMap = map[string]model.MasterPref{}
+			}
+		}
+		tenantMap := map[string]model.TenantPref{}
+		tenStore := model.NewTenantPrefsStore(pool)
+		if got, err := tenStore.All(); err != nil {
+			log.Printf("[runtime] tenant prefs for generation: %v", err)
+		} else {
+			tenantMap = got
+		}
+		return model.CheckAllowed(modelName, masterMap, tenantMap)
+	})
 	core.SetStores(
 		agency.NewAssetSyncStore(pool),
 		agency.NewGenerationLogStore(pool),

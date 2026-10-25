@@ -89,6 +89,13 @@ type Model struct {
 	Reasoning bool `json:"reasoning,omitempty"`
 	// DisplayName for UIs.
 	DisplayName string `json:"display_name"`
+	// Recommended marks the platform-curated efficient models (master pref).
+	Recommended bool `json:"recommended,omitempty"`
+	// RecommendTags holds the master's recommendation labels (empty when
+	// not recommended).
+	RecommendTags []string `json:"recommend_tags,omitempty"`
+	// Favorite marks a master or tenant favorite: it sorts first in listings.
+	Favorite bool `json:"favorite,omitempty"`
 	// Defaults the UI can offer (ratios, resolutions, durations).
 	Defaults Defaults `json:"defaults"`
 	// WorkerID identifies the paired GPU that reported this entry when the

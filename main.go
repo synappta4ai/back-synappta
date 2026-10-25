@@ -149,6 +149,11 @@ func main() {
 	wbStore := workerbridge.NewStore(sysDB)
 	manager.SetWorkerBridge(wbStore)
 
+	// Curaduría del catálogo (maestro + tenant): el veto del maestro y las
+	// prefs del tenant ordenan/filtran listados y bloquean generación.
+	masterPrefs := model.NewMasterPrefsStore(sysDB)
+	manager.SetModelMasterPrefs(masterPrefs)
+
 	// Object storage is per tenant (storage_config, managed over HTTP): there
 	// is no global bucket, so a tenant without one keeps using local disk.
 
@@ -215,13 +220,22 @@ func main() {
 	tenant.SetTenantStorageResolver(func(id int64) (tenant.StorageAdmin, error) {
 		return manager.FilesForTenantID(id)
 	})
-	registry.Register(model.NewModule(func(c *gin.Context) (model.CredentialLister, bool) {
+	modelModule := model.NewModule(func(c *gin.Context) (model.CredentialLister, bool) {
 		hdl, ok := manager.CredentialsFor(c)
 		if !ok || hdl == nil {
 			return nil, false
 		}
 		return hdl, true
-	}, cfg.OutputsDir))
+	}, cfg.OutputsDir)
+	modelModule.SetMasterPrefsStore(masterPrefs)
+	modelModule.SetTenantPrefsSource(func(c *gin.Context) (model.TenantPrefsAccess, bool) {
+		pool, ok := manager.TenantPoolFor(c)
+		if !ok {
+			return nil, false
+		}
+		return model.NewTenantPrefsStore(pool), true
+	})
+	registry.Register(modelModule)
 
 	// Tenant-scoped modules resolve their handler per request.
 	registry.Register(event.NewModule(manager.EventsFor))

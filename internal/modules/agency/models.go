@@ -162,6 +162,11 @@ type BridgeModelResolver func(ctx context.Context, name string) (*BridgeModelRef
 // sigue siendo la única fuente de modelos "downloaded".
 func (s *Core) SetBridgeModels(resolve BridgeModelResolver) { s.bridgeModels = resolve }
 
+// SetModelPrefsCheck wires the master + tenant curation veto, enforced on every generation.
+func (s *Core) SetModelPrefsCheck(check func(modelName string) error) {
+	s.modelPrefsCheck = check
+}
+
 // lookupModel resuelve un modelo de generación: primero el catálogo API y el
 // worker central (LookupModel) y, si ese no lo conoce, las GPUs emparejadas
 // del tenant. Sin este segundo paso un modelo que sólo existe en la GPU del
