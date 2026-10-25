@@ -332,6 +332,14 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		errLog = fmt.Sprintf("failed to resolve content: %v", err)
 		return nil, fmt.Errorf("failed to resolve content: %w", err)
 	}
+	// Video providers download the inputs themselves: a loopback/private
+	// serve URL can never be fetched and the task would fail after submit.
+	if m.Type != model.TypeDownloaded && m.Modality == model.ModalityVideo {
+		if err := requirePublicInputs(resolvedContent); err != nil {
+			errLog = err.Error()
+			return nil, err
+		}
+	}
 	// Compute total input video duration from resolved content
 	inputDuration := float64(0)
 	for _, item := range resolvedContent {
