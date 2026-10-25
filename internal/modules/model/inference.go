@@ -313,6 +313,27 @@ func isRoutingModel(id string) bool {
 	return false
 }
 
+// normalizeModalities keeps the declared input modalities (text, image,
+// video, audio, file) of a text model, lower-cased and deduplicated. Only
+// text models report them: the "brain" pickers use the list to offer models
+// that can watch video or listen to audio.
+func normalizeModalities(modality Modality, raw []string) []string {
+	if modality != ModalityText || len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, m := range raw {
+		m = strings.ToLower(strings.TrimSpace(m))
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
 // supportsReasoning reads the provider's supported_parameters, which OpenRouter
 // publishes as an array of strings and its media catalogs as an object.
 func supportsReasoning(raw json.RawMessage) bool {
@@ -454,6 +475,7 @@ func DiscoverInferenceModels(
 			Type                string          `json:"type"`
 			SupportedParameters json.RawMessage `json:"supported_parameters"`
 			Architecture        struct {
+				InputModalities  []string `json:"input_modalities"`
 				OutputModalities []string `json:"output_modalities"`
 			} `json:"architecture"`
 		} `json:"data"`
@@ -491,6 +513,7 @@ func DiscoverInferenceModels(
 			BaseURL:            base,
 			Endpoint:           endpoint,
 			Reasoning:          modality == ModalityText && supportsReasoning(entry.SupportedParameters),
+			InputModalities:    normalizeModalities(modality, entry.Architecture.InputModalities),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DisplayName < out[j].DisplayName })
