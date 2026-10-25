@@ -315,6 +315,46 @@ func TestDiscoverInferenceModelsMarksReasoningAndDeclaredOutputs(t *testing.T) {
 	}
 }
 
+func TestDiscoverInferenceModelsReportsInputModalities(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"google/gemini-watch","architecture":{"input_modalities":["Text","image","VIDEO","audio","video"],"output_modalities":["text"]}},
+			{"id":"meta-llama/Llama-3.3-70B-Instruct"}
+		]}`))
+	})
+	for _, path := range []string{"/v1/images/models", "/v1/videos/models"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		})
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	models, err := DiscoverInferenceModels(context.Background(), ProviderOpenRouter, srv.URL+"/v1", "key", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byName := map[string]Model{}
+	for _, m := range models {
+		byName[m.Name] = m
+	}
+	got := byName["openrouter/google/gemini-watch"].InputModalities
+	want := []string{"text", "image", "video", "audio"}
+	if len(got) != len(want) {
+		t.Fatalf("input modalities = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("input modalities = %v, want %v", got, want)
+		}
+	}
+	if m := byName["openrouter/meta-llama/Llama-3.3-70B-Instruct"]; len(m.InputModalities) != 0 {
+		t.Fatalf("undeclared model must report none, got %v", m.InputModalities)
+	}
+}
+
 func TestDiscoverInferenceModelsSkipsImagesWithoutRoute(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"data":[{"id":"black-forest-labs/FLUX.1-schnell"},{"id":"llama-3.3-70b"}]}`))

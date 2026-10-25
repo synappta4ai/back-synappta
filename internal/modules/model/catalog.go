@@ -87,6 +87,9 @@ type Model struct {
 	// agency "brain" only offers text models with this flag, so image/video
 	// generators and plain chat models never leak into that picker.
 	Reasoning bool `json:"reasoning,omitempty"`
+	// InputModalities lists what a text model can read besides text (image,
+	// video, audio, file), as the provider declares it. Empty when unknown.
+	InputModalities []string `json:"input_modalities,omitempty"`
 	// DisplayName for UIs.
 	DisplayName string `json:"display_name"`
 	// Recommended marks the platform-curated efficient models (master pref).
@@ -362,9 +365,10 @@ var catalog = []Model{
 	{
 		Name: "higgsfield-wan-2-6-reference", Modality: ModalityVideo,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/wan/v2.6/reference-to-video",
-		DisplayName: "Wan 2.6 Reference",
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/wan/v2.6/reference-to-video",
+		ReferenceEndpoint: "/wan/v2.6/reference-to-video",
+		DisplayName:       "Wan 2.6 Reference",
 		Defaults: Defaults{
 			Ratios:      []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p"},

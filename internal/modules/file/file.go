@@ -1179,6 +1179,26 @@ type Handler struct {
 
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
+// LocalPath returns a local path holding the file's bytes (downloaded from the
+// tenant bucket when needed) for internal consumers such as the infoproduct
+// analysis.
+func (h *Handler) LocalPath(id string) (string, error) { return h.svc.GetServePath(id) }
+
+// Info returns the stored file row (nil when missing).
+func (h *Handler) Info(id string) (*File, error) { return h.svc.GetFile(id) }
+
+// DeleteIfTemp permanently removes a file uploaded with storage=temp. The
+// infoproduct analysis calls it once the reference video was consumed, so
+// videos used only as input never accumulate in storage. Persistent files are
+// never touched.
+func (h *Handler) DeleteIfTemp(id string) {
+	f, err := h.svc.GetFile(id)
+	if err != nil || f == nil || f.Storage != "temp" {
+		return
+	}
+	_ = h.svc.HardDelete(id)
+}
+
 // Upload handles POST /files/upload (multipart: file, category, storage).
 // The bytes always arrive here and the tenant's storage config decides where
 // they land (local disk or its bucket): the front never talks to the bucket.

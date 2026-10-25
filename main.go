@@ -39,6 +39,7 @@ import (
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
+	"synapta/internal/modules/infoproduct"
 	mcpmodule "synapta/internal/modules/mcp"
 	"synapta/internal/modules/model"
 	"synapta/internal/modules/preset"
@@ -248,6 +249,8 @@ func main() {
 	registry.Register(credential.NewModule(manager.CredentialsFor))
 	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, manager.FlowsFor, cfg.AgentServerURL))
 	registry.Register(workerbridge.NewModule(wbStore))
+	// VideoMachine "Infoproducto": analiza videos de referencia y compone el prompt.
+	registry.Register(infoproduct.NewModule(manager.CredentialsFor, manager.FilesFor, manager.TenantPoolFor))
 
 	// Agency core with modality routes attached.
 	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.
