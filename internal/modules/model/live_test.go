@@ -1,4 +1,4 @@
-package model
+﻿package model
 
 import (
 	"context"
@@ -216,9 +216,9 @@ func TestWorkerModelsFallsBackToBridge(t *testing.T) {
 	}
 }
 
-// La vista bridge le da al panel lo que necesita para descargar: a qué GPU
-// pedirle el modelo y el estado real de pesos (el agente lo leyó de su gRPC
-// local). Sin esto el panel mostraba todo "Disponible" y sin botón.
+// La vista bridge le da al panel lo que necesita para descargar: a quÃ© GPU
+// pedirle el modelo y el estado real de pesos (el agente lo leyÃ³ de su gRPC
+// local). Sin esto el panel mostraba todo "Disponible" y sin botÃ³n.
 func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
@@ -258,7 +258,7 @@ func TestWorkerModelsBridgeCarriesWorkerAndWeightState(t *testing.T) {
 	}
 }
 
-// La ruta de los pesos también viaja en el snapshot del bridge: es lo que el
+// La ruta de los pesos tambiÃ©n viaja en el snapshot del bridge: es lo que el
 // panel admin muestra en equipos emparejados, donde el back no tiene gRPC.
 func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
@@ -287,8 +287,8 @@ func TestWorkerModelsBridgePassesWeightsPath(t *testing.T) {
 }
 
 // El worker es opcional: sin worker central y sin GPUs emparejadas la vista de
-// gestión responde 200 con la lista vacía. Un 500 acá rompía el panel de un
-// deploy donde el worker todavía no está instalado, y no hay forma de que el
+// gestiÃ³n responde 200 con la lista vacÃ­a. Un 500 acÃ¡ rompÃ­a el panel de un
+// deploy donde el worker todavÃ­a no estÃ¡ instalado, y no hay forma de que el
 // usuario lo arregle desde esa pantalla.
 func TestWorkerModelsDegradesWithoutAnySource(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
@@ -376,7 +376,7 @@ func TestDownloadedTTSMappedToEmptyModality(t *testing.T) {
 		t.Fatal("Chatterbox-TTS missing from live listing")
 	}
 	// tts has no Synapta modality yet: must be listed with Modality "" and
-	// raw mode preserved — never mislabeled, never dropped.
+	// raw mode preserved â€” never mislabeled, never dropped.
 	if tts.Modality != "" || tts.Downloaded.Mode != "tts" {
 		t.Errorf("tts model: modality=%q mode=%q, want \"\" + tts", tts.Modality, tts.Downloaded.Mode)
 	}
@@ -461,9 +461,9 @@ func bridgeCatalog() []workerbridge.WorkerModel {
 	}
 }
 
-// Las GPUs emparejadas son una fuente de modelos "downloaded" más: en modo
-// bridge (worker central caído o inexistente) el listado de generación debe
-// mostrar lo que las máquinas del tenant pueden correr, y nada más.
+// Las GPUs emparejadas son una fuente de modelos "downloaded" mÃ¡s: en modo
+// bridge (worker central caÃ­do o inexistente) el listado de generaciÃ³n debe
+// mostrar lo que las mÃ¡quinas del tenant pueden correr, y nada mÃ¡s.
 func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
@@ -489,8 +489,8 @@ func TestListTypeDownloadedIncludesBridgeModels(t *testing.T) {
 	}
 }
 
-// El listado público no ofrece elegir un modelo cuyos pesos no están en la
-// GPU: /worker/models sí lo muestra (ahí se descarga).
+// El listado pÃºblico no ofrece elegir un modelo cuyos pesos no estÃ¡n en la
+// GPU: /worker/models sÃ­ lo muestra (ahÃ­ se descarga).
 func TestListTypeDownloadedHidesBridgeModelWithoutWeights(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
@@ -505,7 +505,7 @@ func TestListTypeDownloadedHidesBridgeModelWithoutWeights(t *testing.T) {
 }
 
 // Con el worker central vivo y la GPU reportando el mismo modelo, la entrada
-// no se duplica: gana la del worker (tiene telemetría de pesos y es el camino
+// no se duplica: gana la del worker (tiene telemetrÃ­a de pesos y es el camino
 // que despacha hoy).
 func TestListMergedDedupesModelsOfBothPaths(t *testing.T) {
 	m, _ := setup(t)
@@ -534,7 +534,7 @@ func TestListMergedDedupesModelsOfBothPaths(t *testing.T) {
 }
 
 // Filtro por modalidad en la vista fusionada: el modelo de la GPU responde al
-// modality que las listas de generación piden.
+// modality que las listas de generaciÃ³n piden.
 func TestListByModalityIncludesBridgeModel(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
@@ -548,7 +548,7 @@ func TestListByModalityIncludesBridgeModel(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", code, w.Body.String())
 	}
-	// El catálogo API (con las credenciales del tenant) sigue en la lista; lo
+	// El catÃ¡logo API (con las credenciales del tenant) sigue en la lista; lo
 	// que importa es que el modelo de la GPU aparezca entre las opciones de
 	// esa modalidad, resuelto como downloaded y disponible.
 	found := false
@@ -565,9 +565,9 @@ func TestListByModalityIncludesBridgeModel(t *testing.T) {
 	}
 }
 
-// Sin ninguna fuente viva, type=downloaded responde 200 con catálogo vacío: el
-// worker es opcional y pedir explícitamente esa fuente no cambia la regla. El
-// filtro sigue siendo útil (nunca inventa modelos ni los mezcla con los api).
+// Sin ninguna fuente viva, type=downloaded responde 200 con catÃ¡logo vacÃ­o: el
+// worker es opcional y pedir explÃ­citamente esa fuente no cambia la regla. El
+// filtro sigue siendo Ãºtil (nunca inventa modelos ni los mezcla con los api).
 func TestListTypeDownloadedDegradesWithoutAnySource(t *testing.T) {
 	m := NewModule(allUsableResolver(), "")
 	killCentral(t)
@@ -603,9 +603,9 @@ func TestListByModalityMerged(t *testing.T) {
 	m.ListByModality(c)
 	env, code := decode(t, w)
 
-	// Static video models (3 seedance + 7 higgsfield) + live Wan = 11.
-	if code != http.StatusOK || len(env.Data) != 11 {
-		t.Fatalf("video merged: want 11, got %d (status %d): %s", len(env.Data), code, w.Body.String())
+	// Static video models (3 seedance + 8 higgsfield) + live Wan = 12.
+	if code != http.StatusOK || len(env.Data) != 12 {
+		t.Fatalf("video merged: want 12, got %d (status %d): %s", len(env.Data), code, w.Body.String())
 	}
 }
 
@@ -718,8 +718,8 @@ func TestListTypeDownloadedMapsLiveState(t *testing.T) {
 	if sd.Downloaded == nil || !sd.Downloaded.Downloading || sd.Downloaded.DownloadPercent != 42.5 || sd.Downloaded.SizeBytes != 420 {
 		t.Fatalf("live download state not mapped: %+v", sd.Downloaded)
 	}
-	// La ruta de los pesos la reporta el worker y el back la reenvía tal cual:
-	// es la máquina del worker, no el disco del back.
+	// La ruta de los pesos la reporta el worker y el back la reenvÃ­a tal cual:
+	// es la mÃ¡quina del worker, no el disco del back.
 	if !sd.Downloaded.Downloaded ||
 		sd.Downloaded.DownloadPath != "/home/u/.cache/huggingface/hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5" {
 		t.Fatalf("weights path not mapped: %+v", sd.Downloaded)
@@ -921,10 +921,10 @@ func TestWorkerWriteRejectsUnconfiguredWorker(t *testing.T) {
 	}
 }
 
-// Un contexto ya cancelado no cuelga el handler ni se disfraza de catálogo:
-// la lectura al worker muere rápido y degrada a lista vacía, igual que un
-// worker apagado. El status sigue siendo 200 porque el cliente que canceló ya
-// no está escuchando y el worker es opcional.
+// Un contexto ya cancelado no cuelga el handler ni se disfraza de catÃ¡logo:
+// la lectura al worker muere rÃ¡pido y degrada a lista vacÃ­a, igual que un
+// worker apagado. El status sigue siendo 200 porque el cliente que cancelÃ³ ya
+// no estÃ¡ escuchando y el worker es opcional.
 func TestCancelledContextDegradesInsteadOfHanging(t *testing.T) {
 	m, _ := setup(t)
 

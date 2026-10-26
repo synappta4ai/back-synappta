@@ -251,7 +251,13 @@ func (g *HiggsfieldGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 	case strings.Contains(lowerModel, "-i2v"), strings.Contains(lowerModel, "image-to-video"),
 		strings.HasSuffix(req.Endpoint, "/image-to-video"):
 		// Dedicated image-to-video route: the schema takes one image_url.
-		useSingularImage = true
+		// More than one image (or any audio/video) cannot ride it: use the
+		// model's multi-reference route when the catalog defines one.
+		if (len(imageURLs) > 1 || len(videoURLs) > 0 || len(audioURLs) > 0) && req.ReferenceEndpoint != "" {
+			req.Endpoint = req.ReferenceEndpoint
+		} else {
+			useSingularImage = true
+		}
 	case strings.Contains(lowerModel, "reference"), strings.HasSuffix(req.Endpoint, "/reference-to-video"):
 		// Dedicated multi-reference route: image_urls / video_urls arrays are
 		// the documented shape — no rerouting needed.
