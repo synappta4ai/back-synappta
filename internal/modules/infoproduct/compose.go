@@ -159,7 +159,9 @@ func buildVideoPrompt(raw json.RawMessage, target ComposeTarget, imageIDs, audio
 		AudioRefs:   []AudioRef{},
 	}
 	out.Duration = pickDuration(r.Duration, target.Durations, target.MaxDuration)
-	out.Ratio = pickString(r.Ratio, refRatio, target.Ratios)
+	out.Ratio = pickString("9:16", pickString(r.Ratio, refRatio, target.Ratios), target.Ratios)
+	// The output is watched on smartphones: vertical whenever the model allows
+	// it (otherwise the brain's or the reference's closest allowed ratio).
 	out.Resolution = pickString(r.Resolution, "", target.Resolutions)
 	out.GenerateAudio = r.GenerateAudio && target.SupportsAudio
 
