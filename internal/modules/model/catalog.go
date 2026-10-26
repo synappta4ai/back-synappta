@@ -406,6 +406,22 @@ var catalog = []Model{
 			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
 		},
 	},
+	// Seedance 2.5 multi-reference: images, audio and video ride together as
+	// ingredients (image_urls / audio_urls / video_urls) and aspect_ratio is
+	// honoured. VideoMachine's default model.
+	{
+		Name: "higgsfield-seedance-2-5-reference", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/bytedance/seedance-2.5/reference-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+		DisplayName:       "Seedance 2.5 (Referencias)",
+		Defaults: Defaults{
+			Ratios:      []string{"9:16", "16:9", "4:3", "1:1", "3:4", "21:9"},
+			Resolutions: []string{"480p", "720p"},
+			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
+		},
+	},
 	{
 		Name: "higgsfield-minimax-h3-t2v", Modality: ModalityVideo,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
