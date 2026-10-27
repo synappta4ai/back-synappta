@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -348,8 +349,14 @@ type composeRequest struct {
 	// Model is the brain; Target the video model limits.
 	Model        string        `json:"model"`
 	Target       ComposeTarget `json:"target"`
+	TargetModel  string        `json:"target_model"`
 	ImageFileIDs []string      `json:"image_file_ids"`
 	AudioFileIDs []string      `json:"audio_file_ids"`
+	// ImageRoles maps file ids to person|product for the recreate skill.
+	ImageRoles map[string]string `json:"image_roles"`
+	// FPS and AspectRatio describe the reference video (optional).
+	FPS         float64 `json:"fps"`
+	AspectRatio string  `json:"aspect_ratio"`
 	// Notes are the user's corrections and extra instructions.
 	Notes string `json:"notes"`
 }
@@ -430,19 +437,21 @@ func (m *Module) Compose(c *gin.Context) {
 		req.Target.MaxReferences = len(req.ImageFileIDs)
 	}
 	targetJSON, _ := json.Marshal(req.Target)
-	var text strings.Builder
-	text.WriteString("REFERENCE BREAKDOWN (JSON):\n" + string(req.Breakdown))
-	text.WriteString("\n\nTARGET MODEL CONSTRAINTS (JSON):\n" + string(targetJSON))
-	fmt.Fprintf(&text, "\n\nreference_duration_sec: %.1f\nsegments_required: %d", ref.Duration, n)
+	var legacy strings.Builder
+	legacy.WriteString("REFERENCE BREAKDOWN (JSON):\n" + string(req.Breakdown))
+	legacy.WriteString("\n\nTARGET MODEL CONSTRAINTS (JSON):\n" + string(targetJSON))
+	fmt.Fprintf(&legacy, "\n\nreference_duration_sec: %.1f\nsegments_required: %d", ref.Duration, n)
 	if formatMD != "" {
-		text.WriteString("\n\nFORMAT GUIDE (" + formatLabel + "):\n" + formatMD)
+		legacy.WriteString("\n\nFORMAT GUIDE (" + formatLabel + "):\n" + formatMD)
 	}
 	if notes := strings.TrimSpace(req.Notes); notes != "" {
-		text.WriteString("\n\nUSER NOTES:\n" + notes)
+		legacy.WriteString("\n\nUSER NOTES:\n" + notes)
 	}
-	fmt.Fprintf(&text, "\n\nProduct images attached: %d (labeled @Image1..). Audio references attached: %d.", len(req.ImageFileIDs), len(req.AudioFileIDs))
-	parts := []map[string]any{textPart(text.String())}
+	fmt.Fprintf(&legacy, "\n\nProduct images attached: %d (labeled @Image1..). Audio references attached: %d.", len(req.ImageFileIDs), len(req.AudioFileIDs))
 
+	mediaParts := make([]map[string]any, 0, 2*(len(req.ImageFileIDs)+len(req.AudioFileIDs)))
+	imageNames := make([]string, 0, len(req.ImageFileIDs))
+	audioNames := make([]string, 0, len(req.AudioFileIDs))
 	var warnings []string
 	for i, id := range req.ImageFileIDs {
 		info, err := files.Info(id)
@@ -454,6 +463,7 @@ func (m *Module) Compose(c *gin.Context) {
 			utils.BadRequest(c, fmt.Sprintf("%s no es una imagen", info.Filename))
 			return
 		}
+		imageNames = append(imageNames, info.Filename)
 		path, err := files.LocalPath(id)
 		if err != nil {
 			utils.InternalError(c, err.Error())
@@ -473,7 +483,7 @@ func (m *Module) Compose(c *gin.Context) {
 			utils.InternalError(c, err.Error())
 			return
 		}
-		parts = append(parts, textPart(fmt.Sprintf("@Image%d (%s):", i+1, info.Filename)),
+		mediaParts = append(mediaParts, textPart(fmt.Sprintf("@Image%d (%s):", i+1, info.Filename)),
 			imagePart("data:"+info.MimeType+";base64,"+base64.StdEncoding.EncodeToString(data)))
 	}
 	for i, id := range req.AudioFileIDs {
@@ -486,6 +496,7 @@ func (m *Module) Compose(c *gin.Context) {
 			utils.BadRequest(c, fmt.Sprintf("%s no es un audio", info.Filename))
 			return
 		}
+		audioNames = append(audioNames, info.Filename)
 		src, err := files.LocalPath(id)
 		if err != nil {
 			utils.InternalError(c, err.Error())
@@ -501,10 +512,86 @@ func (m *Module) Compose(c *gin.Context) {
 			utils.InternalError(c, err.Error())
 			return
 		}
-		parts = append(parts, textPart(fmt.Sprintf("@Audio%d (%s):", i+1, info.Filename)),
+		mediaParts = append(mediaParts, textPart(fmt.Sprintf("@Audio%d (%s):", i+1, info.Filename)),
 			audioPart(base64.StdEncoding.EncodeToString(data), "mp3"))
 	}
 
+	images := make([]recreateImage, 0, len(req.ImageFileIDs))
+	for i, id := range req.ImageFileIDs {
+		name := ""
+		if i < len(imageNames) {
+			name = imageNames[i]
+		}
+		images = append(images, recreateImage{FileID: id, Role: req.ImageRoles[id], Name: name})
+	}
+	audios := make([]recreateAudio, 0, len(req.AudioFileIDs))
+	for i, id := range req.AudioFileIDs {
+		name := ""
+		if i < len(audioNames) {
+			name = audioNames[i]
+		}
+		audios = append(audios, recreateAudio{FileID: id, Name: name})
+	}
+
+	if recreateSkillEnabled() {
+		if system, serr := LoadRecreateSystemPrompt(); serr != nil {
+			log.Printf("[infoproduct] recreate skill no disponible (%v): se usa el flujo anterior", serr)
+		} else {
+			in := recreateInput{
+				Breakdown:     req.Breakdown,
+				Images:        images,
+				Audios:        audios,
+				Notes:         req.Notes,
+				AspectRatio:   firstNonEmpty(req.AspectRatio, ref.Ratio),
+				FPS:           req.FPS,
+				TotalDuration: ref.Duration,
+				MaxDuration:   req.Target.MaxDuration,
+				TargetModel:   firstNonEmpty(req.TargetModel, req.Target.Model),
+			}
+			userMsg, berr := buildRecreateUserMessage(in)
+			if berr != nil {
+				log.Printf("[infoproduct] no se pudo armar el mensaje de recreacion (%v): se usa el flujo anterior", berr)
+			} else {
+				parts := append([]map[string]any{textPart(userMsg)}, mediaParts...)
+				answer, u, cerr := m.brain.chatWith(c.Request.Context(), baseURL, apiKey, recreateModel(req.Model), system, parts, recreateMaxTokens, recreateTemperature)
+				if cerr != nil {
+					utils.Error(c, http.StatusBadGateway, cerr.Error())
+					return
+				}
+				prompt, perr := cleanRecreatePrompt(answer)
+				if perr != nil {
+					utils.Error(c, http.StatusBadGateway, perr.Error())
+					return
+				}
+				if looksLikeQuestion(prompt) {
+					log.Printf("[infoproduct] recreate devolvio una pregunta: se reintenta una vez")
+					retrySystem := system + "\n\nREMINDER: your previous reply asked the user a question. This is an automated call with no user present. Do not ask anything; write the final English prompt now."
+					if retry, ru, rerr := m.brain.chatWith(c.Request.Context(), baseURL, apiKey, recreateModel(req.Model), retrySystem, parts, recreateMaxTokens, recreateTemperature); rerr == nil {
+						if fixed, ferr := cleanRecreatePrompt(retry); ferr == nil && !looksLikeQuestion(fixed) {
+							prompt = fixed
+							u.PromptTokens += ru.PromptTokens
+							u.CompletionTokens += ru.CompletionTokens
+							u.CostUSD += ru.CostUSD
+						}
+					}
+				}
+				if looksLikeQuestion(prompt) {
+					utils.Error(c, http.StatusBadGateway, "el cerebro no devolvio un prompt de video; intenta de nuevo")
+					return
+				}
+				vp, verr := buildRecreateVideoPrompt(prompt, in, req.Target, ref.Duration, ref.Ratio, n)
+				if verr != nil {
+					utils.Error(c, http.StatusBadGateway, verr.Error())
+					return
+				}
+				vp.Warnings = append(vp.Warnings, warnings...)
+				utils.Success(c, gin.H{"video_prompt": vp, "segments_required": n, "usage": u})
+				return
+			}
+		}
+	}
+
+	parts := append([]map[string]any{textPart(legacy.String())}, mediaParts...)
 	answer, u, err := m.brain.jsonAnswer(c.Request.Context(), baseURL, apiKey, req.Model, composeSystem, parts, 8192)
 	if err != nil {
 		utils.Error(c, http.StatusBadGateway, err.Error())
