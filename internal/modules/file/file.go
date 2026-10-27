@@ -508,6 +508,31 @@ func (s *Store) ListExpiredTemp(maxAge time.Duration) ([]File, error) {
 	return files, rows.Err()
 }
 
+// ListExpiredTrash returns trashed files past their retention (for the
+// nightly purge that deletes them permanently, disk object included).
+func (s *Store) ListExpiredTrash(cutoff time.Time, limit int) ([]File, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 500
+	}
+	query := `SELECT ` + fileCols + ` FROM files
+		WHERE trashed = TRUE AND deleted_at IS NOT NULL AND deleted_at < $1
+		ORDER BY deleted_at ASC LIMIT $2`
+	rows, err := s.db.Query(query, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var files []File
+	for rows.Next() {
+		var f File
+		if err := scanFile(&f, rows); err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
 // ─── Service ────────────────────────────────────────────────────
 
 type Service struct {
@@ -1155,6 +1180,33 @@ func (s *Service) PurgeExpiredTemp() error {
 		s.store.HardDeleteFile(f.ID)
 	}
 	return nil
+}
+
+// TrashRetentionDays is how long trashed files survive before the nightly
+// purge removes them permanently (same retention as generation trash).
+const TrashRetentionDays = 30
+
+// PurgeExpiredTrash permanently removes files trashed more than
+// TrashRetentionDays ago (disk/bucket object + row, via HardDelete).
+func (s *Service) PurgeExpiredTrash() (int, error) {
+	cutoff := time.Now().AddDate(0, 0, -TrashRetentionDays)
+	total := 0
+	for {
+		files, err := s.store.ListExpiredTrash(cutoff, 200)
+		if err != nil {
+			return total, err
+		}
+		if len(files) == 0 {
+			return total, nil
+		}
+		for i := range files {
+			if err := s.HardDelete(files[i].ID); err != nil {
+				fmt.Printf("[file-cron] trash purge %s: %v\n", files[i].ID, err)
+				continue
+			}
+			total++
+		}
+	}
 }
 
 // StartPurgeCron launches the nightly temp purge loop.

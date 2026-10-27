@@ -393,6 +393,7 @@ func main() {
 	stop := make(chan struct{})
 	go agency.ReconcileLoop(manager.EachCore, stop) // recovers orphaned tasks per tenant
 	go workerbridge.ReconcileLoop(wbStore, stop)    // marca failed jobs de GPUs que murieron
+	go runtime.TrashPurgeLoop(reg, cfg, stop)       // borrado definitivo de la papelera a los 30 días
 
 	go func() {
 		log.Printf("[main] synapta listening on :%s (env=%s)", cfg.Port, cfg.Env)

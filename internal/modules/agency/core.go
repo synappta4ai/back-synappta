@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -1599,6 +1600,115 @@ func (s *Core) ListGeneratedVideos(page, limit int, eventID string) (*ListLogsRe
 // narrows the list to one project.
 func (s *Core) ListGeneratedImages(page, limit int, eventID string) (*ListLogsResponse, error) {
 	return s.listGeneratedByModality(page, limit, config.ModalityImage, eventID)
+}
+
+// TrashLog moves one generation to the trash (recoverable for 30 days).
+func (s *Core) TrashLog(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.logStore.TrashLog(id)
+}
+
+// RestoreLog returns a trashed generation to the gallery.
+func (s *Core) RestoreLog(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.logStore.RestoreLog(id)
+}
+
+// DeleteLogPermanent removes one generation forever (row + local files).
+func (s *Core) DeleteLogPermanent(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.purgeLogRows([]ExpiredTrashRow{{ID: id}})
+}
+
+// ListTrash returns paginated trashed generations (video/image/all).
+func (s *Core) ListTrash(page, limit int, resourceType string) (*ListLogsResponse, error) {
+	if s.logStore == nil {
+		return nil, fmt.Errorf("log store not available")
+	}
+	logs, total, err := s.logStore.ListTrash(page, limit, resourceType)
+	if err != nil {
+		return nil, err
+	}
+	if logs == nil {
+		logs = []GenerationLog{}
+	}
+	totalPages := (total + limit - 1) / limit
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	return &ListLogsResponse{Logs: logs, Total: total, Page: page, Limit: limit, TotalPages: totalPages}, nil
+}
+
+// TrashRetentionDays is how long trashed generations survive before the
+// nightly purge removes them permanently.
+const TrashRetentionDays = 30
+
+// PurgeTrash permanently removes generations trashed more than
+// TrashRetentionDays ago (rows + their local output files, best-effort).
+func (s *Core) PurgeTrash() (int, error) {
+	if s.logStore == nil {
+		return 0, fmt.Errorf("log store not available")
+	}
+	cutoff := time.Now().AddDate(0, 0, -TrashRetentionDays)
+	total := 0
+	for {
+		rows, err := s.logStore.ListExpiredTrash(cutoff, 200)
+		if err != nil {
+			return total, err
+		}
+		if len(rows) == 0 {
+			return total, nil
+		}
+		if err := s.purgeLogRows(rows); err != nil {
+			return total, err
+		}
+		total += len(rows)
+	}
+}
+
+// purgeLogRows removes local output files (best-effort) then hard-deletes
+// the rows. With no outputs recorded it just deletes the row.
+func (s *Core) purgeLogRows(rows []ExpiredTrashRow) error {
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Outputs == "" {
+			ids = append(ids, r.ID)
+			continue
+		}
+		var outputs []OutputResource
+		if err := json.Unmarshal([]byte(r.Outputs), &outputs); err != nil {
+			ids = append(ids, r.ID)
+			continue
+		}
+		for _, o := range outputs {
+			s.removeLocalOutput(o.LocalURL)
+		}
+		ids = append(ids, r.ID)
+	}
+	return s.logStore.DeleteLogsByIDs(ids)
+}
+
+// removeLocalOutput deletes a file served from the local outputs dir
+// ("/outputs/..."). Anything else (bucket URLs, provider URLs) is left
+// alone: buckets are tenant-managed and provider links already expired.
+func (s *Core) removeLocalOutput(localURL string) {
+	const prefix = "/outputs/"
+	if !strings.HasPrefix(localURL, prefix) || s.outputsDir == "" {
+		return
+	}
+	rel := strings.TrimPrefix(localURL, prefix)
+	if rel == "" || strings.Contains(rel, "..") {
+		return
+	}
+	if err := os.Remove(s.outputsDir + "/" + rel); err != nil && !os.IsNotExist(err) {
+		log.Printf("[agency-purge] remove %s: %v", rel, err)
+	}
 }
 
 func (s *Core) listGeneratedByModality(page, limit int, modality, eventID string) (*ListLogsResponse, error) {
