@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/tenancy"
 	"synapta/internal/utils"
 )
 
@@ -228,9 +230,19 @@ func buildPayload(title, body string, data map[string]string) ([]byte, error) {
 // Handler exposes push endpoints.
 type Handler struct {
 	svc *Service
+	// pairing mints QR codes (system-wide); nil disables pairing routes.
+	pairing *PairingService
+	// center serves the native in-app bell; nil disables center routes.
+	center *CenterService
 }
 
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+
+// WithPairing attaches the QR pairing service (shared, not per-tenant).
+func (h *Handler) WithPairing(p *PairingService) *Handler { h.pairing = p; return h }
+
+// WithCenter attaches the native notification center (per-tenant pool).
+func (h *Handler) WithCenter(c *CenterService) *Handler { h.center = c; return h }
 
 // Register handles POST /push/subscriptions.
 func (h *Handler) Register(c *gin.Context) {
@@ -293,6 +305,92 @@ func (h *Handler) Test(c *gin.Context) {
 	utils.Success(c, gin.H{"sent_to": n})
 }
 
+// PublicKey handles GET /push/public-key: the VAPID key browsers need to
+// subscribe, plus whether push delivery is configured at all.
+func (h *Handler) PublicKey(c *gin.Context) {
+	utils.Success(c, gin.H{"public_key": h.svc.vapidPublicKey, "enabled": h.svc.Enabled()})
+}
+
+// CreatePairing handles POST /push/pairing: mints a QR code binding the
+// calling user+tenant for 10 minutes.
+func (h *Handler) CreatePairing(c *gin.Context) {
+	if h.pairing == nil {
+		utils.InternalError(c, "pairing not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	t := tenancy.FromContext(c.Request.Context())
+	if t == nil {
+		utils.BadRequest(c, "missing tenant context")
+		return
+	}
+	pc, err := h.pairing.Mint(t.Slug, userID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, pc)
+}// ListNotifications handles GET /push/notifications: the native bell feed.
+func (h *Handler) ListNotifications(c *gin.Context) {
+	if h.center == nil {
+		utils.InternalError(c, "notification center not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	items, err := h.center.List(userID, 30)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, items)
+}
+
+// UnreadNotifications handles GET /push/notifications/unread: just the count.
+func (h *Handler) UnreadNotifications(c *gin.Context) {
+	if h.center == nil {
+		utils.InternalError(c, "notification center not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	n, err := h.center.UnreadCount(userID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"unread": n})
+}
+
+// ReadNotifications handles POST /push/notifications/read: marks all read.
+func (h *Handler) ReadNotifications(c *gin.Context) {
+	if h.center == nil {
+		utils.InternalError(c, "notification center not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	n, err := h.center.MarkAllRead(userID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"read": n})
+}
+
 // ─── Module ─────────────────────────────────────────────────────
 
 // HandlerResolver supplies the tenant-scoped handler for each request.
@@ -301,9 +399,14 @@ type HandlerResolver func(c *gin.Context) (*Handler, bool)
 // Module registers push routes.
 type Module struct {
 	resolve HandlerResolver
+	// pairing serves the public QR redeem (no tenant context on that call).
+	pairing *PairingService
 }
 
 func NewModule(resolve HandlerResolver) *Module { return &Module{resolve: resolve} }
+
+// WithPairing attaches the shared pairing service for the public redeem.
+func (m *Module) WithPairing(p *PairingService) *Module { m.pairing = p; return m }
 
 func (m *Module) Name() string { return "push" }
 
@@ -314,7 +417,39 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 		g.POST("/subscriptions", m.priv("Register"))
 		g.DELETE("/subscriptions", m.priv("Unregister"))
 		g.POST("/test", m.priv("Test"))
+		g.GET("/public-key", m.priv("PublicKey"))
+		g.POST("/pairing", m.priv("CreatePairing"))
+		g.GET("/notifications", m.priv("ListNotifications"))
+		g.GET("/notifications/unread", m.priv("UnreadNotifications"))
+		g.POST("/notifications/read", m.priv("ReadNotifications"))
 	}
+	// QR redeem is public: the scanning phone has no session yet.
+	pub := rg.Group("/push")
+	{
+		pub.POST("/pairing/:code/redeem", m.redeem)
+	}
+}
+
+// redeem serves the public route with the shared pairing service.
+func (m *Module) redeem(c *gin.Context) {
+	if m.pairing == nil {
+		utils.InternalError(c, "pairing not configured")
+		return
+	}
+	var req SubscriptionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	if err := m.pairing.Redeem(c.Param("code"), &req, c.Request.UserAgent()); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+		utils.BadRequest(c, "invalid or expired code")
+		return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"subscribed": true})
 }
 
 // priv resolves the tenant handler then dispatches to the named method.
@@ -331,6 +466,16 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.Unregister(c)
 		case "Test":
 			hdl.Test(c)
+		case "PublicKey":
+			hdl.PublicKey(c)
+		case "CreatePairing":
+			hdl.CreatePairing(c)
+		case "ListNotifications":
+			hdl.ListNotifications(c)
+		case "UnreadNotifications":
+			hdl.UnreadNotifications(c)
+		case "ReadNotifications":
+			hdl.ReadNotifications(c)
 		default:
 			utils.InternalError(c, "unknown handler method: "+method)
 		}

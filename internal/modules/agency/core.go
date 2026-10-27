@@ -76,6 +76,8 @@ type Core struct {
 	channelNotifier PushNotifier
 	// notificationsChecker respeta el opt-in del usuario (nil → permitir).
 	notificationsChecker func(userID int64) bool
+	// notifyRecorder persiste el aviso en el centro nativo del usuario.
+	notifyRecorder func(userID int64, ntype, title, body, taskID string)
 	// outputPublisher moves finished artifacts to the tenant bucket when it has
 	// one; nil (or stored=false) keeps them on local disk.
 	outputPublisher OutputPublisher
@@ -130,6 +132,11 @@ func (s *Core) SetChannelNotifier(pn PushNotifier) { s.channelNotifier = pn }
 
 // SetNotificationsChecker wires the per-user opt-in gate.
 func (s *Core) SetNotificationsChecker(fn func(userID int64) bool) { s.notificationsChecker = fn }
+
+// SetNotifyRecorder wires the native notification center persistence.
+func (s *Core) SetNotifyRecorder(fn func(userID int64, ntype, title, body, taskID string)) {
+	s.notifyRecorder = fn
+}
 
 // SetOutputPublisher wires the tenant's storage so completed generations can be
 // saved to its bucket instead of local disk.
@@ -1203,6 +1210,9 @@ func (s *Core) notifyTaskCompletion(userID int, info taskNotifyInfo) {
 	data := map[string]string{
 		"type":    ntype,
 		"task_id": info.TaskID,
+	}
+	if s.notifyRecorder != nil {
+		go s.notifyRecorder(int64(userID), ntype, title, body, info.TaskID)
 	}
 	if s.pushNotifier != nil {
 		go s.pushNotifier.SendToUser(int64(userID), title, body, data)

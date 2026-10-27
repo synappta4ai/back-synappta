@@ -56,6 +56,9 @@ type Manager struct {
 	// sin veto del maestro: solo aplican las prefs del tenant.
 	modelMaster *model.MasterPrefsStore
 
+	// pairingSvc emite los códigos QR (sistema, compartido por tenants).
+	pairingSvc *push.PairingService
+
 	// notificationsChecker dice si un usuario aceptó notificaciones async
 	// (prefs del schema de sistema). nil → permitir (no bloquear el push
 	// preexistente).
@@ -97,6 +100,11 @@ func NewManager(cfg *config.Config, reg *tenancy.Registry) *Manager {
 // NAT) en los generators downloaded de todos los tenants.
 func (m *Manager) SetWorkerBridge(store *workerbridge.Store) {
 	m.workerBridgeStore = store
+}
+
+// SetPairingService wire el servicio de códigos QR en los handlers push.
+func (m *Manager) SetPairingService(p *push.PairingService) {
+	m.pairingSvc = p
 }
 
 // SetNotificationsChecker wire el opt-in de notificaciones del usuario
@@ -391,6 +399,12 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		return eventSvc.SaveGenerationOutput(pieceID, number, videoURL, localURL, taskID)
 	})
 	core.SetPushNotifier(pushSvc)
+	centerSvc := push.NewCenterService(pool)
+	core.SetNotifyRecorder(func(userID int64, ntype, title, body, taskID string) {
+		if err := centerSvc.Record(userID, ntype, title, body, taskID); err != nil {
+			log.Printf("[runtime] record notification user=%d: %v", userID, err)
+		}
+	})
 	notifySvc := notify.NewService(notify.NewStore(pool, m.cfg.EncryptionKey))
 	core.SetChannelNotifier(notifySvc)
 	core.SetNotificationsChecker(m.notificationsChecker)
@@ -468,7 +482,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		Assignments: assignment.NewHandler(assignmentSvc),
 		Presets:     preset.NewHandler(presetSvc),
 		Skills:      skill.NewHandler(skillSvc),
-		Push:        push.NewHandler(pushSvc),
+		Push:        push.NewHandler(pushSvc).WithCenter(centerSvc).WithPairing(m.pairingSvc),
 		Notify:      notify.NewHandler(notifySvc),
 		Credentials: credential.NewHandler(credStore),
 		Agency:      agency.NewHandler(core),

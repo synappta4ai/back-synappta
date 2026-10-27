@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log"
 	"net/http"
@@ -249,7 +250,13 @@ func main() {
 	registry.Register(assignment.NewModule(manager.AssignmentsFor))
 	registry.Register(preset.NewModule(manager.PresetsFor))
 	registry.Register(skill.NewModule(manager.SkillsFor))
-	registry.Register(push.NewModule(manager.PushFor))
+	// QR pairing: códigos de un solo uso para suscribir dispositivos sin login.
+	pairingSvc := push.NewPairingService(sysDB, func(tenantSlug string) (*sql.DB, error) {
+		return reg.Pool(tenantSlug)
+	})
+	manager.SetPairingService(pairingSvc)
+	pushModule := push.NewModule(manager.PushFor).WithPairing(pairingSvc)
+	registry.Register(pushModule)
 	registry.Register(notify.NewModule(manager.NotifyFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
 	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, manager.FlowsFor, cfg.AgentServerURL))
