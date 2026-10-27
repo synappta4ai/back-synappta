@@ -78,16 +78,32 @@ func (s *Core) BackfillMissingCosts(limit int) BackfillResult {
 		// excluded by the candidates query.
 		var cost float64
 		source := ""
-		if calc := s.pickCalculator(row.ModelName); calc != nil && calc.Name() != "default" && !isFreeModel(row.ModelName) {
-			if est := calc.CalculateEstimated(genReq); est > 0 && row.EstimatedCost == 0 {
+		if calc := s.pickCalculator(row.ModelName); calc != nil && calc.Name() != "default" && !isFreeModel(row.ModelName) {			if est := calc.CalculateEstimated(genReq); est > 0 && row.EstimatedCost == 0 {
 				cost = est
 				// Provider rows keep their source: only the missing USD
-			// leg is completed (credits stay untouched).
+				// leg is completed (credits stay untouched).
 				if row.CostSource != "provider_estimate" {
 					source = "calculator"
 				}
 			}
-		}
+			}
+			// No priced calculator (e.g. OpenRouter images bill in-response):
+			// recover usage.cost from the stored submit trace instead.
+			if cost == 0 && row.EstimatedCost == 0 && s.commStore != nil {
+				if body, cerr := s.commStore.GetGenerateResponseBody(row.TaskID); cerr == nil && body != "" {
+					var raw map[string]interface{}
+					if jerr := json.Unmarshal([]byte(body), &raw); jerr == nil {
+						if usage, ok := raw["usage"].(map[string]interface{}); ok {
+							if c := HiggsfieldNumber(usage["cost"]); c > 0 {
+								cost = c
+								if row.CostSource != "provider_estimate" {
+									source = "api_response"
+								}
+							}
+						}
+					}
+				}
+			}
 		dur, resName, ratio := row.VideoDuration, row.VideoResolution, row.VideoRatio
 		if dur == 0 && genReq.Duration > 0 {
 			dur = genReq.Duration

@@ -258,6 +258,9 @@ func (g *OpenAIImageGenerator) Generate(req *agency.GeneratorRequest) (*agency.G
 		Status:  config.STATUS_SUCCESS,
 		Outputs: outputs,
 		Raw:     result,
+		// OpenRouter bills in-response (usage.cost, USD): without this the
+		// image cards land at $0.00 with no priced calculator to cover them.
+		CostUSD: openRouterImageCost(result),
 	}, nil
 }
 
@@ -337,6 +340,17 @@ func (g *OpenAIImageGenerator) request(endpoint string, payload map[string]inter
 		return nil, fmt.Errorf("image API error %d: %s", resp.StatusCode, agency.ExtractError(result, string(raw)))
 	}
 	return result, nil
+}
+
+// openRouterImageCost reads the billed cost from an OpenAI-compatible
+// image response (OpenRouter reports usage.cost in USD). Providers without
+// in-response billing return 0 and fall through to the local calculators.
+func openRouterImageCost(result map[string]interface{}) float64 {
+	usage, ok := result["usage"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	return agency.HiggsfieldNumber(usage["cost"])
 }
 
 // truncateBody bounds an unparseable body so the error stays readable.

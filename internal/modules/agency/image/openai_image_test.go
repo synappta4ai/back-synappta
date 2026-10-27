@@ -130,6 +130,29 @@ func TestOpenAIImageGenerateReadsBase64(t *testing.T) {
 	removeOutputFile(t, result.Outputs[0].URL)
 }
 
+func TestOpenAIImageGenerateReadsUsageCost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://cdn.example.com/out.png"}],"usage":{"cost":0.012}}`))
+	}))
+	defer srv.Close()
+
+	g := NewOpenAIImageGenerator()
+	req := &agency.GeneratorRequest{
+		Model:    "openrouter/google/gemini-3.1-flash-image-preview",
+		Content:  []agency.ContentItem{{Type: "text", Text: "test"}},
+		BaseURL:  srv.URL,
+		Endpoint: "/images/generations",
+		AuthKey:  "secret",
+	}
+	result, err := g.Generate(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.CostUSD != 0.012 {
+		t.Fatalf("CostUSD = %v, want 0.012", result.CostUSD)
+	}
+}
+
 func TestOpenAIImageValidateAcceptsOpenRouterReferences(t *testing.T) {
 	g := NewOpenAIImageGenerator()
 	req := &agency.GeneratorRequest{

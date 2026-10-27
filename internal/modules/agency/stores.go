@@ -347,6 +347,23 @@ func (s *GenerationLogStore) ListCostBackfillCandidates(limit int) ([]Generation
 	return out, rows.Err()
 }
 
+// GetGenerateResponseBody returns the stored submit-phase response for a task
+// (sync generators answer inline, so usage/cost figures live here, not in a
+// poll row). Empty string when no submit trace was recorded.
+func (s *ServerCommunicationStore) GetGenerateResponseBody(taskID string) (string, error) {
+	var body string
+	err := s.db.QueryRow(
+		`SELECT COALESCE(response_body, '') FROM server_communications
+		 WHERE task_id = $1 AND phase = 'generate'
+		 ORDER BY created_at DESC LIMIT 1`,
+		taskID,
+	).Scan(&body)
+	if err != nil {
+		return "", err
+	}
+	return body, nil
+}
+
 // ApplyCostBackfill patches a row with a recomputed spend and request shape.
 // A zero cost or empty source/ratio leaves the stored value untouched, so
 // partial recomputes never erase data. Cost writes only land on rows without
