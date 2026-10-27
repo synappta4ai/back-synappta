@@ -35,8 +35,15 @@ func NewSeedance25Calculator() *Seedance25Calculator {
 func (c *Seedance25Calculator) Name() string { return "seedance25" }
 
 // Match reports whether this calculator handles the model.
+// Covers the BytePlus original (dreamina-seedance-2-5-260628) and the
+// Higgsfield-hosted twins (higgsfield-seedance-2-5-t2v/i2v/reference),
+// which share the same Seedance 2.5 per-second pricing. Without this,
+// Higgsfield generations depend solely on the /estimate route and land
+// at $0.00 with cost_source='calculator' when the estimate fails.
 func (c *Seedance25Calculator) Match(modelName string) bool {
-	return strings.Contains(strings.ToLower(modelName), "dreamina-seedance-2-5-260628")
+	lower := strings.ToLower(modelName)
+	return strings.Contains(lower, "dreamina-seedance-2-5-260628") ||
+		strings.Contains(lower, "seedance-2-5")
 }
 
 // CalculateFromResponse never extracts cost from the API response.
@@ -48,7 +55,9 @@ func (c *Seedance25Calculator) CalculateFromResponse(raw interface{}, req *agenc
 func (c *Seedance25Calculator) CalculateEstimated(req *agency.GeneratorRequest) float64 {
 	rate, ok := c.rates[req.Resolution]
 	if !ok {
-		return 0
+		// Unknown/empty resolution: fall back to the 720p rate instead of
+		// reporting $0.00 (which breaks cost traceability).
+		rate = c.rates["720p"]
 	}
 
 	seconds := float64(req.Duration)

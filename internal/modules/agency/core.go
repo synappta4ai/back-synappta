@@ -268,6 +268,15 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		if taskID == "" {
 			taskID = "<no-task>"
 		}
+		// Request shape as fallback for the cards: Higgsfield poll payloads
+		// rarely carry resolution/duration, so without this the UI shows "—"
+		// even though the request asked for a concrete shape.
+		videoDuration, videoResolution, videoRatio := 0, "", ""
+		if genReq != nil {
+			videoDuration, videoResolution, videoRatio = genReq.Duration, genReq.Resolution, genReq.Ratio
+		} else {
+			videoDuration, videoResolution, videoRatio = int(req.Duration), req.Resolution, req.Ratio
+		}
 		logEntry := &GenerationLog{
 			TaskID:                taskID,
 			ModelName:             modelName,
@@ -287,6 +296,9 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			CostSource:            costSource,
 			CostCredits:           costCredits,
 			ProviderTransactionID: providerTxID,
+			VideoDuration:         videoDuration,
+			VideoResolution:       videoResolution,
+			VideoRatio:            videoRatio,
 		}
 		if saveErr := s.logStore.Create(logEntry); saveErr != nil {
 			fmt.Printf("failed to save generation log: %v\n", saveErr)
@@ -488,7 +500,14 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			costSource = "api_response"
 		} else if !calc.NeedsBackgroundCalc() {
 			estimatedCost = calc.CalculateEstimated(genReq)
-			costSource = "calculator"
+			// DefaultCalculator returning 0 means "no pricing known", not
+			// "free" (Gemini is the truly-free exception): mark pending so
+			// the missing cost stays visible instead of a fake $0.00.
+			if estimatedCost == 0 && calc.Name() == "default" {
+				costSource = "pending"
+			} else {
+				costSource = "calculator"
+			}
 		} else {
 			costSource = "pending"
 		}
@@ -520,6 +539,35 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			s.attachAudit(comm, m, creds, req)
 			_ = s.commStore.Create(comm)
 		}
+	} else if costSource == "calculator" && estimatedCost > 0 {
+		log.Printf("[spend] task=%q model=%q usd=%.4f source=%s (fallback, estimate unavailable)",
+			taskID, modelName, estimatedCost, costSource)
+		// Same estimate phase as the provider-reported one so /admin/logs
+		// surfaces the fallback spend per task instead of a "—" cost cell.
+		if s.commStore != nil {
+			estResp, _ := json.Marshal(map[string]interface{}{
+				"credits":        0,
+				"usd":            estimatedCost,
+				"transaction_id": providerTxID,
+				"source":         "calculator",
+			})
+			comm := &ServerCommunication{
+				TaskID:       taskID,
+				ModelName:    m.Name,
+				Endpoint:     strings.TrimSuffix(genReq.BaseURL, "/") + "/estimate" + genReq.Endpoint,
+				Method:       "POST",
+				Phase:        "estimate",
+				StartedAt:    time.Now(),
+				RequestBody:  string(apiPayloadBytes),
+				ResponseBody: string(estResp),
+				StatusCode:   200,
+			}
+			s.attachAudit(comm, m, creds, req)
+			_ = s.commStore.Create(comm)
+		}
+	} else if costSource == "pending" {
+		log.Printf("[spend] task=%q model=%q source=pending (no pricing: estimate failed, no calculator match)",
+			taskID, modelName)
 	}
 
 	// Track the task for status polling

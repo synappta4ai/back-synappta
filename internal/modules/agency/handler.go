@@ -174,6 +174,15 @@ func (h *Handler) GetGenerationLogsCostSummary(c *gin.Context) {
 	utils.Success(c, result)
 }
 
+// BackfillGenerationCosts recomputes missing spend (and empty video shape)
+// from the stored request payloads. Idempotent: provider-reported rows are
+// never touched. The front fires it on every login so past $0 rows heal
+// without manual intervention.
+func (h *Handler) BackfillGenerationCosts(c *gin.Context) {
+	result := h.core.BackfillMissingCosts(500)
+	utils.Success(c, result)
+}
+
 // GetGenerationLog handles GET /agency/logs/generation/:id
 func (h *Handler) GetGenerationLog(c *gin.Context) {
 	id := c.Param("id")
@@ -321,6 +330,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 
 		// The caller's recent tasks (own rows only) — take-reel hydration.
 		g.GET("/tasks/recent", m.priv("RecentTasks"))
+		// Login-triggered cost repair (any authenticated tenant user; the
+		// pass is tenant-scoped and idempotent).
+		g.POST("/tasks/backfill-costs", m.priv("BackfillGenerationCosts"))
 		// The caller's generations by date window (session recovery) and the
 		// two-check rating of a task (owner-only, body carries task_id).
 		g.GET("/tasks/history", m.priv("TaskHistory"))
@@ -360,6 +372,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListGenerationLogs(c)
 		case "RecentTasks":
 			hdl.RecentTasks(c)
+		case "BackfillGenerationCosts":
+			hdl.BackfillGenerationCosts(c)
 		case "TaskHistory":
 			hdl.TaskHistory(c)
 		case "UpdateTaskRating":

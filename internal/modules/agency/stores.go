@@ -220,8 +220,8 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 
 // Create inserts a new generation log entry.
 func (s *GenerationLogStore) Create(log *GenerationLog) error {
-	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source, cost_credits, provider_transaction_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source, cost_credits, provider_transaction_id, video_duration, video_resolution, video_ratio)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		RETURNING id, created_at, updated_at`
 
 	outputsStr := marshalOutputs(log.Outputs)
@@ -245,6 +245,9 @@ func (s *GenerationLogStore) Create(log *GenerationLog) error {
 		log.CostSource,
 		log.CostCredits,
 		log.ProviderTransactionID,
+		log.VideoDuration,
+		nullIfEmptyStr(log.VideoResolution),
+		nullIfEmptyStr(log.VideoRatio),
 	).Scan(&log.ID, &log.CreatedAt, &log.UpdatedAt)
 }
 
@@ -306,6 +309,57 @@ func (s *GenerationLogStore) RefundProviderCostByTaskID(taskID string) (int64, e
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// ListCostBackfillCandidates returns the newest rows whose spend is missing
+// (empty/pending source, or a $0 calculator row) so the login-triggered
+// backfill can recompute them from request_payload. Gemini rows are filtered
+// by the caller (free tier, $0 is genuine).
+func (s *GenerationLogStore) ListCostBackfillCandidates(limit int) ([]GenerationLog, error) {
+	query := `SELECT id, task_id, model_name,
+		COALESCE(request_payload, '') AS request_payload,
+		estimated_cost, COALESCE(cost_source, '') AS cost_source,
+		video_duration, COALESCE(video_resolution, '') AS video_resolution,
+		COALESCE(video_ratio, '') AS video_ratio
+		FROM generation_logs
+		WHERE deleted_at IS NULL
+		AND (cost_source = '' OR cost_source = 'pending'
+			OR (estimated_cost = 0 AND cost_source = 'calculator')
+			OR (video_resolution = '' AND request_payload LIKE '%resolution%'))
+		ORDER BY created_at DESC LIMIT $1`
+	rows, err := s.db.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GenerationLog
+	for rows.Next() {
+		var l GenerationLog
+		if err := rows.Scan(&l.ID, &l.TaskID, &l.ModelName, &l.Request,
+			&l.EstimatedCost, &l.CostSource,
+			&l.VideoDuration, &l.VideoResolution, &l.VideoRatio); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// ApplyCostBackfill patches a row with a recomputed spend and request shape.
+// A zero cost or empty source/ratio leaves the stored value untouched, so
+// partial recomputes never erase data. Cost writes only land on rows without
+// a provider-reported spend.
+func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source string, duration int, resolution, ratio string) error {
+	query := `UPDATE generation_logs SET
+		estimated_cost = CASE WHEN $1 > 0 AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $1 ELSE estimated_cost END,
+		cost_source = CASE WHEN $2 <> '' AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $2 ELSE cost_source END,
+		video_duration = CASE WHEN video_duration = 0 AND $3 > 0 THEN $3 ELSE video_duration END,
+		video_resolution = CASE WHEN video_resolution = '' AND $4 <> '' THEN $4 ELSE video_resolution END,
+		video_ratio = CASE WHEN video_ratio = '' AND $5 <> '' THEN $5 ELSE video_ratio END,
+		updated_at = NOW()
+		WHERE id = $6 AND deleted_at IS NULL`
+	_, err := s.db.Exec(query, cost, source, duration, resolution, ratio, id)
+	return err
 }
 
 // UpdateMetadataByTaskID persists video generation metadata + progress sampled
