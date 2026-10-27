@@ -53,9 +53,6 @@ func (s *Core) BackfillMissingCosts(limit int) BackfillResult {
 	res.Scanned = len(rows)
 	for i := range rows {
 		row := &rows[i]
-		if isFreeModel(row.ModelName) {
-			continue
-		}
 		var payload backfillPayload
 		if err := json.Unmarshal([]byte(row.Request), &payload); err != nil {
 			continue
@@ -75,7 +72,22 @@ func (s *Core) BackfillMissingCosts(limit int) BackfillResult {
 				genReq.Content = append(genReq.Content, ContentItem{Type: item.Type})
 			}
 		}
-		cost, source := s.backfillCostFor(row.ModelName, genReq)
+		// Spend is only recomputed when a priced (non-default) calculator
+		// matches: rows without known pricing keep their stored values so
+		// local/free models are never rewritten. Refunded rows are already
+		// excluded by the candidates query.
+		var cost float64
+		source := ""
+		if calc := s.pickCalculator(row.ModelName); calc != nil && calc.Name() != "default" && !isFreeModel(row.ModelName) {
+			if est := calc.CalculateEstimated(genReq); est > 0 && row.EstimatedCost == 0 {
+				cost = est
+				// Provider rows keep their source: only the missing USD
+			// leg is completed (credits stay untouched).
+				if row.CostSource != "provider_estimate" {
+					source = "calculator"
+				}
+			}
+		}
 		dur, resName, ratio := row.VideoDuration, row.VideoResolution, row.VideoRatio
 		if dur == 0 && genReq.Duration > 0 {
 			dur = genReq.Duration
@@ -86,8 +98,8 @@ func (s *Core) BackfillMissingCosts(limit int) BackfillResult {
 		if ratio == "" {
 			ratio = genReq.Ratio
 		}
-		needsCost := cost > 0 && row.EstimatedCost == 0
-		needsSource := source != "" && source != row.CostSource && (row.CostSource == "" || row.CostSource == "calculator" || row.CostSource == "pending")
+		needsCost := cost > 0
+		needsSource := source != "" && (row.CostSource == "" || row.CostSource == "pending" || row.CostSource == "calculator")
 		needsMeta := (dur > 0 && row.VideoDuration == 0) ||
 			(resName != "" && row.VideoResolution == "") ||
 			(ratio != "" && row.VideoRatio == "")
@@ -111,15 +123,15 @@ func (s *Core) BackfillMissingCosts(limit int) BackfillResult {
 }
 
 // backfillCostFor recomputes a row's spend with the registered calculators.
-// Returns ("calculator", estimate) on a priced match, ("pending", 0) when no
-// pricing is known, and ("", 0) for free models (leave the row untouched).
+// It reports whether the model has known (priced) costing. Kept for
+// diagnosis: the pass above inlines the priced-only policy.
 func (s *Core) backfillCostFor(modelName string, genReq *GeneratorRequest) (float64, string) {
 	if isFreeModel(modelName) {
 		return 0, ""
 	}
 	calc := s.pickCalculator(modelName)
 	if calc == nil || calc.Name() == "default" {
-		return 0, "pending"
+		return 0, ""
 	}
 	if est := calc.CalculateEstimated(genReq); est > 0 {
 		return est, "calculator"

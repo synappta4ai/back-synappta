@@ -494,6 +494,16 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		costCredits = result.CostCredits
 		estimatedCost = result.CostUSD
 		costSource = "provider_estimate"
+		if estimatedCost == 0 {
+			// The provider billed credits without a USD figure: complete
+			// the USD leg with the local calculator so cards don't show
+			// $0.00. Credits, tx and source stay provider-reported.
+			if calc := s.pickCalculator(modelName); calc != nil && calc.Name() != "default" {
+				if est := calc.CalculateEstimated(genReq); est > 0 {
+					estimatedCost = est
+				}
+			}
+		}
 	} else if calc := s.pickCalculator(modelName); calc != nil {
 		if cost, ok := calc.CalculateFromResponse(result.Raw, genReq); ok {
 			estimatedCost = cost
