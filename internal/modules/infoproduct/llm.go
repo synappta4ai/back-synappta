@@ -64,6 +64,11 @@ func audioPart(b64, format string) map[string]any {
 
 // chat sends one system + one multimodal user turn and returns the text.
 func (b *brain) chat(ctx context.Context, baseURL, apiKey, model, system string, parts []map[string]any, maxTokens int) (string, usage, error) {
+	return b.chatWith(ctx, baseURL, apiKey, model, system, parts, maxTokens, 0.2)
+}
+
+// chatWith is chat with an explicit temperature (used by the recreate skill).
+func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system string, parts []map[string]any, maxTokens int, temperature float64) (string, usage, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
@@ -74,7 +79,7 @@ func (b *brain) chat(ctx context.Context, baseURL, apiKey, model, system string,
 			{"role": "user", "content": parts},
 		},
 		"max_tokens":  maxTokens,
-		"temperature": 0.2,
+		"temperature": temperature,
 		"usage":       map[string]any{"include": true},
 	}
 	body, err := json.Marshal(payload)

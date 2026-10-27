@@ -31,6 +31,14 @@ GET /outputs/video/syn_<ns>.mp4    ← servido por Synapta (no expira)
 - Recuperación del artifact: disco compartido (dev) o `BM_WORKER_ARTIFACT_BASE/artifacts/<nombre>` (worker remoto / túnel de Colab). Si no se puede traer, el job **falla** — nunca éxito falso.
 - Los modelos descargados **no requieren credenciales** (corren en nuestra propia GPU).
 
+## VideoMachine · Infoproducto
+
+- Paso 1: `POST /api/v1/infoproduct/analyze` desglosa el video con `internal/modules/infoproduct/prompts/analyze.md`.
+- Paso 2: `POST /api/v1/infoproduct/compose` usa como system prompt el skill embebido `internal/modules/infoproduct/prompts/Synappta Skill actuacion Infoproducto.md` (copia exacta de `internal/Prompt/...`) y devuelve un único prompt final en inglés.
+- `VIDEO_RECREATE_SKILL=legacy` vuelve al flujo anterior (`prompts/compose.md`, JSON con segmentos); `VIDEO_RECREATE_SKILL=dcs-recreate` (default) activa el skill.
+- `LLM_MODEL_RECREATE_PROMPT` sobreescribe el modelo del cerebro solo para este paso.
+- La copia embebida debe existir: `go:embed` falla en build si se borra; el fallback a legacy solo cubre fallos en runtime.
+
 ## Layout
 
 ```
