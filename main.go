@@ -42,6 +42,7 @@ import (
 	"synapta/internal/modules/infoproduct"
 	mcpmodule "synapta/internal/modules/mcp"
 	"synapta/internal/modules/model"
+	"synapta/internal/modules/notify"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
@@ -141,6 +142,9 @@ func main() {
 
 	// ─── Per-tenant service graph ─────────────────────────────
 	manager := runtime.NewManager(cfg, reg)
+	// El opt-in de notificaciones vive en las prefs del usuario (sistema):
+	// el core lo consulta antes de pushear o fanear a los canales.
+	manager.SetNotificationsChecker(authSvc.NotificationsAllowed)
 
 	// ─── GPU worker bridge (Fase A del plan distribuido) ──────
 	// Tablas en el schema de sistema: el worker se autentica con su propio
@@ -246,6 +250,7 @@ func main() {
 	registry.Register(preset.NewModule(manager.PresetsFor))
 	registry.Register(skill.NewModule(manager.SkillsFor))
 	registry.Register(push.NewModule(manager.PushFor))
+	registry.Register(notify.NewModule(manager.NotifyFor))
 	registry.Register(credential.NewModule(manager.CredentialsFor))
 	registry.Register(agent.NewModule(manager.CredentialsFor, manager.EventsFor, manager.AgencyCoreFor, manager.FlowsFor, cfg.AgentServerURL))
 	registry.Register(workerbridge.NewModule(wbStore))

@@ -71,6 +71,11 @@ type Core struct {
 	genAssetSt   *GeneratedAssetStore
 	genSaver     GenerationSaver
 	pushNotifier PushNotifier
+	// channelNotifier fanea el evento a los canales externos del tenant
+	// (Slack, Telegram, Discord... vía shoutrrr). Nil → solo Web Push.
+	channelNotifier PushNotifier
+	// notificationsChecker respeta el opt-in del usuario (nil → permitir).
+	notificationsChecker func(userID int64) bool
 	// outputPublisher moves finished artifacts to the tenant bucket when it has
 	// one; nil (or stored=false) keeps them on local disk.
 	outputPublisher OutputPublisher
@@ -119,6 +124,12 @@ func (s *Core) serveURL(fileID string) string {
 
 // SetPushNotifier wires the push service used for async completion alerts.
 func (s *Core) SetPushNotifier(pn PushNotifier) { s.pushNotifier = pn }
+
+// SetChannelNotifier wires the tenant channels fan-out (shoutrrr).
+func (s *Core) SetChannelNotifier(pn PushNotifier) { s.channelNotifier = pn }
+
+// SetNotificationsChecker wires the per-user opt-in gate.
+func (s *Core) SetNotificationsChecker(fn func(userID int64) bool) { s.notificationsChecker = fn }
 
 // SetOutputPublisher wires the tenant's storage so completed generations can be
 // saved to its bucket instead of local disk.
@@ -1155,9 +1166,16 @@ type taskNotifyInfo struct {
 	GenerationNumber int
 }
 
-// notifyTaskCompletion sends a Web Push to the task owner (video only today).
+// notifyTaskCompletion alerts the task owner (video only today) via Web Push
+// and the tenant's external channels, honoring the user's opt-in.
 func (s *Core) notifyTaskCompletion(userID int, info taskNotifyInfo) {
-	if s.pushNotifier == nil || userID <= 0 || info.ResourceType != "video" {
+	if userID <= 0 || info.ResourceType != "video" {
+		return
+	}
+	if s.notificationsChecker != nil && !s.notificationsChecker(int64(userID)) {
+		return
+	}
+	if s.pushNotifier == nil && s.channelNotifier == nil {
 		return
 	}
 
@@ -1182,10 +1200,16 @@ func (s *Core) notifyTaskCompletion(userID int, info taskNotifyInfo) {
 		}
 	}
 
-	go s.pushNotifier.SendToUser(int64(userID), title, body, map[string]string{
+	data := map[string]string{
 		"type":    ntype,
 		"task_id": info.TaskID,
-	})
+	}
+	if s.pushNotifier != nil {
+		go s.pushNotifier.SendToUser(int64(userID), title, body, data)
+	}
+	if s.channelNotifier != nil {
+		go s.channelNotifier.SendToUser(int64(userID), title, body, data)
+	}
 }
 
 // resolveContent maps file IDs to public serve URLs, or asset:// URIs when

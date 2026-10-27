@@ -293,6 +293,22 @@ func (s *Store) UpdateAvatarPreference(userID int64, fileID, url string) error {
 	return nil
 }
 
+// UpdateNotificationsPreference stores the user's opt-in for async
+// notifications (video completado, etc.) under preferences.notifications.
+func (s *Store) UpdateNotificationsPreference(userID int64, enabled bool) error {
+	result, err := s.db.Exec(
+		`UPDATE users SET preferences = jsonb_set(COALESCE(preferences, '{}'), '{notifications,enabled}', to_jsonb($1::boolean), true),
+		updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL`,
+		enabled, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return errors.New("user not found")
+	}
+	return nil
+}
+
 // Service issues tokens and manages users.
 type Service struct {
 	store     *Store
@@ -536,6 +552,64 @@ func (s *Service) UpdateThemePreferences(userID int64, theme ThemePreferences) e
 	return s.store.UpdateThemePreferences(userID, theme)
 }
 
+// NotificationsPreferences is the user's opt-in for async notifications.
+// Enabled defaults to true when the user never set it.
+type NotificationsPreferences struct {
+	Enabled bool `json:"enabled"`
+}
+
+// GetNotificationsPreferences returns the user's notification opt-in.
+func (s *Service) GetNotificationsPreferences(userID int64) (NotificationsPreferences, error) {
+	prefs, err := s.store.GetUserPreferences(userID)
+	if err != nil {
+		return NotificationsPreferences{}, err
+	}
+	notifRaw, ok := prefs["notifications"]
+	if !ok {
+		return NotificationsPreferences{Enabled: true}, nil
+	}
+	notifBytes, err := json.Marshal(notifRaw)
+	if err != nil {
+		return NotificationsPreferences{}, err
+	}
+	var notif NotificationsPreferences
+	if err := json.Unmarshal(notifBytes, &notif); err != nil {
+		return NotificationsPreferences{}, err
+	}
+	return notif, nil
+}
+
+// UpdateNotificationsPreferences saves the user's notification opt-in.
+func (s *Service) UpdateNotificationsPreferences(userID int64, enabled bool) error {
+	return s.store.UpdateNotificationsPreference(userID, enabled)
+}
+
+// NotificationsAllowed reports whether the user opted into async
+// notifications. Unknown users and read errors default to allowed so a
+// missing preference never blocks the pre-existing push flow.
+func (s *Service) NotificationsAllowed(userID int64) bool {
+	if userID <= 0 {
+		return true
+	}
+	prefs, err := s.store.GetUserPreferences(userID)
+	if err != nil {
+		return true
+	}
+	notifRaw, ok := prefs["notifications"]
+	if !ok {
+		return true
+	}
+	notifBytes, err := json.Marshal(notifRaw)
+	if err != nil {
+		return true
+	}
+	var notif NotificationsPreferences
+	if err := json.Unmarshal(notifBytes, &notif); err != nil {
+		return true
+	}
+	return notif.Enabled
+}
+
 // UpdateUserAvatar stores the user's profile avatar (file id + public serve
 // URL) or clears it when both values are empty. Returns the fresh profile.
 func (s *Service) UpdateUserAvatar(userID int64, avatarFileID, avatarURL string) (*UserResponse, error) {
@@ -753,6 +827,40 @@ func (h *Handler) UpdateAvatar(c *gin.Context) {
 	utils.Success(c, user)
 }
 
+// GetNotifications handles GET /user/preferences/notifications
+func (h *Handler) GetNotifications(c *gin.Context) {
+	id := utils.UserIDFromContext(c)
+	if id <= 0 {
+		utils.Unauthorized(c, "invalid token")
+		return
+	}
+	notif, err := h.svc.GetNotificationsPreferences(id)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, notif)
+}
+
+// UpdateNotifications handles PUT /user/preferences/notifications
+func (h *Handler) UpdateNotifications(c *gin.Context) {
+	id := utils.UserIDFromContext(c)
+	if id <= 0 {
+		utils.Unauthorized(c, "invalid token")
+		return
+	}
+	var req NotificationsPreferences
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	if err := h.svc.UpdateNotificationsPreferences(id, req.Enabled); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, req)
+}
+
 // ListUsers handles GET /admin/users
 func (h *Handler) ListUsers(c *gin.Context) {
 	users, err := h.svc.ListUsers()
@@ -807,6 +915,8 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, adminMw gin.HandlerFun
 		user.GET("/preferences/theme", m.hdl.GetTheme)
 		user.POST("/preferences/theme", m.hdl.UpdateTheme)
 		user.PUT("/profile/avatar", m.hdl.UpdateAvatar)
+		user.GET("/preferences/notifications", m.hdl.GetNotifications)
+		user.PUT("/preferences/notifications", m.hdl.UpdateNotifications)
 	}
 
 	adm := rg.Group("/admin")

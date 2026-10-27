@@ -33,6 +33,7 @@ import (
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
 	"synapta/internal/modules/model"
+	"synapta/internal/modules/notify"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
@@ -55,6 +56,11 @@ type Manager struct {
 	// sin veto del maestro: solo aplican las prefs del tenant.
 	modelMaster *model.MasterPrefsStore
 
+	// notificationsChecker dice si un usuario aceptó notificaciones async
+	// (prefs del schema de sistema). nil → permitir (no bloquear el push
+	// preexistente).
+	notificationsChecker func(userID int64) bool
+
 	mu      sync.Mutex
 	bundles map[string]*Bundle // slug → bundle
 }
@@ -71,6 +77,7 @@ type Bundle struct {
 	Presets     *preset.Handler
 	Skills      *skill.Handler
 	Push        *push.Handler
+	Notify      *notify.Handler
 	Credentials *credential.Handler
 	Agency      *agency.Handler
 
@@ -90,6 +97,12 @@ func NewManager(cfg *config.Config, reg *tenancy.Registry) *Manager {
 // NAT) en los generators downloaded de todos los tenants.
 func (m *Manager) SetWorkerBridge(store *workerbridge.Store) {
 	m.workerBridgeStore = store
+}
+
+// SetNotificationsChecker wire el opt-in de notificaciones del usuario
+// (prefs del schema de sistema) para que el core lo respete al notificar.
+func (m *Manager) SetNotificationsChecker(fn func(userID int64) bool) {
+	m.notificationsChecker = fn
 }
 
 // SetModelMasterPrefs wire la curaduría de plataforma (veto + badges) en
@@ -291,6 +304,12 @@ func (m *Manager) SkillsFor(c *gin.Context) (*skill.Handler, bool) {
 	return b.Skills, ok
 }
 
+// NotifyFor returns the notify handler for the request's tenant.
+func (m *Manager) NotifyFor(c *gin.Context) (*notify.Handler, bool) {
+	b, ok := m.Resolve(c)
+	return b.Notify, ok
+}
+
 // PushFor returns the push handler for the request's tenant.
 func (m *Manager) PushFor(c *gin.Context) (*push.Handler, bool) {
 	b, ok := m.Resolve(c)
@@ -372,6 +391,9 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		return eventSvc.SaveGenerationOutput(pieceID, number, videoURL, localURL, taskID)
 	})
 	core.SetPushNotifier(pushSvc)
+	notifySvc := notify.NewService(notify.NewStore(pool, m.cfg.EncryptionKey))
+	core.SetChannelNotifier(notifySvc)
+	core.SetNotificationsChecker(m.notificationsChecker)
 	// Generated media follows the same rule as uploads: the tenant's bucket
 	// when configured, local disk otherwise.
 	core.SetOutputPublisher(fileSvc)
@@ -447,6 +469,7 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		Presets:     preset.NewHandler(presetSvc),
 		Skills:      skill.NewHandler(skillSvc),
 		Push:        push.NewHandler(pushSvc),
+		Notify:      notify.NewHandler(notifySvc),
 		Credentials: credential.NewHandler(credStore),
 		Agency:      agency.NewHandler(core),
 		Flows:       toolkit.NewPGFlows(pool),
