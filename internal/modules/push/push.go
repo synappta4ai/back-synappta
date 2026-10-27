@@ -101,11 +101,15 @@ func (s *Store) DeleteByEndpoint(userID int64, endpoint string) error {
 // ─── Service ────────────────────────────────────────────────────
 
 // Service owns subscription persistence and Web Push delivery.
+// Delivery is signed with the user's own VAPID pair (auto-generated on
+// first use); the global PUSH_VAPID_* pair only signs sends to legacy
+// subscriptions created before per-user keys existed.
 type Service struct {
 	store           *Store
 	vapidPublicKey  string
 	vapidPrivateKey string
 	vapidSubject    string
+	userKeys        *UserKeysStore
 	client          *http.Client
 }
 
@@ -119,9 +123,41 @@ func NewService(store *Store, vapidPublicKey, vapidPrivateKey, vapidSubject stri
 	}
 }
 
-// Enabled reports whether VAPID is configured.
+// WithUserKeys attaches the per-user VAPID store (auto-generation).
+func (s *Service) WithUserKeys(st *UserKeysStore) *Service { s.userKeys = st; return s }
+
+// Enabled reports whether push delivery can work at all: per-user keys
+// auto-generate, so a configured store is enough; otherwise the legacy
+// global pair must be complete.
 func (s *Service) Enabled() bool {
+	if s.userKeys != nil {
+		return true
+	}
 	return s.vapidPublicKey != "" && s.vapidPrivateKey != "" && s.vapidSubject != ""
+}
+
+// keysFor resolves the signing identity for a user: their own pair when
+// present, else the legacy global pair.
+func (s *Service) keysFor(userID int64) (pub, priv, subject string) {
+	if s.userKeys != nil {
+		if k, err := s.userKeys.Get(userID); err == nil && k.PublicKey != "" && k.PrivateKey != "" {
+			sub := k.Subject
+			if sub == "" {
+				sub = s.vapidSubject
+			}
+			return k.PublicKey, k.PrivateKey, sub
+		}
+	}
+	return s.vapidPublicKey, s.vapidPrivateKey, s.vapidSubject
+}
+
+// EnsureUserKeys returns the user's own VAPID pair, generating it on first
+// use (same generation as cmd/generate-keys).
+func (s *Service) EnsureUserKeys(userID int64) (*UserKeys, error) {
+	if s.userKeys == nil {
+		return &UserKeys{UserID: userID, PublicKey: s.vapidPublicKey, PrivateKey: s.vapidPrivateKey, Subject: s.vapidSubject}, nil
+	}
+	return s.userKeys.Ensure(userID, s.vapidSubject, false)
 }
 
 // Register stores a new device subscription for the user.
@@ -139,8 +175,9 @@ func (s *Service) Unregister(userID int64, endpoint string) error {
 
 // SendTest delivers a test notification to all the user's devices.
 func (s *Service) SendTest(userID int64, message string) (int, error) {
-	if !s.Enabled() {
-		return 0, fmt.Errorf("push not configured: set PUSH_VAPID_PUBLIC_KEY, PUSH_VAPID_PRIVATE_KEY and PUSH_VAPID_SUBJECT")
+	pub, priv, subject := s.keysFor(userID)
+	if pub == "" || priv == "" || subject == "" {
+		return 0, fmt.Errorf("push not configured: no VAPID keys for user")
 	}
 	subs, err := s.store.ListByUser(userID)
 	if err != nil {
@@ -157,7 +194,7 @@ func (s *Service) SendTest(userID int64, message string) (int, error) {
 		return 0, err
 	}
 	for i := range subs {
-		s.sendOne(&subs[i], payload)
+		s.sendOne(&subs[i], payload, pub, priv, subject)
 	}
 	return len(subs), nil
 }
@@ -165,7 +202,8 @@ func (s *Service) SendTest(userID int64, message string) (int, error) {
 // SendToUser pushes a notification to all the user's devices. Fire-and-forget:
 // delivery problems are logged and gone subscriptions are cleaned up.
 func (s *Service) SendToUser(userID int64, title, body string, data map[string]string) {
-	if !s.Enabled() {
+	pub, priv, subject := s.keysFor(userID)
+	if pub == "" || priv == "" || subject == "" {
 		return
 	}
 	subs, err := s.store.ListByUser(userID)
@@ -179,19 +217,19 @@ func (s *Service) SendToUser(userID int64, title, body string, data map[string]s
 		return
 	}
 	for i := range subs {
-		s.sendOne(&subs[i], payload)
+		s.sendOne(&subs[i], payload, pub, priv, subject)
 	}
 }
 
-func (s *Service) sendOne(sub *Subscription, payload []byte) {
+func (s *Service) sendOne(sub *Subscription, payload []byte, pub, priv, subject string) {
 	resp, err := webpush.SendNotificationWithContext(context.Background(), payload, &webpush.Subscription{
 		Endpoint: sub.Endpoint,
 		Keys:     webpush.Keys{P256dh: sub.P256DH, Auth: sub.Auth},
 	}, &webpush.Options{
 		HTTPClient:      s.client,
-		Subscriber:      s.vapidSubject,
-		VAPIDPublicKey:  s.vapidPublicKey,
-		VAPIDPrivateKey: s.vapidPrivateKey,
+		Subscriber:      subject,
+		VAPIDPublicKey:  pub,
+		VAPIDPrivateKey: priv,
 		TTL:             60,
 	})
 	if err != nil {
@@ -305,10 +343,72 @@ func (h *Handler) Test(c *gin.Context) {
 	utils.Success(c, gin.H{"sent_to": n})
 }
 
-// PublicKey handles GET /push/public-key: the VAPID key browsers need to
-// subscribe, plus whether push delivery is configured at all.
+// PublicKey handles GET /push/public-key: the user's own VAPID key
+// (auto-generated on first call), plus whether push delivery works.
 func (h *Handler) PublicKey(c *gin.Context) {
-	utils.Success(c, gin.H{"public_key": h.svc.vapidPublicKey, "enabled": h.svc.Enabled()})
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	keys, err := h.svc.EnsureUserKeys(userID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{
+		"public_key": keys.PublicKey,
+		"enabled":    keys.PublicKey != "" && keys.PrivateKey != "",
+		"managed":    h.svc.userKeys != nil,
+	})
+}
+
+// RotateVapid handles POST /push/vapid/rotate: forces a fresh per-user pair.
+// Existing subscriptions were bound to the old applicationServerKey and must
+// resubscribe (the front re-subscribes automatically after rotating).
+func (h *Handler) RotateVapid(c *gin.Context) {
+	if h.svc.userKeys == nil {
+		utils.BadRequest(c, "per-user vapid not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	keys, err := h.svc.userKeys.Ensure(userID, h.svc.vapidSubject, true)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"public_key": keys.PublicKey})
+}
+
+// TestCenter handles POST /push/notifications/test: writes a probe alert
+// into the native bell so admins can verify the center chain.
+func (h *Handler) TestCenter(c *gin.Context) {
+	if h.center == nil {
+		utils.InternalError(c, "notification center not configured")
+		return
+	}
+	userID := utils.UserIDFromContext(c)
+	if userID <= 0 {
+		utils.Unauthorized(c, "missing user id")
+		return
+	}
+	var req struct {
+		Message string `json:"message"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	body := req.Message
+	if body == "" {
+		body = "If you see this in your bell, the native center works."
+	}
+	if err := h.center.Record(userID, "push-test", "🔔 Synapta center test", body, ""); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "center test notification recorded")
 }
 
 // CreatePairing handles POST /push/pairing: mints a QR code binding the
@@ -422,12 +522,34 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 		g.GET("/notifications", m.priv("ListNotifications"))
 		g.GET("/notifications/unread", m.priv("UnreadNotifications"))
 		g.POST("/notifications/read", m.priv("ReadNotifications"))
+		g.POST("/notifications/test", m.priv("TestCenter"))
+		g.POST("/vapid/rotate", m.priv("RotateVapid"))
 	}
 	// QR redeem is public: the scanning phone has no session yet.
 	pub := rg.Group("/push")
 	{
+		pub.GET("/pairing/:code/public-key", m.redeemKey)
 		pub.POST("/pairing/:code/redeem", m.redeem)
 	}
+}
+
+// redeemKey serves the owner's VAPID public key for a pairing code so the
+// scanning phone can subscribe before redeeming (still unused at this point).
+func (m *Module) redeemKey(c *gin.Context) {
+	if m.pairing == nil {
+		utils.InternalError(c, "pairing not configured")
+		return
+	}
+	pub, err := m.pairing.PublicKeyFor(c.Param("code"), "")
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.BadRequest(c, "invalid or expired code")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"public_key": pub, "enabled": pub != ""})
 }
 
 // redeem serves the public route with the shared pairing service.
@@ -476,6 +598,10 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.UnreadNotifications(c)
 		case "ReadNotifications":
 			hdl.ReadNotifications(c)
+		case "TestCenter":
+			hdl.TestCenter(c)
+		case "RotateVapid":
+			hdl.RotateVapid(c)
 		default:
 			utils.InternalError(c, "unknown handler method: "+method)
 		}

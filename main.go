@@ -253,7 +253,7 @@ func main() {
 	// QR pairing: códigos de un solo uso para suscribir dispositivos sin login.
 	pairingSvc := push.NewPairingService(sysDB, func(tenantSlug string) (*sql.DB, error) {
 		return reg.Pool(tenantSlug)
-	})
+	}).WithKeys(cfg.EncryptionKey, cfg.PushVapidSubject)
 	manager.SetPairingService(pairingSvc)
 	pushModule := push.NewModule(manager.PushFor).WithPairing(pairingSvc)
 	registry.Register(pushModule)

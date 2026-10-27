@@ -361,7 +361,8 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	assignmentSvc := assignment.NewService(assignment.NewStore(pool))
 	presetSvc := preset.NewService(preset.NewStore(pool))
 	skillSvc := skill.NewService(skill.NewStore(pool))
-	pushSvc := push.NewService(push.NewStore(pool), m.cfg.PushVapidPublicKey, m.cfg.PushVapidPrivateKey, m.cfg.PushVapidSubject)
+	pushSvc := push.NewService(push.NewStore(pool), m.cfg.PushVapidPublicKey, m.cfg.PushVapidPrivateKey, m.cfg.PushVapidSubject).
+		WithUserKeys(push.NewUserKeysStore(pool, m.cfg.EncryptionKey))
 
 	// Agency orchestration core (per-tenant task tracking + logs).
 	core := agency.NewCore(m.cfg, fileSvc, credStore, m.cfg.BaseURL, t.Slug)
