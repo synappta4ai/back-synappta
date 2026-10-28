@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"errors"
 	"log"
 	"net/http"
@@ -39,8 +40,8 @@ import (
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
-	"synapta/internal/modules/ingredient"
 	"synapta/internal/modules/infoproduct"
+	"synapta/internal/modules/ingredient"
 	mcpmodule "synapta/internal/modules/mcp"
 	"synapta/internal/modules/model"
 	"synapta/internal/modules/notify"
@@ -327,7 +328,7 @@ func main() {
 
 	// ─── Health endpoints (outside /api/v1 auth) ──────────────
 	router.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "env": cfg.Env})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "env": cfg.Env, "version": version})
 	})
 	router.GET("/readyz", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
@@ -343,10 +344,10 @@ func main() {
 				return
 			}
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ready"})
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "version": version})
 	})
 	router.GET("/", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"service": "synapta", "status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"service": "synapta", "status": "ok", "version": version})
 	})
 
 	// ─── GlitchTip / Sentry test endpoints ────────────────────
@@ -401,7 +402,7 @@ func main() {
 	renderModule.ReconcileLoop(reg, stop)           // falla renders huérfanos (reinicio / sin progreso)
 
 	go func() {
-		log.Printf("[main] synapta listening on :%s (env=%s)", cfg.Port, cfg.Env)
+		log.Printf("[main] synapta %s listening on :%s (env=%s)", version, cfg.Port, cfg.Env)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[main] server: %v", err)
 		}
@@ -413,7 +414,7 @@ func main() {
 	<-quit
 	log.Println("[main] shutdown signal received")
 
-	close(stop) // stop the reconciler first
+	close(stop)             // stop the reconciler first
 	renderModule.Shutdown() // cancel in-flight ffmpeg renders
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -424,6 +425,14 @@ func main() {
 	reg.CloseAll()
 	log.Println("[main] bye")
 }
+
+// appVersion comes from the VERSION file at the repo root (embedded at build).
+//
+//go:embed VERSION
+var appVersion string
+
+// version is the trimmed app version ("1.5.0").
+var version = strings.TrimSpace(appVersion)
 
 // requestID middleware tags each request with an X-Request-ID.
 func requestID() gin.HandlerFunc {
