@@ -2,6 +2,7 @@ package push
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,22 @@ import (
 
 	"synapta/internal/secretbox"
 )
+
+// ValidVapidPublicKey reports whether s is a usable VAPID applicationServerKey:
+// an uncompressed P-256 point (65 bytes starting with 0x04) in base64url.
+// A 43-char key decodes to 32 bytes (a private scalar, not a point) and the
+// browser rejects it in pushManager.subscribe.
+func ValidVapidPublicKey(s string) bool {
+	raw := s
+	if m := len(raw) % 4; m != 0 {
+		raw += strings.Repeat("=", 4-m)
+	}
+	b, err := base64.URLEncoding.DecodeString(raw)
+	if err != nil {
+		return false
+	}
+	return len(b) == 65 && b[0] == 4
+}
 
 // UserKeys is a user's own VAPID identity (private key in plaintext only in
 // memory; at rest it lives sealed in user_vapid_keys).
@@ -57,11 +74,15 @@ func (s *UserKeysStore) Ensure(userID int64, subjectFallback string, force bool)
 		return nil, errors.New("missing user id")
 	}
 	if !force {
-		if k, err := s.Get(userID); err == nil && k.PublicKey != "" && k.PrivateKey != "" {
+		// Auto-heal: rows minted while the GenerateVAPIDKeys return order was
+		// swapped hold the private scalar in public_key (43 chars, rejected
+		// by the browser). Treat them as missing so they regenerate below.
+		if k, err := s.Get(userID); err == nil && k.PublicKey != "" && k.PrivateKey != "" && ValidVapidPublicKey(k.PublicKey) {
 			return k, nil
 		}
 	}
-	pub, priv, err := webpush.GenerateVAPIDKeys()
+	// GenerateVAPIDKeys returns (privateKey, publicKey): keep this order.
+	priv, pub, err := webpush.GenerateVAPIDKeys()
 	if err != nil {
 		return nil, fmt.Errorf("generate vapid keys: %w", err)
 	}
