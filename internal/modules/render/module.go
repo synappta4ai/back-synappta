@@ -45,6 +45,8 @@ type Module struct {
 	files      FilesResolver
 	pool       PoolResolver
 	outputsDir string
+	// tempDir holds download-only exports (outside the public /outputs tree).
+	tempDir string
 
 	sem        chan struct{}
 	maxSeconds float64
@@ -71,8 +73,12 @@ func NewModule(files FilesResolver, pool PoolResolver, outputsDir string) *Modul
 	if threads < 1 {
 		threads = 1
 	}
+	tempDir := strings.TrimSpace(os.Getenv("RENDER_TMP_DIR"))
+	if tempDir == "" {
+		tempDir = filepath.Join(os.TempDir(), "synapta-renders")
+	}
 	return &Module{
-		files: files, pool: pool, outputsDir: outputsDir,
+		files: files, pool: pool, outputsDir: outputsDir, tempDir: tempDir,
 		sem:        make(chan struct{}, envInt("RENDER_MAX_CONCURRENT", 1)),
 		maxSeconds: float64(envInt("RENDER_MAX_SECONDS", 600)),
 		timeout:    time.Duration(envInt("RENDER_TIMEOUT_MINUTES", 20)) * time.Minute,

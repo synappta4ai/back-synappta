@@ -156,7 +156,7 @@ func (m *Module) render(ctx context.Context, st *store, files *file.Handler, job
 	}
 	// Download-only: the file waits for the user in a temp folder and is
 	// deleted as soon as it is delivered.
-	tmpDir := filepath.Join(m.outputsDir, ".renders", jobID)
+	tmpDir := filepath.Join(m.tempDir, jobID)
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return "", "", "", err
 	}
