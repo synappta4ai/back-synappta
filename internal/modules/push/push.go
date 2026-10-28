@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
@@ -98,6 +99,60 @@ func (s *Store) DeleteByEndpoint(userID int64, endpoint string) error {
 	return err
 }
 
+// DeviceView is an admin-facing subscription row (no push secrets).
+type DeviceView struct {
+	ID              string    `json:"id"`
+	UserID          int64     `json:"user_id"`
+	UserDisplayName string    `json:"user_display_name"`
+	UserAgent       string    `json:"user_agent"`
+	EndpointHost    string    `json:"endpoint_host"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// ListAll returns every device subscription in the tenant with owner info.
+func (s *Store) ListAll() ([]DeviceView, error) {
+	rows, err := s.db.Query(`
+		SELECT ps.id, ps.user_id,
+			COALESCE(NULLIF(TRIM(COALESCE(u.name,'') || ' ' || COALESCE(u.surname,'')), ''), COALESCE(u.username, '')) AS display,
+			COALESCE(ps.user_agent, ''), ps.endpoint, ps.created_at
+		FROM push_subscriptions ps
+		LEFT JOIN users u ON u.id = ps.user_id
+		ORDER BY ps.created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	devs := []DeviceView{}
+	for rows.Next() {
+		var d DeviceView
+		var endpoint string
+		if err := rows.Scan(&d.ID, &d.UserID, &d.UserDisplayName, &d.UserAgent, &endpoint, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		d.EndpointHost = subscriptionHost(endpoint)
+		devs = append(devs, d)
+	}
+	return devs, rows.Err()
+}
+
+// DeleteByID removes a subscription regardless of owner (admin action).
+func (s *Store) DeleteByID(id string) error {
+	_, err := s.db.Exec(`DELETE FROM push_subscriptions WHERE id = $1`, id)
+	return err
+}
+
+// subscriptionHost extracts the push service host for display
+// (endpoints are long FCM/WebPush URLs; the secret stays server-side).
+func subscriptionHost(endpoint string) string {
+	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+		return u.Host
+	}
+	if len(endpoint) > 48 {
+		return endpoint[:48] + "…"
+	}
+	return endpoint
+}
+
 // ─── Service ────────────────────────────────────────────────────
 
 // Service owns subscription persistence and Web Push delivery.
@@ -171,6 +226,16 @@ func (s *Service) Register(userID int64, req *SubscriptionRequest, userAgent str
 // Unregister removes one device subscription for the user.
 func (s *Service) Unregister(userID int64, endpoint string) error {
 	return s.store.DeleteByEndpoint(userID, endpoint)
+}
+
+// ListDevices returns every subscribed device in the tenant (admin view).
+func (s *Service) ListDevices() ([]DeviceView, error) {
+	return s.store.ListAll()
+}
+
+// RemoveDevice deletes any subscription by id (admin action).
+func (s *Service) RemoveDevice(id string) error {
+	return s.store.DeleteByID(id)
 }
 
 // SendTest delivers a test notification to all the user's devices.
@@ -299,6 +364,30 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 	utils.Success(c, gin.H{"subscribed": true})
+}
+
+// ListSubscriptions handles GET /push/subscriptions (admin: all tenant devices).
+func (h *Handler) ListSubscriptions(c *gin.Context) {
+	devs, err := h.svc.ListDevices()
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, devs)
+}
+
+// UnregisterByID handles DELETE /push/subscriptions/:id (admin: any device).
+func (h *Handler) UnregisterByID(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		utils.BadRequest(c, "subscription id is required")
+		return
+	}
+	if err := h.svc.RemoveDevice(id); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "unsubscribed")
 }
 
 // Unregister handles DELETE /push/subscriptions?endpoint=...
@@ -510,12 +599,14 @@ func (m *Module) WithPairing(p *PairingService) *Module { m.pairing = p; return 
 
 func (m *Module) Name() string { return "push" }
 
-func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFunc) {
+func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.HandlerFunc) {
 	g := rg.Group("/push")
 	g.Use(authMw, tenantMw)
 	{
 		g.POST("/subscriptions", m.priv("Register"))
 		g.DELETE("/subscriptions", m.priv("Unregister"))
+		g.GET("/subscriptions", adminMw, m.priv("ListSubscriptions"))
+		g.DELETE("/subscriptions/:id", adminMw, m.priv("UnregisterByID"))
 		g.POST("/test", m.priv("Test"))
 		g.GET("/public-key", m.priv("PublicKey"))
 		g.POST("/pairing", m.priv("CreatePairing"))
@@ -586,6 +677,10 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.Register(c)
 		case "Unregister":
 			hdl.Unregister(c)
+		case "ListSubscriptions":
+			hdl.ListSubscriptions(c)
+		case "UnregisterByID":
+			hdl.UnregisterByID(c)
 		case "Test":
 			hdl.Test(c)
 		case "PublicKey":
