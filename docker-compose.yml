@@ -4,6 +4,11 @@ services:
   api:
     build: .
     container_name: ${CONTAINER_NAME:-synapta-back-v0}
+    # Todo el .env entra al contenedor. La lista `environment` de abajo solo
+    # cubre lo mínimo: las variables que no estén ahí NO llegaban al proceso
+    # (compose solo expande ${VAR} para el YAML, no las inyecta).
+    env_file:
+      - .env
     environment:
       - APP_ENV=${APP_ENV}
       - PORT=${PORT}
