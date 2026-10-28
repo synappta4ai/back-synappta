@@ -46,6 +46,7 @@ import (
 	"synapta/internal/modules/notify"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
+	"synapta/internal/modules/render"
 	"synapta/internal/modules/skill"
 	"synapta/internal/modules/tenant"
 	"synapta/internal/modules/workerbridge"
@@ -263,6 +264,9 @@ func main() {
 	registry.Register(workerbridge.NewModule(wbStore))
 	// VideoMachine "Infoproducto": analiza videos de referencia y compone el prompt.
 	registry.Register(infoproduct.NewModule(manager.CredentialsFor, manager.FilesFor, manager.TenantPoolFor))
+	// Editor de video: proyectos (/editor) y render con ffmpeg (/render).
+	renderModule := render.NewModule(manager.FilesFor, manager.TenantPoolFor, cfg.OutputsDir)
+	registry.Register(renderModule)
 
 	// Agency core with modality routes attached.
 	// Servidor MCP remoto: mismo middleware auth+tenant, tools del dominio.
@@ -394,6 +398,7 @@ func main() {
 	go agency.ReconcileLoop(manager.EachCore, stop) // recovers orphaned tasks per tenant
 	go workerbridge.ReconcileLoop(wbStore, stop)    // marca failed jobs de GPUs que murieron
 	go runtime.TrashPurgeLoop(reg, cfg, stop)       // borrado definitivo de la papelera a los 30 días
+	renderModule.ReconcileLoop(reg, stop)           // falla renders huérfanos (reinicio / sin progreso)
 
 	go func() {
 		log.Printf("[main] synapta listening on :%s (env=%s)", cfg.Port, cfg.Env)
@@ -409,6 +414,7 @@ func main() {
 	log.Println("[main] shutdown signal received")
 
 	close(stop) // stop the reconciler first
+	renderModule.Shutdown() // cancel in-flight ffmpeg renders
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
