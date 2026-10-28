@@ -256,8 +256,8 @@ func buildPayload(title, body string, data map[string]string) ([]byte, error) {
 		"notification": map[string]interface{}{
 			"title": title,
 			"body":  body,
-			"icon":  "/assets/icons/192x192.png",
-			"badge": "/assets/icons/192x192.png",
+			"icon":  "/favicon.ico",
+			"badge": "/favicon.ico",
 			"data":  data,
 		},
 	})
