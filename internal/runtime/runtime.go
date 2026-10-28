@@ -11,8 +11,12 @@
 package runtime
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -28,10 +32,14 @@ import (
 	"synapta/internal/modules/event"
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/ingredient"
+	"synapta/internal/modules/model"
+	"synapta/internal/modules/notify"
 	"synapta/internal/modules/preset"
 	"synapta/internal/modules/push"
 	"synapta/internal/modules/skill"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/tenancy"
+	"synapta/internal/toolkit"
 	"synapta/internal/worker"
 )
 
@@ -39,6 +47,22 @@ import (
 type Manager struct {
 	cfg *config.Config
 	reg *tenancy.Registry
+
+	// workerBridgeStore es el registry/cola de GPUs emparejadas (schema de
+	// sistema). nil → los generators downloaded viven solo del gRPC directo.
+	workerBridgeStore *workerbridge.Store
+
+	// modelMaster es la curaduría de plataforma (schema de sistema). nil →
+	// sin veto del maestro: solo aplican las prefs del tenant.
+	modelMaster *model.MasterPrefsStore
+
+	// pairingSvc emite los códigos QR (sistema, compartido por tenants).
+	pairingSvc *push.PairingService
+
+	// notificationsChecker dice si un usuario aceptó notificaciones async
+	// (prefs del schema de sistema). nil → permitir (no bloquear el push
+	// preexistente).
+	notificationsChecker func(userID int64) bool
 
 	mu      sync.Mutex
 	bundles map[string]*Bundle // slug → bundle
@@ -56,8 +80,13 @@ type Bundle struct {
 	Presets     *preset.Handler
 	Skills      *skill.Handler
 	Push        *push.Handler
+	Notify      *notify.Handler
 	Credentials *credential.Handler
 	Agency      *agency.Handler
+
+	// Flows persiste el estado del flujo /agency por (usuario, agente)
+	// sobre agency_flows (schema del tenant).
+	Flows toolkit.FlowsAPI
 
 	agencyCore *agency.Core // for the reconciler and modality resolvers
 }
@@ -65,6 +94,44 @@ type Bundle struct {
 // NewManager creates a bundle manager over the tenancy registry.
 func NewManager(cfg *config.Config, reg *tenancy.Registry) *Manager {
 	return &Manager{cfg: cfg, reg: reg, bundles: map[string]*Bundle{}}
+}
+
+// SetWorkerBridge habilita el camino saliente (GPU de usuarios detrás de
+// NAT) en los generators downloaded de todos los tenants.
+func (m *Manager) SetWorkerBridge(store *workerbridge.Store) {
+	m.workerBridgeStore = store
+}
+
+// SetPairingService wire el servicio de códigos QR en los handlers push.
+func (m *Manager) SetPairingService(p *push.PairingService) {
+	m.pairingSvc = p
+}
+
+// SetNotificationsChecker wire el opt-in de notificaciones del usuario
+// (prefs del schema de sistema) para que el core lo respete al notificar.
+func (m *Manager) SetNotificationsChecker(fn func(userID int64) bool) {
+	m.notificationsChecker = fn
+}
+
+// SetModelMasterPrefs wire la curaduría de plataforma (veto + badges) en
+// listados y generación de todos los tenants.
+func (m *Manager) SetModelMasterPrefs(store *model.MasterPrefsStore) {
+	m.modelMaster = store
+}
+
+// TenantPoolFor returns the tenant-schema pool for the request's tenant.
+// False means no tenant context, so per-tenant prefs are skipped.
+func (m *Manager) TenantPoolFor(c *gin.Context) (*sql.DB, bool) {
+	t := tenancy.FromContext(c.Request.Context())
+	if t == nil {
+		return nil, false
+	}
+	pool, err := m.reg.Pool(t.Slug)
+	if err != nil {
+		log.Printf("[runtime] tenant pool for model prefs %q: %v", t.Slug, err)
+		return nil, false
+	}
+	return pool, true
 }
 
 // Resolve returns the bundle for the request's tenant (set by the tenancy
@@ -82,6 +149,38 @@ func (m *Manager) Resolve(c *gin.Context) (*Bundle, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// FilesForTenantID resolves a tenant's file handler from its numeric id.
+//
+// Platform-superadmin endpoints that act on another tenant (/tenants/:id/...)
+// have no tenant in their token, so they cannot use Resolve. A nil handler
+// with a nil error means the tenant does not exist.
+func (m *Manager) FilesForTenantID(id int64) (*file.Handler, error) {
+	t, err := m.tenantByID(id)
+	if err != nil || t == nil {
+		return nil, err
+	}
+	b, err := m.Bundle(t)
+	if err != nil {
+		return nil, err
+	}
+	return b.Files, nil
+}
+
+// tenantByID reads one tenant row from the system schema (nil when absent).
+func (m *Manager) tenantByID(id int64) (*tenancy.Tenant, error) {
+	t := &tenancy.Tenant{}
+	err := m.reg.System().QueryRow(
+		`SELECT id, slug, name, active, created_at, updated_at FROM tenants WHERE id = $1`, id,
+	).Scan(&t.ID, &t.Slug, &t.Name, &t.Active, &t.CreatedAt, &t.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 // Bundle returns (building if needed) the bundle for a tenant.
@@ -129,6 +228,35 @@ func (m *Manager) FileForSlug(c *gin.Context) (*file.Handler, bool) {
 		return nil, false
 	}
 	return b.Files, true
+}
+
+// bridgeModelResolver arma el resolver de modelos del bridge para un tenant:
+// busca el nombre en los snapshots de sus GPUs emparejadas (la única fuente
+// viva cuando no hay worker central) y devuelve la modalidad resuelta, que el
+// generator necesita para no despachar una imagen como video.
+func bridgeModelResolver(store *workerbridge.Store, tenantID int64) agency.BridgeModelResolver {
+	return func(ctx context.Context, name string) (*agency.BridgeModelRef, error) {
+		models, err := store.SnapshotsForTenant(ctx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range models {
+			if !strings.EqualFold(m.Key, name) {
+				continue
+			}
+			return &agency.BridgeModelRef{
+				Name:        m.Key,
+				Label:       m.Label,
+				Modality:    model.ModalityForWorkerMode(m.Mode),
+				WorkerID:    m.WorkerID,
+				WorkerName:  m.WorkerName,
+				Available:   m.Available,
+				Downloading: m.Downloading,
+				SizeBytes:   m.SizeBytes,
+			}, nil
+		}
+		return nil, nil // el catálogo de las GPUs no declara ese modelo
+	}
 }
 
 // EachCore runs fn over every cached tenant core (reconciler sweeps).
@@ -184,6 +312,12 @@ func (m *Manager) SkillsFor(c *gin.Context) (*skill.Handler, bool) {
 	return b.Skills, ok
 }
 
+// NotifyFor returns the notify handler for the request's tenant.
+func (m *Manager) NotifyFor(c *gin.Context) (*notify.Handler, bool) {
+	b, ok := m.Resolve(c)
+	return b.Notify, ok
+}
+
 // PushFor returns the push handler for the request's tenant.
 func (m *Manager) PushFor(c *gin.Context) (*push.Handler, bool) {
 	b, ok := m.Resolve(c)
@@ -202,6 +336,12 @@ func (m *Manager) AgencyCoreFor(c *gin.Context) (*agency.Core, bool) {
 	return b.agencyCore, ok
 }
 
+// FlowsFor returns the agency flow store for the request's tenant.
+func (m *Manager) FlowsFor(c *gin.Context) (toolkit.FlowsAPI, bool) {
+	b, ok := m.Resolve(c)
+	return b.Flows, ok
+}
+
 // build constructs the full service graph for one tenant over its own pool.
 func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	pool, err := m.reg.Pool(t.Slug)
@@ -214,17 +354,40 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("file store: %w", err)
 	}
-	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug)
+	fileSvc := file.NewService(fileStore, m.cfg.BaseURL, t.Slug, m.cfg.EncryptionKey, m.cfg.MaxUploadBytes, m.cfg.StorageAllowPrivateEndpoints)
 	credStore := credential.NewStore(pool, m.cfg.EncryptionKey)
 	eventSvc := event.NewService(event.NewStore(pool))
-	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL)
+	ingredientSvc := ingredient.NewService(ingredient.NewStore(pool), m.cfg.BaseURL, t.Slug)
 	assignmentSvc := assignment.NewService(assignment.NewStore(pool))
 	presetSvc := preset.NewService(preset.NewStore(pool))
 	skillSvc := skill.NewService(skill.NewStore(pool))
-	pushSvc := push.NewService(push.NewStore(pool), m.cfg.PushVapidPublicKey, m.cfg.PushVapidPrivateKey, m.cfg.PushVapidSubject)
+	pushSvc := push.NewService(push.NewStore(pool), m.cfg.PushVapidPublicKey, m.cfg.PushVapidPrivateKey, m.cfg.PushVapidSubject).
+		WithUserKeys(push.NewUserKeysStore(pool, m.cfg.EncryptionKey))
 
 	// Agency orchestration core (per-tenant task tracking + logs).
 	core := agency.NewCore(m.cfg, fileSvc, credStore, m.cfg.BaseURL, t.Slug)
+	// Curaduría maestro + tenant también en generación directa por nombre:
+	// el listado oculta, pero el veto real vive aquí.
+	master := m.modelMaster
+	core.SetModelPrefsCheck(func(modelName string) error {
+		var masterMap map[string]model.MasterPref
+		if master != nil {
+			var err error
+			masterMap, err = master.All()
+			if err != nil {
+				log.Printf("[runtime] master prefs for generation: %v", err)
+				masterMap = map[string]model.MasterPref{}
+			}
+		}
+		tenantMap := map[string]model.TenantPref{}
+		tenStore := model.NewTenantPrefsStore(pool)
+		if got, err := tenStore.All(); err != nil {
+			log.Printf("[runtime] tenant prefs for generation: %v", err)
+		} else {
+			tenantMap = got
+		}
+		return model.CheckAllowed(modelName, masterMap, tenantMap)
+	})
 	core.SetStores(
 		agency.NewAssetSyncStore(pool),
 		agency.NewGenerationLogStore(pool),
@@ -237,6 +400,18 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		return eventSvc.SaveGenerationOutput(pieceID, number, videoURL, localURL, taskID)
 	})
 	core.SetPushNotifier(pushSvc)
+	centerSvc := push.NewCenterService(pool)
+	core.SetNotifyRecorder(func(userID int64, ntype, title, body, taskID string) {
+		if err := centerSvc.Record(userID, ntype, title, body, taskID); err != nil {
+			log.Printf("[runtime] record notification user=%d: %v", userID, err)
+		}
+	})
+	notifySvc := notify.NewService(notify.NewStore(pool, m.cfg.EncryptionKey))
+	core.SetChannelNotifier(notifySvc)
+	core.SetNotificationsChecker(m.notificationsChecker)
+	// Generated media follows the same rule as uploads: the tenant's bucket
+	// when configured, local disk otherwise.
+	core.SetOutputPublisher(fileSvc)
 
 	// Generators (video ×3, image ×3, text ×1). Audio has no generator yet.
 	core.RegisterGenerator(agencyvideo.NewSeedanceGenerator())
@@ -246,15 +421,51 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 	core.RegisterGenerator(agencyimage.NewGeminiNanoGenerator())
 	core.RegisterGenerator(agencyimage.NewGeminiProGenerator())
 	core.RegisterGenerator(agencytext.NewClaudeTextGenerator())
-	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	// Local LLM servers the tenant runs (Ollama, LM Studio): names are
+	// "<provider>/<model id>", discovered live from /v1/models. Registered
+	// before the downloaded generator, which claims any unknown name.
+	core.RegisterGenerator(agencytext.NewOpenAITextGenerator())
+	// Hosted inference clouds the tenant pays for itself: the OpenAI-compatible
+	// images route (Together, DeepInfra, OpenRouter) and RunPod serverless
+	// endpoints. Both match only "<provider>/…" names, so the curated catalog
+	// keeps its own generators.
+	core.RegisterGenerator(agencyimage.NewOpenAIImageGenerator())
+	core.RegisterGenerator(agencyimage.NewRunPodGenerator())
+	// Image Higgsfield FIRST: its Match is narrow (soul/ideogram/recraft) while
+	// the video one claims any "higgsfield-*", so registering video first would
+	// shadow the image models (Soul 2 et al.) and route them to the video
+	// generator.
 	core.RegisterGenerator(agencyimage.NewHiggsfieldImageGenerator())
+	core.RegisterGenerator(agencyvideo.NewHiggsfieldGenerator())
+	// OpenRouter dedicated video API (Veo, Kling, Wan, Seedance, Hailuo…):
+	// async submit/poll/download. Registered after Higgsfield so the
+	// curated catalog keeps precedence on overlapping names (there is none:
+	// hosted names are provider-namespaced).
+	core.RegisterGenerator(agencyvideo.NewOpenRouterVideoGenerator())
 
 	// Downloaded-model generator — registered LAST on purpose: it claims any
 	// model name outside the API catalog, so it must not shadow API
-	// generators. Dispatches jobs to the brain-master inference worker over
-	// gRPC (stateless client: no persistent connection, no cached state).
-	core.RegisterGenerator(agencyvideo.NewDownloadedGenerator(
-		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir))
+	// generators. Two dispatch paths, chosen by configuration:
+	//   - BM_WORKER_ADDR set → direct gRPC (local / rented VM with tunnel).
+	//   - bridge store wired (SetWorkerBridge) → outbound queue: the user's
+	//     GPU pulls jobs over HTTP; state lives in worker_jobs (survives
+	//     restarts on both sides).
+	dlGen := agencyvideo.NewDownloadedGenerator(
+		worker.NewClient(), m.cfg.WorkerAddr, m.cfg.OutputsDir)
+	// Bridge siempre activo cuando hay store: cada usuario puede emparejar
+	// su propia GPU (multi-usuario) y generar aunque haya un worker
+	// central configurado. El generator prefiere el central cuando está
+	// vivo y cae al bridge cuando no lo está o no tiene el modelo.
+	if m.workerBridgeStore != nil {
+		dlGen.SetBridge(m.workerBridgeStore, t.ID)
+		// Los snapshots de las GPUs emparejadas del tenant son fuente viva
+		// de modelos "downloaded" junto al worker central: el core los
+		// resuelve para generar (modalidad incluida) en vez de responder
+		// "model not found" a todo modelo que sólo vive en la máquina del
+		// usuario.
+		core.SetBridgeModels(bridgeModelResolver(m.workerBridgeStore, t.ID))
+	}
+	core.RegisterGenerator(dlGen)
 
 	// Cost calculators. Seedance25 must precede Seedance: the latter's
 	// substring match ("dreamina-seedance") also covers the 2.5 model.
@@ -272,9 +483,11 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 		Assignments: assignment.NewHandler(assignmentSvc),
 		Presets:     preset.NewHandler(presetSvc),
 		Skills:      skill.NewHandler(skillSvc),
-		Push:        push.NewHandler(pushSvc),
+		Push:        push.NewHandler(pushSvc).WithCenter(centerSvc).WithPairing(m.pairingSvc),
+		Notify:      notify.NewHandler(notifySvc),
 		Credentials: credential.NewHandler(credStore),
 		Agency:      agency.NewHandler(core),
+		Flows:       toolkit.NewPGFlows(pool),
 		agencyCore:  core,
 	}, nil
 }

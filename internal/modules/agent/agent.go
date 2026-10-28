@@ -20,12 +20,24 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/modules/agency"
 	"synapta/internal/modules/credential"
+	"synapta/internal/modules/event"
+	"synapta/internal/toolkit"
 	"synapta/internal/utils"
 )
 
 // CredentialResolver supplies the tenant-scoped credential handler per request.
 type CredentialResolver func(c *gin.Context) (*credential.Handler, bool)
+
+// EventsResolver supplies the tenant-scoped events handler per request.
+type EventsResolver func(c *gin.Context) (*event.Handler, bool)
+
+// CoreResolver supplies the tenant-scoped agency core per request.
+type CoreResolver func(c *gin.Context) (*agency.Core, bool)
+
+// FlowsResolver supplies the tenant-scoped agency flow store per request.
+type FlowsResolver func(c *gin.Context) (toolkit.FlowsAPI, bool)
 
 // chatRequest is the front-end payload for one agent chat turn.
 type chatRequest struct {
@@ -33,6 +45,14 @@ type chatRequest struct {
 	Message        string `json:"message"`
 	Provider       string `json:"provider"`
 	Workflow       string `json:"workflow,omitempty"`
+	// Artifact pide un artefacto estructurado del flujo /agency
+	// ("sales_angles", "scene_prompts", "scene_analysis", "storyboard",
+	// "clip_prompt") en vez de una respuesta conversacional. Vacío = chat
+	// normal del experto.
+	Artifact string `json:"artifact,omitempty"`
+	// Payload es el contexto del paso (brief, cantidades, referencias)
+	// que alimenta al artefacto sin obligar al LLM a parsear el mensaje.
+	Payload json.RawMessage `json:"payload,omitempty"`
 	// Model overrides the LLM configured in admin/models (credential extra)
 	// for this single request — lets the agency flow pick the model per step.
 	Model string `json:"model,omitempty"`
@@ -41,13 +61,20 @@ type chatRequest struct {
 // Module registers the /agent routes (tenant-scoped).
 type Module struct {
 	resolve  CredentialResolver
+	events   EventsResolver
+	core     CoreResolver
+	flows    FlowsResolver
 	agentURL string
 	client   *http.Client
+	// Historial de turnos del fallback directo (ver direct.go).
+	convs *convStore
 }
 
 // NewModule creates the proxy module. agentURL points at the DCS Agent
-// server (default http://localhost:3200).
-func NewModule(resolve CredentialResolver, agentURL string) *Module {
+// server (default http://localhost:3200). events/core/flows aportan los
+// servicios del tenant que el loop de tool-calling del asistente necesita
+// (mismos resolvers del runtime que usa el módulo MCP).
+func NewModule(resolve CredentialResolver, events EventsResolver, core CoreResolver, flows FlowsResolver, agentURL string) *Module {
 	if strings.TrimSpace(agentURL) == "" {
 		agentURL = "http://localhost:3200"
 	}
@@ -58,24 +85,58 @@ func NewModule(resolve CredentialResolver, agentURL string) *Module {
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	return &Module{resolve: resolve, agentURL: strings.TrimRight(agentURL, "/"), client: &http.Client{Transport: transport}}
+	return &Module{
+		resolve:  resolve,
+		events:   events,
+		core:     core,
+		flows:    flows,
+		agentURL: strings.TrimRight(agentURL, "/"),
+		client:   &http.Client{Transport: transport},
+		convs:    newConvStore(),
+	}
 }
 
 // Name implements modules.Module.
 func (m *Module) Name() string { return "agent" }
 
 // Register implements modules.Module: POST /agent/chat (auth + tenant).
+// Además registra las tres rutas especializadas del flujo /agency, una
+// por agente experto; el workflow lo fija la URL, sin depender del body.
 func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFunc) {
 	g := rg.Group("/agent")
 	g.Use(authMw, tenantMw)
 	{
 		g.POST("/chat", m.Chat)
+		for _, slug := range []string{"commercial", "real-estate", "cinema"} {
+			s := slug
+			g.POST("/chat/"+s, func(c *gin.Context) { m.ChatWorkflow(c, s) })
+		}
 	}
 }
 
+// ChatWorkflow procesa un turno de una ruta especializada
+// (/agent/chat/commercial|real-estate|cinema): el slug de la URL elige
+// al experto que atiende el flujo /agency.
+func (m *Module) ChatWorkflow(c *gin.Context, slug string) {
+	workflow, ok := workflowFromSlug(slug)
+	if !ok {
+		utils.BadRequest(c, fmt.Sprintf("unknown agent %q", slug))
+		return
+	}
+	m.chatTurn(c, workflow)
+}
+
 // Chat forwards one message to the agent server and streams its SSE answer
-// back to the client, adding the tenant's LLM credentials as headers.
+// back to the client, adding the tenant's LLM credentials as headers. El
+// workflow sale del body (ruta legada /agent/chat).
 func (m *Module) Chat(c *gin.Context) {
+	m.chatTurn(c, "")
+}
+
+// chatTurn atiende un turno con el workflow forzado por la ruta (vacío
+// = el del body): primero el agent-server, y si no responde el fallback
+// directo con la persona experta del workflow.
+func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	hdl, ok := m.resolve(c)
 	if !ok {
 		return
@@ -87,9 +148,18 @@ func (m *Module) Chat(c *gin.Context) {
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
-	if req.Message == "" {
+	if req.Artifact != "" {
+		if _, ok := parseArtifactKind(req.Artifact); !ok {
+			utils.BadRequest(c, fmt.Sprintf("unknown artifact %q", req.Artifact))
+			return
+		}
+	}
+	if req.Message == "" && req.Artifact == "" {
 		utils.BadRequest(c, "message is required")
 		return
+	}
+	if forcedWorkflow != "" {
+		req.Workflow = forcedWorkflow
 	}
 	if !credential.IsValidProvider(req.Provider) {
 		utils.BadRequest(c, fmt.Sprintf("invalid provider %q", req.Provider))
@@ -103,6 +173,23 @@ func (m *Module) Chat(c *gin.Context) {
 	}
 	if cred == nil || cred.AuthKey() == "" {
 		utils.BadRequest(c, fmt.Sprintf("no credentials stored for provider %q: save them in the flow panel first", req.Provider))
+		return
+	}
+
+	// Servicios del tenant para el loop de tool-calling del fallback directo.
+	// Si el bundle no resuelve, el chat sigue igual sin tools: no se cae el
+	// turno por falta de dominio.
+	deps := m.tenantDeps(c)
+	if deps != nil {
+		// Las skills del flujo (get_project_brief) ubican el estado en
+		// agency_flows por el agente que atiende el request.
+		deps.Agent = workflowSlug(req.Workflow)
+	}
+
+	// Los turnos de artefacto del flujo /agency se resuelven siempre en el
+	// back: el agent-server no conoce los contratos por paso.
+	if req.Artifact != "" {
+		m.directChat(c, req, hdl, cred, deps)
 		return
 	}
 
@@ -125,9 +212,9 @@ func (m *Module) Chat(c *gin.Context) {
 	upstream.Header.Set("X-LLM-Key", cred.AuthKey())
 	upstream.Header.Set("X-LLM-Provider", req.Provider)
 	if model := strings.TrimSpace(req.Model); model != "" {
-		upstream.Header.Set("X-LLM-Model", model)
+		upstream.Header.Set("X-LLM-Model", normalizeLLMModel(req.Provider, model))
 	} else if model := modelFromExtra(cred.Extra); model != "" {
-		upstream.Header.Set("X-LLM-Model", model)
+		upstream.Header.Set("X-LLM-Model", normalizeLLMModel(req.Provider, model))
 	}
 	if cred.BaseURL != "" {
 		upstream.Header.Set("X-LLM-BaseURL", cred.BaseURL)
@@ -140,7 +227,7 @@ func (m *Module) Chat(c *gin.Context) {
 		if c.Request.Context().Err() != nil {
 			return
 		}
-		m.directChat(c, req, hdl, cred)
+		m.directChat(c, req, hdl, cred, deps)
 		return
 	}
 	defer resp.Body.Close()
@@ -171,6 +258,40 @@ func (m *Module) Chat(c *gin.Context) {
 			break
 		}
 	}
+}
+
+// tenantDeps materializa los servicios del tenant (eventos + core de
+// generación) con la identidad del usuario para el loop de tool-calling.
+// Devuelve nil si el bundle no está disponible: el turno de chat sigue sin
+// tools en vez de fallar.
+func (m *Module) tenantDeps(c *gin.Context) *toolkit.Deps {
+	if m.events == nil || m.core == nil {
+		return nil
+	}
+	eventsHdl, ok := m.events(c)
+	if !ok {
+		return nil
+	}
+	core, ok := m.core(c)
+	if !ok {
+		return nil
+	}
+	deps := &toolkit.Deps{
+		Events: eventsHdl.Service(),
+		Core:   core,
+		UserID: utils.UserIDFromContext(c),
+	}
+	if m.flows != nil {
+		if flows, ok := m.flows(c); ok {
+			deps.Flows = flows
+		}
+	}
+	if v, ok := c.Get("username"); ok {
+		if s, ok := v.(string); ok {
+			deps.Username = s
+		}
+	}
+	return deps
 }
 
 // modelFromExtra pulls the "model" field out of the credential's extra JSON.

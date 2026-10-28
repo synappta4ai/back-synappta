@@ -1,46 +1,141 @@
 package model
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"synapta/internal/tenancy"
 	"synapta/internal/utils"
+	inferencev1 "synapta/internal/worker/proto"
 )
+
+// CredentialLister is the tenant credential capability the public model
+// listings need: only API models whose provider has a stored authentication
+// secret are offered as generation choices.
+type CredentialLister interface {
+	UsableProviders() (map[string]bool, error)
+}
+
+// LocalModelLister is the optional credential capability the catalog uses to
+// reach the tenant's own OpenAI-compatible servers (Ollama, LM Studio). Their
+// models are not in the static catalog: they are discovered live from each
+// server. Handlers that cannot discover anything simply don't implement it.
+type LocalModelLister interface {
+	// LocalModelEndpoints maps each configured local provider to its base URL.
+	LocalModelEndpoints() (map[string]string, error)
+}
+
+// InferenceModelLister is the optional credential capability the catalog uses
+// to list the models a hosted inference cloud (RunPod, Together, DeepInfra,
+// …) serves for this tenant. Like the local servers, nothing is cached and an
+// unreachable provider contributes no entries.
+type InferenceModelLister interface {
+	InferenceEndpoints() ([]InferenceEndpoint, error)
+}
+
+// CredentialResolver supplies the tenant-scoped credential lister. It returns
+// false when the request has no tenant bundle, in which case listings fail
+// closed instead of silently offering models the tenant cannot run.
+type CredentialResolver func(c *gin.Context) (CredentialLister, bool)
 
 // Module exposes the model catalog.
 //
-// The catalog has two sources:
-//   - "api" models: static entries defined in catalog.go (external provider
-//     HTTP APIs, per-tenant credentials).
-//   - "downloaded" models: served live by the brain-master inference worker
-//     (gRPC). Nothing is cached: every request re-reads the worker.
-type Module struct{}
+// The public catalog has two sources:
+//   - "api" models: static entries defined in catalog.go, filtered by the
+//     tenant's stored provider credentials.
+//   - "downloaded" models: served live by the workers that can run them —
+//     the back's own inference worker (gRPC) and the GPUs tenants paired
+//     through the bridge — filtered by the availability each one reports.
+//     Nothing is cached: every request re-reads both sources.
+//
+// The /worker/models management routes are the full worker view (including
+// unavailable entries, download progress and on-disk size) with download,
+// cancel and delete operations.
+type Module struct {
+	resolve     CredentialResolver
+	outputsDir  string // carpeta donde se guarda el payload del worker para auto-update
+	masterPrefs MasterPrefsAccess
+	tenantPrefs TenantPrefsSource
+}
 
-func NewModule() *Module { return &Module{} }
+func NewModule(resolve CredentialResolver, outputsDir string) *Module {
+	return &Module{resolve: resolve, outputsDir: outputsDir}
+}
+
+// SetMasterPrefsStore wires the platform curation source (system schema).
+// Nil (tests, unwired deploys) disables master filtering.
+func (m *Module) SetMasterPrefsStore(s MasterPrefsAccess) { m.masterPrefs = s }
+
+// SetTenantPrefsSource wires the per-request tenant curation source.
+// Nil disables tenant overrides.
+func (m *Module) SetTenantPrefsSource(src TenantPrefsSource) { m.tenantPrefs = src }
 
 func (m *Module) Name() string { return "models" }
 
-func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
+func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.HandlerFunc) {
 	g := rg.Group("/models")
-	g.Use(authMw)
+	g.Use(authMw, tenantMw)
 	{
 		g.GET("", m.List)
 		g.GET("/:modality", m.ListByModality)
 	}
+	// ─── Curaduría del catálogo (maestro + tenant) ───────────
+	master := g.Group("/master", platformSuperadminOnly())
+	{
+		master.GET("", m.MasterPrefs)
+		master.PUT("", m.MasterUpsertPrefs)
+	}
+	prefs := g.Group("/prefs", adminMw)
+	{
+		prefs.GET("", m.TenantPrefs)
+		prefs.PUT("", m.TenantUpsertPrefs)
+	}
 	w := rg.Group("/worker")
-	w.Use(authMw)
+	w.Use(authMw, tenantMw)
 	{
 		w.GET("/status", m.WorkerStatus)
+		w.GET("/diagnostic", m.WorkerDiagnostic)
+
+		admin := w.Group("", adminMw)
+		{
+			admin.GET("/models", m.WorkerModels)
+			admin.POST("/models/:key/download", m.WorkerDownloadModel)
+			admin.POST("/models/:key/cancel", m.WorkerCancelDownload)
+			admin.DELETE("/models", m.WorkerDeleteAllModels)
+			admin.DELETE("/models/:key", m.WorkerDeleteModel)
+
+			// ─── Artefactos del worker (videos / imágenes generados) ───
+			admin.GET("/artifacts", m.WorkerListArtifacts)
+			admin.DELETE("/artifacts/:name", m.WorkerDeleteArtifact)
+
+			// ─── Auto-update del worker (servido por este back vía /outputs) ───
+			admin.POST("/update-payload", m.WorkerUpdatePayload)
+			admin.POST("/update", m.WorkerUpdate)
+		}
 	}
 }
 
 // List handles GET /api/v1/models?modality=video&type=downloaded
 //
-// type is optional: "api" | "downloaded". Without it, both sources are
-// merged — API models always appear; downloaded ones only while the worker
-// answers (never cached, never invented offline).
+// type is optional: "api" | "downloaded". Without it, both usable sources are
+// merged — credentialed API models plus available downloaded models. Models
+// without credentials or reported unavailable never appear here: they are
+// managed through the admin /worker/models routes instead.
 func (m *Module) List(c *gin.Context) {
 	modality := c.Query("modality")
 	if modality != "" && !IsValidModality(modality) {
@@ -55,24 +150,38 @@ func (m *Module) List(c *gin.Context) {
 
 	// Explicit type → single source, errors propagate.
 	if typeFilter != "" {
-		models, err := ListLiveFiltered(c.Request.Context(), workerAddr(), typeFilter, modality)
-		if err != nil {
-			utils.InternalError(c, workerMessage(err))
+		models, handled := m.listByType(c, typeFilter, modality)
+		if handled {
 			return
 		}
 		utils.Success(c, models)
 		return
 	}
 
-	// Merged view: static API models + whatever the worker reports now.
-	models := List(Modality(modality))
-	live, err := ListLive(c.Request.Context(), workerAddr())
-	if err != nil {
-		logWorkerError(c, err) // API models are still served
-	} else {
-		models = append(models, filterByModalityOrAll(live, modality)...)
+	// Merged view: usable API models + whatever usable models the workers
+	// report now (central gRPC and/or paired GPUs). A silent worker
+	// degrades to API-only, never to invented downloaded entries.
+	models, handled := m.usableAPIModels(c, Modality(modality))
+	if handled {
+		return
 	}
-	utils.Success(c, models)
+	live := m.liveUsable(c)
+	models = append(models, filterByModalityOrAll(live, modality)...)
+	utils.Success(c, m.withPrefs(c, models))
+}
+
+// platformSuperadminOnly aborts unless role_level == 0 (same gate the
+// tenants module uses: inline check, no middleware import, no cycle).
+func platformSuperadminOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, _ := c.Get("role_level")
+		level, ok := raw.(float64)
+		if !ok || int(level) != 0 {
+			c.AbortWithStatusJSON(403, gin.H{"success": false, "message": "platform superadmin only"})
+			return
+		}
+		c.Next()
+	}
 }
 
 // ListByModality handles GET /api/v1/models/:modality
@@ -89,39 +198,585 @@ func (m *Module) ListByModality(c *gin.Context) {
 	}
 
 	if typeFilter != "" {
-		models, err := ListLiveFiltered(c.Request.Context(), workerAddr(), typeFilter, modality)
-		if err != nil {
-			utils.InternalError(c, workerMessage(err))
+		models, handled := m.listByType(c, typeFilter, modality)
+		if handled {
 			return
 		}
 		utils.Success(c, models)
 		return
 	}
 
-	models := List(Modality(modality))
-	live, err := ListLive(c.Request.Context(), workerAddr())
-	if err != nil {
-		logWorkerError(c, err)
-	} else {
-		models = append(models, filterByModalityOrAll(live, modality)...)
+	models, handled := m.usableAPIModels(c, Modality(modality))
+	if handled {
+		return
 	}
-	utils.Success(c, models)
+	live := m.liveUsable(c)
+	models = append(models, filterByModalityOrAll(live, modality)...)
+	utils.Success(c, m.withPrefs(c, models))
+}
+
+// liveUsable returns the downloaded models a tenant can run right now, merged
+// from the two dispatch paths: the back's own worker (live gRPC over
+// BM_WORKER_ADDR) and the GPUs the tenant paired through the bridge. Both
+// reads are live and uncached; whichever side fails contributes nothing.
+//
+// The worker is optional, so this never fails the request: an unreachable
+// worker (or a cancelled request) simply means an empty downloaded catalog,
+// and the failure is logged. Callers that list API models keep serving them,
+// and a caller that asked only for downloaded models gets 200 with zero
+// entries — the panel shows "nothing configured" instead of an error it
+// cannot act on.
+func (m *Module) liveUsable(c *gin.Context) []Model {
+	ctx := c.Request.Context()
+	central, cerr := ListUsable(ctx, workerAddr())
+	var bridge []Model
+	if t := tenancy.FromContext(ctx); t != nil {
+		models, berr := UsableBridgeModelsForTenant(ctx, t.ID)
+		if berr != nil {
+			log.Printf("[model] bridge catalog for tenant %d: %v", t.ID, berr)
+		} else {
+			bridge = models
+		}
+	}
+	models := mergeByName(central, bridge)
+	if cerr != nil {
+		logWorkerError(c, cerr)
+	}
+	return models
+}
+
+// mergeByName concatenates catalogs keeping one entry per model name (first
+// occurrence wins, compared like the other catalog lookups) and returns them
+// in the same deterministic order as ListLive: modality, family, name. The
+// central worker comes first, so when a GPU and the central worker both have
+// the same weights the entry with weight telemetry wins — on both dispatch
+// paths the model key is the same, so either one dispatches correctly.
+func mergeByName(lists ...[]Model) []Model {
+	out := make([]Model, 0)
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, m := range list {
+			key := strings.ToLower(m.Name)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Modality != out[j].Modality {
+			return out[i].Modality < out[j].Modality
+		}
+		fi, fj := "", ""
+		if out[i].Downloaded != nil {
+			fi = out[i].Downloaded.Family
+		}
+		if out[j].Downloaded != nil {
+			fj = out[j].Downloaded.Family
+		}
+		if fi != fj {
+			return fi < fj
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 // WorkerStatus handles GET /api/v1/worker/status — live reachability and GPU
 // snapshot of the inference worker. Never cached.
 func (m *Module) WorkerStatus(c *gin.Context) {
-	status, err := WorkerStatusNow(c.Request.Context(), workerAddr())
+	st, err := WorkerStatusNow(c.Request.Context(), workerAddr())
 	if err != nil {
 		// Report the degraded status with 200: the endpoint answered
 		// truthfully — the worker is just not reachable right now.
-		if status == nil {
-			status = &WorkerStatus{Configured: workerAddr() != ""}
+		if st == nil {
+			st = &WorkerStatus{Configured: workerAddr() != ""}
 		}
-		utils.Success(c, status)
+		utils.Success(c, st)
 		return
 	}
-	utils.Success(c, status)
+	utils.Success(c, st)
+}
+
+// WorkerDiagnostic es una lectura en vivo y verídica del worker: alcance,
+// latencia del ping, telemetría de GPU y estado de pesos de cada modelo. Sirve
+// para diagnosticar "model not found" sin dependir de cachés: todo se lee
+// directo del worker por gRPC en cada llamada.
+// GET /api/v1/worker/diagnostic (auth + tenant; no requiere admin).
+func (m *Module) WorkerDiagnostic(c *gin.Context) {
+	ctx := c.Request.Context()
+	addr := workerAddr()
+	diag := &WorkerDiagnostic{Configured: addr != ""}
+	if addr == "" {
+		utils.Success(c, diag)
+		return
+	}
+	client := workerClientOrNil()
+	if client == nil {
+		diag.PingError = "worker client not wired"
+		utils.Success(c, diag)
+		return
+	}
+
+	// Ping con latencia: el back usa este mismo llamado para readyz.
+	start := time.Now()
+	if err := client.Ping(ctx, addr); err != nil {
+		diag.Connected = false
+		diag.PingMs = int64(time.Since(start).Milliseconds())
+		diag.PingError = err.Error()
+		utils.Success(c, diag)
+		return
+	}
+	diag.Connected = true
+	diag.PingMs = int64(time.Since(start).Milliseconds())
+
+	// Telemetría de GPU.
+	gt, gerr := client.GpuTelemetry(ctx, addr)
+	if gerr != nil {
+		diag.TelemetryError = gerr.Error()
+	} else if gt != nil {
+		diag.Telemetry = &WorkerTelemetryView{
+			DeviceName:     gt.DeviceName,
+			TotalVramMb:    int64(gt.TotalVramMb),
+			UsedVramMb:     int64(gt.UsedVramMb),
+			FreeVramMb:     int64(gt.FreeVramMb),
+			GpuUtilization: float64(gt.GpuUtilization),
+			TemperatureC:   float64(gt.TemperatureC),
+		}
+	}
+
+	// Catálogo vivo con estado de pesos.
+	lm, lerr := client.ListModels(ctx, addr)
+	if lerr != nil {
+		diag.ListError = lerr.Error()
+		utils.Success(c, diag)
+		return
+	}
+	if lm != nil {
+		diag.ModelCount = len(lm.Models)
+		for _, m2 := range lm.Models {
+			if m2 == nil {
+				continue
+			}
+			diag.Models = append(diag.Models, WorkerModelView{
+				Key:          m2.Key,
+				Label:        m2.Label,
+				Mode:         m2.Mode,
+				Engine:       m2.Engine,
+				Available:    m2.Available,
+				Downloaded:   m2.Downloaded,
+				Downloading:  m2.Downloading,
+				SizeBytes:    m2.SizeBytes,
+				Progress:     float64(m2.DownloadPercent),
+				Error:        m2.DownloadError,
+				DownloadPath: m2.DownloadPath,
+			})
+		}
+	}
+
+	// Estado de pesos (bytes totales en disco).
+	gs, gserr := client.GetModelState(ctx, addr, "")
+	if gserr != nil {
+		diag.StateError = gserr.Error()
+	} else if gs != nil {
+		diag.DiskBytes = gs.BytesOnDisk
+	}
+	utils.Success(c, diag)
+}
+
+// WorkerDiagnostic es una lectura en vivo y verídica del worker.
+type WorkerDiagnostic struct {
+	Configured     bool                `json:"configured"`
+	Connected      bool                `json:"connected"`
+	PingMs         int64               `json:"ping_ms"`
+	PingError      string              `json:"ping_error,omitempty"`
+	Telemetry      *WorkerTelemetryView `json:"telemetry,omitempty"`
+	TelemetryError string              `json:"telemetry_error,omitempty"`
+	ModelCount     int                 `json:"model_count"`
+	Models         []WorkerModelView   `json:"models"`
+	ListError      string              `json:"list_error,omitempty"`
+	DiskBytes      int64               `json:"disk_bytes"`
+	StateError     string              `json:"state_error,omitempty"`
+}
+
+type WorkerTelemetryView struct {
+	DeviceName     string  `json:"device_name"`
+	TotalVramMb    int64   `json:"total_vram_mb"`
+	UsedVramMb     int64   `json:"used_vram_mb"`
+	FreeVramMb     int64   `json:"free_vram_mb"`
+	GpuUtilization float64 `json:"gpu_utilization"`
+	TemperatureC   float64 `json:"temperature_c"`
+}
+
+type WorkerModelView struct {
+	Key          string  `json:"key"`
+	Label        string  `json:"label"`
+	Mode         string  `json:"mode"`
+	Engine       string  `json:"engine"`
+	Available    bool    `json:"available"`
+	Downloaded   bool    `json:"downloaded"`
+	Downloading  bool    `json:"downloading"`
+	SizeBytes    int64   `json:"size_bytes"`
+	Progress     float64 `json:"progress"`
+	Error        string  `json:"error,omitempty"`
+	DownloadPath string  `json:"download_path,omitempty"`
+}
+
+// WorkerModels handles GET /api/v1/worker/models — the full management view:
+// every worker catalog entry with availability, download progress and on-disk
+// size. Unavailable entries are included on purpose: this is where an admin
+// downloads them, retries failures, or deletes weights.
+//
+// When the central worker is unreachable, tenants with online bridge GPUs
+// get those snapshots instead (read-only: no weight state) rather than a
+// 500 — the GPUs already reported everything this view needs to list.
+// WorkerSourceHeader tells UIs which backend served the management view:
+// "central" (weight state included, operations allowed) or "bridge"
+// (read-only snapshots, operations must stay hidden). It is CORS-exposed.
+const WorkerSourceHeader = "X-Worker-Source"
+
+func (m *Module) WorkerModels(c *gin.Context) {
+	models, err := ListLive(c.Request.Context(), workerAddr())
+	if err != nil {
+		if t := tenancy.FromContext(c.Request.Context()); t != nil {
+			if bridge, berr := BridgeModelsForTenant(c.Request.Context(), t.ID); berr == nil && len(bridge) > 0 {
+				log.Printf("[model] worker/models from bridge snapshots (tenant %d, central down: %v)",
+					t.ID, err)
+				c.Header(WorkerSourceHeader, "bridge")
+				utils.Success(c, bridge)
+				return
+			}
+		}
+		log.Printf("[model] worker/models: worker unreachable, returning empty list: %v", err)
+		c.Header(WorkerSourceHeader, "central")
+		utils.Success(c, []Model{})
+		return
+	}
+	c.Header(WorkerSourceHeader, "central")
+	if models == nil {
+		models = []Model{}
+	}
+	utils.Success(c, models)
+}
+
+// WorkerDownloadModel handles POST /api/v1/worker/models/:key/download.
+func (m *Module) WorkerDownloadModel(c *gin.Context) {
+	m.operateOnWeights(c, "DownloadModel", false)
+}
+
+// WorkerCancelDownload handles POST /api/v1/worker/models/:key/cancel.
+func (m *Module) WorkerCancelDownload(c *gin.Context) {
+	m.operateOnWeights(c, "DownloadModel", true)
+}
+
+// WorkerDeleteModel handles DELETE /api/v1/worker/models/:key.
+func (m *Module) WorkerDeleteModel(c *gin.Context) {
+	key, client, addr, ok := workerWriteTarget(c)
+	if !ok {
+		return
+	}
+	resp, err := client.DeleteModel(c.Request.Context(), addr, key)
+	if err != nil {
+		workerRPCError(c, "DeleteModel", err)
+		return
+	}
+	utils.Success(c, toModelOperation(resp))
+}
+
+// BulkDeleteResult summarizes a DELETE /api/v1/worker/models call.
+type BulkDeleteResult struct {
+	Deleted []string `json:"deleted"`
+	// Failed maps model keys that kept their weights to the reason.
+	Failed     map[string]string `json:"failed"`
+	FreedBytes int64             `json:"freed_bytes"`
+}
+
+// WorkerDeleteAllModels handles DELETE /api/v1/worker/models — the
+// "uninstall everything" option: removes every downloaded weight from the
+// worker disk. Models that cannot be deleted (download in progress, no
+// disk weights) are reported in Failed without aborting the rest.
+func (m *Module) WorkerDeleteAllModels(c *gin.Context) {
+	client, addr, ok := workerClientOnly(c)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	models, err := ListLive(ctx, addr)
+	if err != nil {
+		utils.InternalError(c, workerMessage(err))
+		return
+	}
+	result := BulkDeleteResult{Deleted: []string{}, Failed: map[string]string{}}
+	for _, model := range models {
+		if model.Type != TypeDownloaded || model.Downloaded == nil {
+			continue
+		}
+		if model.Downloaded.SizeBytes == 0 && !model.Downloaded.Downloading && model.Downloaded.DownloadError == "" {
+			continue // nothing on disk for this entry
+		}
+		if _, derr := client.DeleteModel(ctx, addr, model.Name); derr != nil {
+			st, _ := status.FromError(derr)
+			msg := strings.TrimSpace(st.Message())
+			if msg == "" {
+				msg = derr.Error()
+			}
+			result.Failed[model.Name] = msg
+			continue
+		}
+		result.Deleted = append(result.Deleted, model.Name)
+		result.FreedBytes += model.Downloaded.SizeBytes
+	}
+	utils.Success(c, result)
+}
+
+// operateOnWeights starts or cancels a background weight download.
+func (m *Module) operateOnWeights(c *gin.Context, op string, cancel bool) {
+	key, client, addr, ok := workerWriteTarget(c)
+	if !ok {
+		return
+	}
+	resp, err := client.DownloadModel(c.Request.Context(), addr, key, cancel)
+	if err != nil {
+		workerRPCError(c, op, err)
+		return
+	}
+	utils.Created(c, toModelOperation(resp))
+}
+
+// listByType serves one explicit source for the public catalog. The boolean
+// reports whether an error response was already written.
+func (m *Module) listByType(c *gin.Context, typeFilter, modality string) ([]Model, bool) {
+	if ModelType(strings.ToLower(typeFilter)) == TypeAPI {
+		models, handled := m.usableAPIModels(c, Modality(modality))
+		if handled {
+			return nil, true
+		}
+		return m.withPrefs(c, models), false
+	}
+	// "downloaded" is the union of both dispatch paths (central worker +
+	// paired GPUs). The worker is optional: an unreachable one (or a dead
+	// request context) yields an empty catalog, not a 500 — the listing is
+	// still a truthful answer, and failing here would break the panel for a
+	// deployment that simply has no worker yet.
+	models := m.liveUsable(c)
+	return m.withPrefs(c, filterByModalityOrAll(models, modality)), false
+}
+
+// withPrefs filters and orders a public listing through both curation
+// levels. Unwired stores (or empty tables) pass the listing through, so
+// existing tests and pre-migration deploys behave exactly as before.
+func (m *Module) withPrefs(c *gin.Context, models []Model) []Model {
+	if m.masterPrefs == nil && m.tenantPrefs == nil {
+		return models
+	}
+	master := map[string]MasterPref{}
+	if m.masterPrefs != nil {
+		master = prefsOrEmpty("master", m.masterPrefs.All)
+	}
+	tenant := map[string]TenantPref{}
+	if m.tenantPrefs != nil {
+		if access, ok := m.tenantPrefs(c); ok && access != nil {
+			tenant = prefsOrEmpty("tenant", access.All)
+		}
+	}
+	if len(master) == 0 && len(tenant) == 0 {
+		return models
+	}
+	return ApplyPrefs(models, master, tenant)
+}
+
+// usableAPIModels returns the static catalog entries whose provider has a
+// stored authentication secret for this tenant. The boolean reports whether
+// an error response was already written.
+func (m *Module) usableAPIModels(c *gin.Context, modality Modality) ([]Model, bool) {
+	usable, err := m.usableProviders(c)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return nil, true
+	}
+	models := FilterAPIByCredentials(List(modality), usable)
+	// Local providers (Ollama, LM Studio) serve models the static catalog
+	// cannot enumerate: discover them live from each configured server.
+	if modality == "" || modality == ModalityText {
+		models = append(models, m.localModels(c)...)
+	}
+	// Hosted inference clouds (RunPod, Together, DeepInfra, …) list only the
+	// models this tenant's key can reach: discover them live per provider.
+	models = append(models, m.inferenceModels(c, modality)...)
+	return models, false
+}
+
+// localModels returns the models the tenant's local OpenAI-compatible servers
+// report right now. It never fails the listing: a server that is stopped or
+// slow contributes no entries (and no invented ones), matching how an
+// unreachable inference worker degrades the downloaded catalog.
+func (m *Module) localModels(c *gin.Context) []Model {
+	if m.resolve == nil {
+		return nil
+	}
+	lister, ok := m.resolve(c)
+	if !ok || lister == nil {
+		return nil
+	}
+	source, ok := lister.(LocalModelLister)
+	if !ok {
+		return nil
+	}
+	endpoints, err := source.LocalModelEndpoints()
+	if err != nil {
+		log.Printf("[model] local provider endpoints: %v", err)
+		return nil
+	}
+	out := make([]Model, 0, len(endpoints))
+	for provider, baseURL := range endpoints {
+		models, derr := DiscoverLocalModels(c.Request.Context(), CredentialProvider(provider), baseURL)
+		if derr != nil {
+			log.Printf("[model] local catalog %s unavailable: %v", provider, derr)
+			continue
+		}
+		out = append(out, models...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CredentialProvider != out[j].CredentialProvider {
+			return out[i].CredentialProvider < out[j].CredentialProvider
+		}
+		return out[i].DisplayName < out[j].DisplayName
+	})
+	return out
+}
+
+// inferenceModels returns the hosted inference models the tenant can run
+// right now, filtered by modality. A provider that is down, slow or has no
+// key contributes nothing (and reports the failure in the log), matching how
+// unreachable local servers and workers degrade the catalog.
+func (m *Module) inferenceModels(c *gin.Context, modality Modality) []Model {
+	if m.resolve == nil {
+		return nil
+	}
+	lister, ok := m.resolve(c)
+	if !ok || lister == nil {
+		return nil
+	}
+	source, ok := lister.(InferenceModelLister)
+	if !ok {
+		return nil
+	}
+	endpoints, err := source.InferenceEndpoints()
+	if err != nil {
+		log.Printf("[model] inference provider endpoints: %v", err)
+		return nil
+	}
+	// Discovery is concurrent and degrades per provider, so one slow cloud
+	// costs a single timeout instead of one per provider.
+	discovered := DiscoverAllInferenceModels(c.Request.Context(), endpoints)
+	out := make([]Model, 0, len(discovered))
+	for _, m := range discovered {
+		if modality == "" || m.Modality == modality {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// usableProviders resolves the tenant credential lister and reports which
+// providers can actually run. Unknown tenants fail closed.
+func (m *Module) usableProviders(c *gin.Context) (map[string]bool, error) {
+	if m.resolve == nil {
+		return nil, errors.New("credential resolver not wired")
+	}
+	lister, ok := m.resolve(c)
+	if !ok || lister == nil {
+		return nil, errors.New("credential lookup failed for this tenant")
+	}
+	return lister.UsableProviders()
+}
+
+// FilterAPIByCredentials drops API models whose provider has no stored
+// authentication secret. Entries without a provider are kept: they declare
+// no credential requirement.
+func FilterAPIByCredentials(models []Model, usable map[string]bool) []Model {
+	out := make([]Model, 0, len(models))
+	for _, m := range models {
+		if m.Type == TypeAPI && m.CredentialProvider != "" && !usable[string(m.CredentialProvider)] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// ModelOperation is the JSON view of a worker weight operation.
+type ModelOperation struct {
+	Key             string  `json:"key"`
+	State           string  `json:"state"`
+	Progress        float32 `json:"progress"`
+	BytesDownloaded int64   `json:"bytes_downloaded"`
+	TotalBytes      int64   `json:"total_bytes"`
+	Error           string  `json:"error,omitempty"`
+}
+
+// modelKeyParam validates the :key route parameter shared by weight writes.
+func modelKeyParam(c *gin.Context) (string, bool) {
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" {
+		utils.BadRequest(c, "model key is required")
+		return "", false
+	}
+	return key, true
+}
+
+// weightWriter is the narrow gRPC surface the management writes need.
+type weightWriter interface {
+	DownloadModel(ctx context.Context, addr, key string, cancel bool) (*inferencev1.ModelOperationResponse, error)
+	DeleteModel(ctx context.Context, addr, key string) (*inferencev1.ModelOperationResponse, error)
+}
+
+// workerClientOnly resolves the wired gRPC client and configured address
+// for management writes. Reads degrade gracefully elsewhere, but a write
+// with no worker to receive it must fail explicitly.
+func workerClientOnly(c *gin.Context) (weightWriter, string, bool) {
+	client := workerClientOrNil()
+	if client == nil {
+		utils.InternalError(c, "inference worker client not wired")
+		return nil, "", false
+	}
+	addr := workerAddr()
+	if addr == "" {
+		utils.BadRequest(c, "inference worker not configured (BM_WORKER_ADDR)")
+		return nil, "", false
+	}
+	return client, addr, true
+}
+
+// workerWriteTarget resolves the model key, wired gRPC client and configured
+// address for single-model management writes.
+func workerWriteTarget(c *gin.Context) (string, weightWriter, string, bool) {
+	key, ok := modelKeyParam(c)
+	if !ok {
+		return "", nil, "", false
+	}
+	client, addr, ok := workerClientOnly(c)
+	if !ok {
+		return "", nil, "", false
+	}
+	return key, client, addr, true
+}
+
+// toModelOperation maps a worker operation response onto the stable HTTP
+// shape served by the management routes.
+func toModelOperation(resp *inferencev1.ModelOperationResponse) ModelOperation {
+	if resp == nil {
+		return ModelOperation{}
+	}
+	return ModelOperation{
+		Key:             resp.Key,
+		State:           resp.State,
+		Progress:        resp.Progress,
+		BytesDownloaded: resp.BytesDownloaded,
+		TotalBytes:      resp.TotalBytes,
+		Error:           resp.Error,
+	}
 }
 
 // filterByModalityOrAll filters live entries by a validated modality, or
@@ -146,6 +801,188 @@ func workerMessage(err error) string {
 		return "inference worker not configured (BM_WORKER_ADDR)"
 	}
 	return err.Error()
+}
+
+// ─── Worker artifacts (list / delete) ─────────────────────────────────
+
+// WorkerArtifact es un archivo generado expuesto por el artifact server del worker.
+type WorkerArtifact struct {
+	Name      string `json:"name"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// WorkerListArtifacts handles GET /api/v1/worker/artifacts — lista los
+// artefactos (videos/imágenes) disponibles en el artifact server del worker.
+func (m *Module) WorkerListArtifacts(c *gin.Context) {
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, base+"/artifacts", nil)
+	if err != nil {
+		utils.InternalError(c, "build artifact list request: "+err.Error())
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		utils.InternalError(c, "worker artifact server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		utils.InternalError(c, fmt.Sprintf("worker artifact server returned %d", resp.StatusCode))
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		utils.InternalError(c, "read artifact list: "+err.Error())
+		return
+	}
+	var payload struct {
+		Artifacts []WorkerArtifact `json:"artifacts"`
+		Count     int              `json:"count"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		utils.InternalError(c, "parse artifact list: "+err.Error())
+		return
+	}
+	utils.Success(c, payload.Artifacts)
+}
+
+// WorkerDeleteArtifact handles DELETE /api/v1/worker/artifacts/:name — borra
+// un artefacto del artifact server del worker.
+func (m *Module) WorkerDeleteArtifact(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		utils.BadRequest(c, "artifact name is required")
+		return
+	}
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodDelete, base+"/artifacts/"+name, nil)
+	if err != nil {
+		utils.InternalError(c, "build artifact delete request: "+err.Error())
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		utils.InternalError(c, "worker artifact server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		utils.NotFound(c, "artifact not found")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		utils.InternalError(c, fmt.Sprintf("worker artifact server returned %d", resp.StatusCode))
+		return
+	}
+	utils.Success(c, gin.H{"deleted": name, "ok": true})
+}
+
+// WorkerUpdateRequest es el payload de POST /api/v1/worker/update.
+type WorkerUpdateRequest struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// WorkerUpdatePayload guarda el zip del worker subido por el admin en la
+// carpeta de outputs, para que el worker lo descargue vía /outputs.
+func (m *Module) WorkerUpdatePayload(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		utils.BadRequest(c, "file es requerido (campo form-data 'file')")
+		return
+	}
+	if filepath.Ext(file.Filename) != ".zip" {
+		utils.BadRequest(c, "el archivo debe ser .zip")
+		return
+	}
+	if m.outputsDir == "" {
+		utils.InternalError(c, "outputsDir no configurado")
+		return
+	}
+	if err := os.MkdirAll(m.outputsDir, 0o755); err != nil {
+		utils.InternalError(c, "crear outputsDir: "+err.Error())
+		return
+	}
+	dst := filepath.Join(m.outputsDir, "worker-update.zip")
+	if err := c.SaveUploadedFile(file, dst); err != nil {
+		utils.InternalError(c, "guardar payload: "+err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"path": dst, "size": file.Size, "url": "/outputs/worker-update.zip"})
+}
+
+// WorkerUpdate ordena al worker que se auto-actualice. Reenvía al artifact
+// server del worker (BM_WORKER_ARTIFACT_BASE/worker/update) la url y el hash
+// del payload. Si no se pasa url, se asume que el back sirve el zip subido
+// previamente en /outputs/worker-update.zip.
+func (m *Module) WorkerUpdate(c *gin.Context) {
+	var req WorkerUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "body JSON requerido: {url, sha256?}")
+		return
+	}
+	if req.URL == "" {
+		req.URL = "http://" + c.Request.Host + "/outputs/worker-update.zip"
+	}
+	base := WorkerArtifactBase()
+	if base == "" {
+		utils.BadRequest(c, "inference worker artifact server not configured (BM_WORKER_ARTIFACT_BASE)")
+		return
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		utils.InternalError(c, "marshal update request: "+err.Error())
+		return
+	}
+	httpReq, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, base+"/worker/update", bytes.NewReader(body))
+	if err != nil {
+		utils.InternalError(c, "build update request: "+err.Error())
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if tok := c.Request.Header.Get("X-Artifact-Token"); tok != "" {
+		httpReq.Header.Set("X-Artifact-Token", tok)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		utils.InternalError(c, "worker update server unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	c.Data(resp.StatusCode, "application/json", respBody)
+}
+
+// workerRPCError maps a worker RPC failure to the HTTP status its gRPC code
+// implies: unknown keys are 404, conflicting operations are 409, and a dead
+// worker is 503 — not a generic 500.
+func workerRPCError(c *gin.Context, op string, err error) {
+	st, _ := status.FromError(err)
+	message := strings.TrimSpace(st.Message())
+	if message == "" {
+		message = err.Error()
+	}
+	switch st.Code() {
+	case codes.InvalidArgument:
+		utils.BadRequest(c, message)
+	case codes.NotFound:
+		utils.NotFound(c, message)
+	case codes.FailedPrecondition:
+		utils.Conflict(c, message)
+	case codes.Unavailable:
+		c.JSON(http.StatusServiceUnavailable,
+			gin.H{"success": false, "message": "inference worker unavailable: " + message})
+	default:
+		utils.InternalError(c, op+" failed: "+message)
+	}
 }
 
 // logWorkerError marks the response and logs a degraded merged listing.

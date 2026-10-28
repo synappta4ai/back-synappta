@@ -12,102 +12,6 @@ import (
 	"synapta/internal/modules/credential"
 )
 
-func TestExtractAngles(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name     string
-		raw      string
-		wantN    int
-		wantOK   bool
-		title    string
-		hook     string
-		selected bool
-	}{
-		{
-			name:     "json puro",
-			raw:      `{"angles":[{"title":"Vista al mar","hook":"Hook","narrative_pitch":"Pitch","target_audience":"Familias","selected":true}]}`,
-			wantN:    1,
-			wantOK:   true,
-			title:    "Vista al mar",
-			hook:     "Hook",
-			selected: true,
-		},
-		{
-			name:   "json en fence markdown",
-			raw:    "```json\n{\"angles\":[{\"title\":\"A\",\"hook\":\"H\"}]}\n```",
-			wantN:  1,
-			wantOK: true,
-			title:  "A",
-			hook:   "H",
-		},
-		{
-			name:   "json con prosa alrededor",
-			raw:    "Acá van los ángulos pedidos:\n{\"angles\":[{\"title\":\"A\"}]}\nEspero que sirva.",
-			wantN:  1,
-			wantOK: true,
-			title:  "A",
-		},
-		{
-			name:   "sin json devuelve false",
-			raw:    "No puedo ayudarte con eso.",
-			wantOK: false,
-		},
-		{
-			name:   "angles vacío devuelve false",
-			raw:    `{"angles":[]}`,
-			wantOK: false,
-		},
-		{
-			name:   "campos por defecto desde description",
-			raw:    `{"angles":[{"description":"D compartida"}]}`,
-			wantN:  1,
-			wantOK: true,
-			title:  "Ángulo 1",
-			hook:   "D compartida",
-		},
-		{
-			name:   "title no string usa default",
-			raw:    `{"angles":[{"title":42}]}`,
-			wantN:  1,
-			wantOK: true,
-			title:  "Ángulo 1",
-		},
-		{
-			name:   "varios ángulos",
-			raw:    `{"angles":[{"title":"A"},{"title":"B"},{"title":"C"}]}`,
-			wantN:  3,
-			wantOK: true,
-			title:  "A",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			angles, ok := extractAngles(tc.raw)
-			if ok != tc.wantOK {
-				t.Fatalf("ok=%v, want %v", ok, tc.wantOK)
-			}
-			if !tc.wantOK {
-				return
-			}
-			if len(angles) != tc.wantN {
-				t.Fatalf("len=%d, want %d", len(angles), tc.wantN)
-			}
-			if angles[0]["title"] != tc.title {
-				t.Errorf("title=%v, want %q", angles[0]["title"], tc.title)
-			}
-			if tc.hook != "" && angles[0]["hook"] != tc.hook {
-				t.Errorf("hook=%v, want %q", angles[0]["hook"], tc.hook)
-			}
-			if tc.selected != angles[0]["selected"] {
-				t.Errorf("selected=%v, want %v", angles[0]["selected"], tc.selected)
-			}
-		})
-	}
-}
-
 func TestParseLLMText(t *testing.T) {
 	t.Parallel()
 
@@ -160,7 +64,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-test"}
-		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "openai/gpt-4o-mini", "sys", "hola")
+		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "openai/gpt-4o-mini", "sys", []chatMsg{{Role: "user", Content: "hola"}}, chatMaxTokens)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -186,7 +90,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-ant"}
-		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderAnthropic, cred, "claude-3-haiku-20240307", "sys", "hola")
+		got, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderAnthropic, cred, "claude-3-haiku-20240307", "sys", []chatMsg{{Role: "user", Content: "hola"}}, chatMaxTokens)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -209,7 +113,7 @@ func TestLLMAnswer(t *testing.T) {
 		defer srv.Close()
 
 		cred := &credential.Resolve{BaseURL: srv.URL, APIKey: "sk-test"}
-		_, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "m", "s", "hola")
+		_, err := llmAnswer(context.Background(), srv.Client(), credential.ProviderOpenRouter, cred, "m", "s", []chatMsg{{Role: "user", Content: "hola"}}, chatMaxTokens)
 		if err == nil || !strings.Contains(err.Error(), "insufficient credits") {
 			t.Fatalf("err=%v, want insufficient credits", err)
 		}
@@ -218,7 +122,7 @@ func TestLLMAnswer(t *testing.T) {
 	t.Run("provider sin soporte directo", func(t *testing.T) {
 		t.Parallel()
 		cred := &credential.Resolve{APIKey: "k"}
-		_, err := llmAnswer(context.Background(), http.DefaultClient, credential.ProviderGemini, cred, "m", "s", "hola")
+		_, err := llmAnswer(context.Background(), http.DefaultClient, credential.ProviderGemini, cred, "m", "s", []chatMsg{{Role: "user", Content: "hola"}}, chatMaxTokens)
 		if err == nil || !strings.Contains(err.Error(), "openrouter") {
 			t.Fatalf("err=%v, want mención a openrouter", err)
 		}
@@ -247,5 +151,25 @@ func TestDefaultLLMModel(t *testing.T) {
 	}
 	if got := defaultLLMModel(credential.ProviderOpenRouter); got != openrouterModel {
 		t.Errorf("openrouter=%q", got)
+	}
+}
+
+func TestNormalizeLLMModel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		provider string
+		model    string
+		want     string
+	}{
+		{credential.ProviderOpenRouter, "openrouter/anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5"},
+		{credential.ProviderOpenRouter, "openrouter/openrouter/auto", "openrouter/auto"},
+		{credential.ProviderOpenRouter, "anthropic/claude-sonnet-5.5", "anthropic/claude-sonnet-5.5"},
+		{credential.ProviderAnthropic, "anthropic/claude-sonnet-5.5", "claude-sonnet-5.5"},
+		{credential.ProviderAnthropic, "claude-text", "claude-text"},
+	}
+	for _, tc := range cases {
+		if got := normalizeLLMModel(tc.provider, tc.model); got != tc.want {
+			t.Errorf("normalizeLLMModel(%q, %q) = %q, want %q", tc.provider, tc.model, got, tc.want)
+		}
 	}
 }

@@ -3,7 +3,7 @@
 Backend **Go + Gin** orientado a eventos para generación IA: **eventos → programas → piezas → generaciones**, con generación de **video, imagen, texto y audio** y dos tipos de modelos distinguibles:
 
 - **`api`** — proveedores externos (BytePlus, Gemini, Anthropic) con credenciales por tenant.
-- **`downloaded`** — pesos ejecutados por el **inference worker de brain-master** (Python, gRPC), consultados **en vivo y sin caché**.
+- **`downloaded`** — pesos ejecutados por el **inference worker** (repo `inference-worker`, Python + gRPC), consultados **en vivo y sin caché**.
 
 ## Arquitectura
 
@@ -31,6 +31,14 @@ GET /outputs/video/syn_<ns>.mp4    ← servido por Synapta (no expira)
 - Recuperación del artifact: disco compartido (dev) o `BM_WORKER_ARTIFACT_BASE/artifacts/<nombre>` (worker remoto / túnel de Colab). Si no se puede traer, el job **falla** — nunca éxito falso.
 - Los modelos descargados **no requieren credenciales** (corren en nuestra propia GPU).
 
+## VideoMachine · Infoproducto
+
+- Paso 1: `POST /api/v1/infoproduct/analyze` desglosa el video con `internal/modules/infoproduct/prompts/analyze.md`.
+- Paso 2: `POST /api/v1/infoproduct/compose` usa como system prompt el skill embebido `internal/modules/infoproduct/prompts/Synappta Skill actuacion Infoproducto.md` (copia exacta de `internal/Prompt/...`) y devuelve un único prompt final en inglés.
+- `VIDEO_RECREATE_SKILL=legacy` vuelve al flujo anterior (`prompts/compose.md`, JSON con segmentos); `VIDEO_RECREATE_SKILL=dcs-recreate` (default) activa el skill.
+- `LLM_MODEL_RECREATE_PROMPT` sobreescribe el modelo del cerebro solo para este paso.
+- La copia embebida debe existir: `go:embed` falla en build si se borra; el fallback a legacy solo cubre fallos en runtime.
+
 ## Layout
 
 ```
@@ -49,7 +57,7 @@ synapta/
 └── internal/
     ├── db/                    # pgx + pool limits + quote ident
     ├── worker/                # cliente gRPC stateless del inference worker
-    │   └── proto/             # inference.proto + código generado (brain-master)
+    │   └── proto/             # inference.proto + código generado (espejo del worker)
     ├── tenancy/               # registry, middleware, provisioner
     ├── runtime/               # bundle de servicios por tenant
     ├── middleware/            # JWT, rate limit (IP + usuario)
@@ -69,7 +77,7 @@ synapta/
 cp .env.example .env
 go run ./cmd/generate-keys     # genera JWT_SECRET, ENCRYPTION_KEY y claves VAPID
 docker compose up -d db        # solo Postgres
-go run .                       # API en :8099 (aplica migraciones al boot)
+go run main.go                      # API en :8099 (aplica migraciones al boot)
 ```
 
 Health: `GET /healthz` · Readiness: `GET /readyz`
@@ -84,22 +92,55 @@ BM_WORKER_TIMEOUT_SECONDS=6             # timeout por llamada (lecturas siempre 
 BM_WORKER_ARTIFACT_BASE=                # vacío en local; URL del artifact server si el worker es remoto
 ```
 
-Worker local en modo mock (sin GPU, sin descargas — repo brain-master):
+Worker local en modo mock (sin GPU, sin descargas — repo `inference-worker`):
 
 ```bash
-BM_ARTIFACT_PORT=50052 py -3 inference-worker/run_mock.py   # gRPC :50051 + artifacts :50052
+BM_ARTIFACT_PORT=50052 py -3 ../inference-worker/run_mock.py   # gRPC :50051 + artifacts :50052
 ```
 
-Worker remoto (Colab T4 / VM): el worker anuncia su túnel y se usa esa dirección en `BM_WORKER_ADDR` (`tls://…` para cloudflared). Ver `deploy/README.md` de brain-master.
+Worker remoto (Colab T4 / VM): el worker anuncia su túnel y se usa esa dirección en `BM_WORKER_ADDR` (`tls://…` para cloudflared). Ver el README de `inference-worker`.
+
+### GPU de usuarios (bridge saliente, "Tu GPU")
+
+Sin `BM_WORKER_ADDR`, el back usa el **bridge saliente**: las máquinas con
+GPU de los clientes se emparejan con un código de 6 dígitos y consultan
+trabajos por HTTP long-poll — sin abrir puertos ni túneles, detrás del NAT
+del hogar. Módulo: `internal/modules/workerbridge`.
+
+- **Tablas** (schema de sistema, migración `00004_worker_registry.sql`):
+  `worker_registry` (token hasheado + snapshot del catálogo),
+  `worker_pairing_codes` (hash del código, TTL 10 min, canje único) y
+  `worker_jobs` (la cola: FIFO, `FOR UPDATE SKIP LOCKED`).
+- **Flujo**: admin del tenant → `POST /api/v1/gpu/pairing-code` → el usuario
+  corre `python pair.py` en su máquina y pega el código → el worker canjea
+  el código por un token (`POST /internal/workers/register`) → heartbeat
+  cada 20 s + claim long-poll de la cola → sube el artefacto al back
+  (`multipart`), que lo guarda en `outputs/` y lo linkea al job.
+- **Dispatch**: el generator `downloaded` encola en `worker_jobs` cuando no
+  hay `BM_WORKER_ADDR`; el estado vive en la DB (sobrevive reinicios de
+  ambos lados) y un reconciler marca `failed` los jobs de GPUs que murieron
+  (nada queda `running` eterno).
+- **Panel en la app**: "Tu GPU" (nav, role_level ≤ 1) muestra las GPUs
+  online/offline, genera el código de emparejamiento y permite revocar.
+
+```bash
+# Los endpoints del worker (register/heartbeat/claim/report/artifacts) van
+# con X-Worker-Token, sin JWT; el tenant se resuelve desde el token.
+```
 
 ## Endpoints principales
 
 ```
 POST /api/v1/auth/login                     # token con tenant_id
-GET  /api/v1/models                         # catálogo combinado (?type=api|downloaded, ?modality=)
-                                            #   "downloaded" se lee EN VIVO del worker: si no responde,
-                                            #   no aparece (header X-Worker-Status: unreachable)
-GET  /api/v1/worker/status                  # estado en vivo del worker (device, cuda, n° de modelos)
+GET  /api/v1/models                         # solo modelos utilizables (?type=api|downloaded, ?modality=)
+                                            #   api: únicamente con credencial del tenant; downloaded:
+                                            #   únicamente disponibles en el worker. Sin worker, solo api
+                                            #   (header X-Worker-Status: unreachable)
+GET  /api/v1/worker/status                  # estado en vivo del worker (device, cuda, n° de modelos utilizables)
+GET  /api/v1/worker/models                  # gestión admin: catálogo completo con progreso y tamaño
+POST /api/v1/worker/models/:key/download    # gestión admin: iniciar descarga de pesos
+POST /api/v1/worker/models/:key/cancel      # gestión admin: cancelar descarga en curso
+DELETE /api/v1/worker/models/:key           # gestión admin: eliminar pesos del disco
 PUT  /api/v1/credentials                    # credenciales del tenant (cifradas) — solo modelos api
 
 POST /api/v1/files/upload                   # dedup por SHA-256: contenido idéntico activo
@@ -122,7 +163,14 @@ GET  /api/v1/agency/tasks/server-communications  # ?task_id: detalle HTTP del pr
 PATCH /api/v1/agency/tasks/rating           # rating excluyente: buena_toma / elegida_final
 
 GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant explícito
+GET  /api/v1/files/storage                  # bucket del tenant (lectura: cualquier miembro)
+PUT  /api/v1/files/storage                  # admin del tenant: guardar/rotar el bucket propio
+DELETE /api/v1/files/storage                # admin: volver a disco local
+GET  /outputs/*                             # estático: imágenes/videos generados (siempre local)
 ```
+
+Almacenamiento de binarios (biblioteca vs generados, con y sin bucket): [docs/ALMACENAMIENTO_ASSETS.md](docs/ALMACENAMIENTO_ASSETS.md).
+Inference providers hospedados (RunPod, Together, DeepInfra, OpenRouter, …): [docs/INFERENCE_PROVIDERS.md](docs/INFERENCE_PROVIDERS.md).
 
 ### Forma de un modelo en la API
 
@@ -131,12 +179,18 @@ GET  /api/v1/t/:slug/files/:id/serve        # público, rate-limited, con tenant
 { "name": "gemini-nano-banana", "modality": "image", "type": "api",
   "credential_provider": "gemini", "base_url": "https://…", "display_name": "Gemini Nano Banana", … }
 
-// GET /api/v1/models?type=downloaded  (en vivo del worker)
+// GET /api/v1/models?type=downloaded  (solo disponibles, en vivo del worker)
 { "name": "Wan2.1-T2V-1.3B", "modality": "video", "type": "downloaded",
   "display_name": "Wan 2.1 T2V 1.3B (video ligero)",
   "downloaded": { "mode": "video", "engine": "diffusers", "pipeline": "wan",
                   "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "steps": 30,
-                  "vram_gb": 6, "family": "wan", "available": true } }
+                  "vram_gb": 6, "family": "wan", "available": true,
+                  "downloading": false, "download_percent": 100, "size_bytes": 123456 } }
+
+// GET /api/v1/worker/models  (gestión admin: incluye no disponibles)
+{ "name": "Wan2.1-T2V-1.3B", "modality": "video", "type": "downloaded",
+  "downloaded": { "available": false, "downloading": true, "download_percent": 42.5,
+                  "size_bytes": 420, "download_error": "weights not downloaded" } }
 ```
 
 ## Costos del proveedor (spend)

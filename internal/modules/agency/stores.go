@@ -220,8 +220,8 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 
 // Create inserts a new generation log entry.
 func (s *GenerationLogStore) Create(log *GenerationLog) error {
-	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source, cost_credits, provider_transaction_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+	query := `INSERT INTO generation_logs (task_id, model_name, request_payload, outputs, status, error_message, user_id, event_id, program_id, piece_id, piece_code, generation_number, resource_type, content_types, estimated_cost, cost_source, cost_credits, provider_transaction_id, video_duration, video_resolution, video_ratio)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		RETURNING id, created_at, updated_at`
 
 	outputsStr := marshalOutputs(log.Outputs)
@@ -245,6 +245,9 @@ func (s *GenerationLogStore) Create(log *GenerationLog) error {
 		log.CostSource,
 		log.CostCredits,
 		log.ProviderTransactionID,
+		log.VideoDuration,
+		nullIfEmptyStr(log.VideoResolution),
+		nullIfEmptyStr(log.VideoRatio),
 	).Scan(&log.ID, &log.CreatedAt, &log.UpdatedAt)
 }
 
@@ -306,6 +309,76 @@ func (s *GenerationLogStore) RefundProviderCostByTaskID(taskID string) (int64, e
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
+}
+
+// ListCostBackfillCandidates returns the newest rows whose spend is missing
+// (empty/pending source, or a $0 calculator row) so the login-triggered
+// backfill can recompute them from request_payload. Gemini rows are filtered
+// by the caller (free tier, $0 is genuine).
+func (s *GenerationLogStore) ListCostBackfillCandidates(limit int) ([]GenerationLog, error) {
+	query := `SELECT id, task_id, model_name,
+		COALESCE(request_payload, '') AS request_payload,
+		estimated_cost, COALESCE(cost_source, '') AS cost_source,
+		video_duration, COALESCE(video_resolution, '') AS video_resolution,
+		COALESCE(video_ratio, '') AS video_ratio
+		FROM generation_logs
+		WHERE deleted_at IS NULL
+		AND cost_source <> 'provider_refund'
+		AND (cost_source = '' OR cost_source = 'pending'
+			OR (estimated_cost = 0 AND cost_source = 'calculator')
+			OR (cost_source = 'provider_estimate' AND estimated_cost = 0 AND cost_credits > 0)
+			OR (video_resolution = '' AND request_payload LIKE '%resolution%'))
+		ORDER BY created_at DESC LIMIT $1`
+	rows, err := s.db.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GenerationLog
+	for rows.Next() {
+		var l GenerationLog
+		if err := rows.Scan(&l.ID, &l.TaskID, &l.ModelName, &l.Request,
+			&l.EstimatedCost, &l.CostSource,
+			&l.VideoDuration, &l.VideoResolution, &l.VideoRatio); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// GetGenerateResponseBody returns the stored submit-phase response for a task
+// (sync generators answer inline, so usage/cost figures live here, not in a
+// poll row). Empty string when no submit trace was recorded.
+func (s *ServerCommunicationStore) GetGenerateResponseBody(taskID string) (string, error) {
+	var body string
+	err := s.db.QueryRow(
+		`SELECT COALESCE(response_body, '') FROM server_communications
+		 WHERE task_id = $1 AND phase = 'generate'
+		 ORDER BY created_at DESC LIMIT 1`,
+		taskID,
+	).Scan(&body)
+	if err != nil {
+		return "", err
+	}
+	return body, nil
+}
+
+// ApplyCostBackfill patches a row with a recomputed spend and request shape.
+// A zero cost or empty source/ratio leaves the stored value untouched, so
+// partial recomputes never erase data. Cost writes only land on rows without
+// a provider-reported spend.
+func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source string, duration int, resolution, ratio string) error {
+	query := `UPDATE generation_logs SET
+		estimated_cost = CASE WHEN $1 > 0 AND (cost_source NOT IN ('provider_estimate', 'provider_refund') OR (cost_source = 'provider_estimate' AND estimated_cost = 0)) THEN $1 ELSE estimated_cost END,
+		cost_source = CASE WHEN $2 <> '' AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $2 ELSE cost_source END,
+		video_duration = CASE WHEN video_duration = 0 AND $3 > 0 THEN $3 ELSE video_duration END,
+		video_resolution = CASE WHEN video_resolution = '' AND $4 <> '' THEN $4 ELSE video_resolution END,
+		video_ratio = CASE WHEN video_ratio = '' AND $5 <> '' THEN $5 ELSE video_ratio END,
+		updated_at = NOW()
+		WHERE id = $6 AND deleted_at IS NULL`
+	_, err := s.db.Exec(query, cost, source, duration, resolution, ratio, id)
+	return err
 }
 
 // UpdateMetadataByTaskID persists video generation metadata + progress sampled
@@ -401,6 +474,143 @@ func (s *GenerationLogStore) SumCostByFilter(f ListLogsFilter) (float64, error) 
 		return 0, err
 	}
 	return total, nil
+}
+
+// ─── Trash (papelera de videos/imágenes generadas) ──────────────
+
+// TrashLog soft-deletes one generation (moves it to the trash). The row
+// stays 30 days for recovery; the nightly purge removes it permanently.
+func (s *GenerationLogStore) TrashLog(id string) error {
+	res, err := s.db.Exec(`UPDATE generation_logs SET deleted_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// RestoreLog returns a trashed generation to the gallery.
+func (s *GenerationLogStore) RestoreLog(id string) error {
+	res, err := s.db.Exec(`UPDATE generation_logs SET deleted_at = NULL, updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NOT NULL`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ListTrash returns paginated trashed generations (newest trashed first).
+// resourceType narrows to "video" / "image" ("" = all).
+func (s *GenerationLogStore) ListTrash(page, limit int, resourceType string) ([]GenerationLog, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	where := "WHERE gl.deleted_at IS NOT NULL"
+	args := []interface{}{}
+	if resourceType != "" {
+		where += " AND gl.resource_type = $1"
+		args = append(args, resourceType)
+	}
+
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM generation_logs gl "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := "SELECT " + genLogListCols + ", gl.deleted_at, " + genLogJoinCols + " " + genLogFromJoins + " " + where +
+		" ORDER BY gl.deleted_at DESC LIMIT $" + itoa(len(args)+1) + " OFFSET $" + itoa(len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var logs []GenerationLog
+	for rows.Next() {
+		var l GenerationLog
+		var outputsStr string
+		if err := rows.Scan(
+			&l.ID, &l.TaskID, &l.ModelName,
+			&l.Status, &l.ErrorMessage,
+			&l.UserID, &l.EventID, &l.ProgramID, &l.PieceID, &l.PieceCode,
+			&l.GenerationNumber,
+			&outputsStr,
+			&l.ResourceType, &l.ContentTypes,
+			&l.EstimatedCost, &l.CostSource,
+			&l.CostCredits, &l.ProviderTransactionID,
+			&l.UsageTokens, &l.UsageCompletionTokens,
+		&l.VideoDuration, &l.VideoResolution, &l.VideoRatio,
+			&l.VideoSeed, &l.VideoFPS, &l.Progress,
+			&l.RatingGood, &l.RatingFinal,
+			&l.CreatedAt, &l.UpdatedAt, &l.DeletedAt,
+			&l.EventName, &l.UserDisplayName, &l.PieceName,
+		); err != nil {
+			return nil, 0, err
+		}
+		if outputsStr != "" {
+			json.Unmarshal([]byte(outputsStr), &l.Outputs)
+		}
+		logs = append(logs, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return logs, total, nil
+}
+
+// ExpiredTrashRow is a trashed generation past its retention (for purge).
+type ExpiredTrashRow struct {
+	ID      string
+	Outputs string
+}
+
+// ListExpiredTrash returns trashed rows older than the cutoff (bounded).
+func (s *GenerationLogStore) ListExpiredTrash(cutoff time.Time, limit int) ([]ExpiredTrashRow, error) {
+	if limit < 1 || limit > 1000 {
+		limit = 500
+	}
+	rows, err := s.db.Query(`SELECT id, COALESCE(outputs, '') FROM generation_logs
+		WHERE deleted_at IS NOT NULL AND deleted_at < $1 ORDER BY deleted_at ASC LIMIT $2`, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ExpiredTrashRow
+	for rows.Next() {
+		var r ExpiredTrashRow
+		if err := rows.Scan(&r.ID, &r.Outputs); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteLogsByIDs permanently removes generation rows and their asset
+// records (generated_assets mirrors the task outputs per piece).
+func (s *GenerationLogStore) DeleteLogsByIDs(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := s.db.Exec(`DELETE FROM generated_assets WHERE task_id IN
+		(SELECT task_id FROM generation_logs WHERE id = ANY($1))`, ids); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM generation_logs WHERE id = ANY($1)`, ids)
+	return err
 }
 
 // ListRecentByUser returns the user's most recent generations (own rows only).
@@ -629,6 +839,11 @@ type ServerCommunication struct {
 	TotalDurationMs int64     `json:"total_duration_ms"`
 	RequestBody     string    `json:"request_body,omitempty"`
 	ResponseBody    string    `json:"response_body,omitempty"`
+	// List trims bodies to a preview: true when the full text must be
+	// fetched with GetByID (detail dialog). Estimate bodies are tiny and
+	// never trimmed, so the cost column keeps working from the list.
+	RequestTruncated  bool `json:"request_truncated,omitempty"`
+	ResponseTruncated bool `json:"response_truncated,omitempty"`
 	StatusCode      int       `json:"status_code"`
 	DurationMs      int64     `json:"duration_ms"`
 	ErrorMessage    string    `json:"error_message,omitempty"`
@@ -810,6 +1025,33 @@ type ServerCommListResponse struct {
 	TotalPages int                   `json:"total_pages"`
 }
 
+// serverCommListCols mirrors serverCommCols but trims the bodies: the list
+// view never renders them (only the tiny estimate payload is parsed, for the
+// cost column), while request/response TEXT can hold megabytes (base64
+// images, full provider dumps). Fetching 20 full TOAST values per page made
+// the paginated endpoint slow. Full bodies still come from GetByID.
+const serverCommListCols = `id, task_id, model_name, endpoint, method,
+	COALESCE(phase, '') AS phase,
+	COALESCE(poll_count, 0) AS poll_count,
+	COALESCE(started_at, '0001-01-01T00:00:00Z') AS started_at,
+	COALESCE(finished_at, '0001-01-01T00:00:00Z') AS finished_at,
+	COALESCE(total_duration_ms, 0) AS total_duration_ms,
+	LEFT(COALESCE(request_body, ''), 4000) AS request_body,
+	LEFT(COALESCE(response_body, ''), 4000) AS response_body,
+	status_code, duration_ms,
+	COALESCE(error_message, '') AS error_message,
+	COALESCE(user_id, 0) AS user_id,
+	COALESCE(username, '') AS username,
+	COALESCE(tenant_slug, '') AS tenant_slug,
+	COALESCE(credential_provider, '') AS credential_provider,
+	COALESCE(api_key_mask, '') AS api_key_mask,
+	COALESCE(access_key_mask, '') AS access_key_mask,
+	COALESCE(secret_key_mask, '') AS secret_key_mask,
+	COALESCE(auth_type, '') AS auth_type,
+	created_at,
+	(LENGTH(COALESCE(request_body, '')) > 4000) AS request_truncated,
+	(LENGTH(COALESCE(response_body, '')) > 4000) AS response_truncated`
+
 // List returns paginated traces.
 func (s *ServerCommunicationStore) List(filter ServerCommFilter) (*ServerCommListResponse, error) {
 	if filter.Page < 1 {
@@ -843,7 +1085,7 @@ func (s *ServerCommunicationStore) List(filter ServerCommFilter) (*ServerCommLis
 		return nil, err
 	}
 
-	query := "SELECT " + serverCommCols + " FROM server_communications" + where +
+	query := "SELECT " + serverCommListCols + " FROM server_communications" + where +
 		" ORDER BY created_at DESC LIMIT $" + itoa(argIdx) + " OFFSET $" + itoa(argIdx+1)
 	args = append(args, filter.Limit, offset)
 
@@ -862,7 +1104,7 @@ func (s *ServerCommunicationStore) List(filter ServerCommFilter) (*ServerCommLis
 			&l.StatusCode, &l.DurationMs, &l.ErrorMessage,
 			&l.UserID, &l.Username, &l.TenantSlug, &l.CredentialProvider,
 			&l.APIKeyMask, &l.AccessKeyMask, &l.SecretKeyMask, &l.AuthType,
-			&l.CreatedAt); err != nil {
+			&l.CreatedAt, &l.RequestTruncated, &l.ResponseTruncated); err != nil {
 			return nil, err
 		}
 		logs = append(logs, l)

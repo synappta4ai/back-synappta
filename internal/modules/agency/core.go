@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -71,7 +72,24 @@ type Core struct {
 	genAssetSt   *GeneratedAssetStore
 	genSaver     GenerationSaver
 	pushNotifier PushNotifier
-	mu           sync.RWMutex
+	// channelNotifier fanea el evento a los canales externos del tenant
+	// (Slack, Telegram, Discord... vía shoutrrr). Nil → solo Web Push.
+	channelNotifier PushNotifier
+	// notificationsChecker respeta el opt-in del usuario (nil → permitir).
+	notificationsChecker func(userID int64) bool
+	// notifyRecorder persiste el aviso en el centro nativo del usuario.
+	notifyRecorder func(userID int64, ntype, title, body, taskID string)
+	// outputPublisher moves finished artifacts to the tenant bucket when it has
+	// one; nil (or stored=false) keeps them on local disk.
+	outputPublisher OutputPublisher
+	// bridgeModels resuelve modelos servidos por las GPUs emparejadas del
+	// tenant (nil en deploys con worker central, donde el catálogo vivo por
+	// gRPC es la única fuente "downloaded").
+	bridgeModels BridgeModelResolver
+	// modelPrefsCheck vets a model name against the master + tenant curation
+	// (nil = unwired, everything routable passes).
+	modelPrefsCheck func(modelName string) error
+	mu              sync.RWMutex
 }
 
 // NewCore builds the per-tenant orchestration core.
@@ -110,11 +128,37 @@ func (s *Core) serveURL(fileID string) string {
 // SetPushNotifier wires the push service used for async completion alerts.
 func (s *Core) SetPushNotifier(pn PushNotifier) { s.pushNotifier = pn }
 
+// SetChannelNotifier wires the tenant channels fan-out (shoutrrr).
+func (s *Core) SetChannelNotifier(pn PushNotifier) { s.channelNotifier = pn }
+
+// SetNotificationsChecker wires the per-user opt-in gate.
+func (s *Core) SetNotificationsChecker(fn func(userID int64) bool) { s.notificationsChecker = fn }
+
+// SetNotifyRecorder wires the native notification center persistence.
+func (s *Core) SetNotifyRecorder(fn func(userID int64, ntype, title, body, taskID string)) {
+	s.notifyRecorder = fn
+}
+
+// SetOutputPublisher wires the tenant's storage so completed generations can be
+// saved to its bucket instead of local disk.
+func (s *Core) SetOutputPublisher(p OutputPublisher) { s.outputPublisher = p }
+
 // RegisterGenerator registers a generator that satisfies PipelineRunner.
 func (s *Core) RegisterGenerator(gen PipelineRunner) { s.pipelineGens = append(s.pipelineGens, gen) }
 
-func (s *Core) pickGenerator(modelName string) PipelineRunner {
+func (s *Core) pickGenerator(modelName string, workerAddr string) PipelineRunner {
 	for _, g := range s.pipelineGens {
+		// Los generators que soporten worker_addr per-request lo reciben antes
+		// de Match, para que DownloadedGenerator resuelva contra el worker
+		// correcto (Option B) o contra el global (BM_WORKER_ADDR). Solo se
+		// propaga un valor no vacío: un request sin worker_addr no debe
+		// borrar la dirección global del generator (multi-usuario: cada
+		// request comparte el mismo generator del tenant).
+		if workerAddr != "" {
+			if setter, ok := g.(interface{ SetWorkerAddr(string) }); ok {
+				setter.SetWorkerAddr(workerAddr)
+			}
+		}
 		if g.Match(modelName) {
 			return g
 		}
@@ -144,7 +188,9 @@ func (s *Core) resolveProvider(m *modelRef) (*credential.Resolve, error) {
 	if res == nil {
 		return nil, fmt.Errorf("no credentials configured for provider %q — add them in admin → tenants → gestionar", m.CredentialProvider)
 	}
-	if res.AuthKey() == "" {
+	// Local servers (Ollama, LM Studio) authenticate nothing: their
+	// credential only stores the base URL.
+	if res.AuthKey() == "" && !model.IsLocalProvider(m.CredentialProvider) {
 		return nil, fmt.Errorf("provider %q has no credentials for generation — add an API key or Key ID + Key Secret in admin → tenants → gestionar", m.CredentialProvider)
 	}
 	return res, nil
@@ -241,38 +287,61 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		if taskID == "" {
 			taskID = "<no-task>"
 		}
+		// Request shape as fallback for the cards: Higgsfield poll payloads
+		// rarely carry resolution/duration, so without this the UI shows "—"
+		// even though the request asked for a concrete shape.
+		videoDuration, videoResolution, videoRatio := 0, "", ""
+		if genReq != nil {
+			videoDuration, videoResolution, videoRatio = genReq.Duration, genReq.Resolution, genReq.Ratio
+		} else {
+			videoDuration, videoResolution, videoRatio = int(req.Duration), req.Resolution, req.Ratio
+		}
 		logEntry := &GenerationLog{
-			TaskID:           taskID,
-			ModelName:        modelName,
-			UserID:           intPtrOrNil(req.UserID),
-			EventID:          req.EventID,
-			ProgramID:        req.ProgramID,
-			PieceID:          req.PieceID,
-			PieceCode:        req.PieceCode,
-			GenerationNumber: req.GenerationNumber,
-			Request:          string(reqBytes),
-			Outputs:          outputs,
-			Status:           status,
-			ErrorMessage:     errLog,
-			ResourceType:     req.ResourceType,
-			ContentTypes:     extractContentTypes(req.Content),
-			EstimatedCost:    estimatedCost,
-			CostSource:       costSource,
-			CostCredits:      costCredits,
+			TaskID:                taskID,
+			ModelName:             modelName,
+			UserID:                intPtrOrNil(req.UserID),
+			EventID:               req.EventID,
+			ProgramID:             req.ProgramID,
+			PieceID:               req.PieceID,
+			PieceCode:             req.PieceCode,
+			GenerationNumber:      req.GenerationNumber,
+			Request:               string(reqBytes),
+			Outputs:               outputs,
+			Status:                status,
+			ErrorMessage:          errLog,
+			ResourceType:          req.ResourceType,
+			ContentTypes:          extractContentTypes(req.Content),
+			EstimatedCost:         estimatedCost,
+			CostSource:            costSource,
+			CostCredits:           costCredits,
 			ProviderTransactionID: providerTxID,
+			VideoDuration:         videoDuration,
+			VideoResolution:       videoResolution,
+			VideoRatio:            videoRatio,
 		}
 		if saveErr := s.logStore.Create(logEntry); saveErr != nil {
 			fmt.Printf("failed to save generation log: %v\n", saveErr)
 		}
 	}()
 
-	// Look up model in the code catalog
-	m := LookupModel(req.Model)
+	// Look up model in the code catalog (API + worker central + GPUs
+	// emparejadas del tenant). workerAddr puede ser la dirección de un
+	// worker propio del usuario (Option B) o vacía para usar la global.
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		errLog = fmt.Sprintf("model not found: %s", req.Model)
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
 	modelName = m.Name
+
+	// Curaduría maestro + tenant: un modelo desactivado no genera aunque se
+	// invoque por nombre directo (el listado ya lo oculta).
+	if s.modelPrefsCheck != nil {
+		if err := s.modelPrefsCheck(m.Name); err != nil {
+			errLog = err.Error()
+			return nil, err
+		}
+	}
 
 	// Resolve per-tenant credentials (API models only: downloaded models run
 	// on our own inference worker and need no external provider).
@@ -294,6 +363,14 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		errLog = fmt.Sprintf("failed to resolve content: %v", err)
 		return nil, fmt.Errorf("failed to resolve content: %w", err)
 	}
+	// Video providers download the inputs themselves: a loopback/private
+	// serve URL can never be fetched and the task would fail after submit.
+	if m.Type != model.TypeDownloaded && m.Modality == model.ModalityVideo {
+		if err := requirePublicInputs(resolvedContent); err != nil {
+			errLog = err.Error()
+			return nil, err
+		}
+	}
 	// Compute total input video duration from resolved content
 	inputDuration := float64(0)
 	for _, item := range resolvedContent {
@@ -307,6 +384,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 	// Convert to generator request
 	genReq = &GeneratorRequest{
 		Model:         m.Name,
+		Modality:      m.Modality,
 		Content:       resolvedContent,
 		Ratio:         req.Ratio,
 		Duration:      int(req.Duration),
@@ -320,6 +398,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		InputDuration: inputDuration,
 		APIKey:        creds.APIKey,
 		AuthKey:       creds.AuthKey(),
+		WorkerAddr:    req.WorkerAddr,
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -342,8 +421,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}
 
-	// Pick generator
-	gen := s.pickGenerator(m.Name)
+	// Pick generator (pasa worker_addr para Option B).
+	gen := s.pickGenerator(m.Name, req.WorkerAddr)
 	if gen == nil {
 		errLog = fmt.Sprintf("no generator available for model: %s", m.Name)
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
@@ -422,19 +501,42 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		return nil, err
 	}
 
+	// Sync generators (Gemini images) leave their bytes on local disk: move them
+	// to the tenant bucket when it has one.
+	if result != nil {
+		s.publishLocalOutputs(result)
+	}
+
 	// Calculate the generation spend: a provider-reported estimate
 	// (Higgsfield /estimate, in credits + USD) wins over local calculators.
 	if result.CostCredits > 0 || result.CostUSD > 0 {
 		costCredits = result.CostCredits
 		estimatedCost = result.CostUSD
 		costSource = "provider_estimate"
+		if estimatedCost == 0 {
+			// The provider billed credits without a USD figure: complete
+			// the USD leg with the local calculator so cards don't show
+			// $0.00. Credits, tx and source stay provider-reported.
+			if calc := s.pickCalculator(modelName); calc != nil && calc.Name() != "default" {
+				if est := calc.CalculateEstimated(genReq); est > 0 {
+					estimatedCost = est
+				}
+			}
+		}
 	} else if calc := s.pickCalculator(modelName); calc != nil {
 		if cost, ok := calc.CalculateFromResponse(result.Raw, genReq); ok {
 			estimatedCost = cost
 			costSource = "api_response"
 		} else if !calc.NeedsBackgroundCalc() {
 			estimatedCost = calc.CalculateEstimated(genReq)
-			costSource = "calculator"
+			// DefaultCalculator returning 0 means "no pricing known", not
+			// "free" (Gemini is the truly-free exception): mark pending so
+			// the missing cost stays visible instead of a fake $0.00.
+			if estimatedCost == 0 && calc.Name() == "default" {
+				costSource = "pending"
+			} else {
+				costSource = "calculator"
+			}
 		} else {
 			costSource = "pending"
 		}
@@ -466,6 +568,35 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 			s.attachAudit(comm, m, creds, req)
 			_ = s.commStore.Create(comm)
 		}
+	} else if costSource == "calculator" && estimatedCost > 0 {
+		log.Printf("[spend] task=%q model=%q usd=%.4f source=%s (fallback, estimate unavailable)",
+			taskID, modelName, estimatedCost, costSource)
+		// Same estimate phase as the provider-reported one so /admin/logs
+		// surfaces the fallback spend per task instead of a "—" cost cell.
+		if s.commStore != nil {
+			estResp, _ := json.Marshal(map[string]interface{}{
+				"credits":        0,
+				"usd":            estimatedCost,
+				"transaction_id": providerTxID,
+				"source":         "calculator",
+			})
+			comm := &ServerCommunication{
+				TaskID:       taskID,
+				ModelName:    m.Name,
+				Endpoint:     strings.TrimSuffix(genReq.BaseURL, "/") + "/estimate" + genReq.Endpoint,
+				Method:       "POST",
+				Phase:        "estimate",
+				StartedAt:    time.Now(),
+				RequestBody:  string(apiPayloadBytes),
+				ResponseBody: string(estResp),
+				StatusCode:   200,
+			}
+			s.attachAudit(comm, m, creds, req)
+			_ = s.commStore.Create(comm)
+		}
+	} else if costSource == "pending" {
+		log.Printf("[spend] task=%q model=%q source=pending (no pricing: estimate failed, no calculator match)",
+			taskID, modelName)
 	}
 
 	// Track the task for status polling
@@ -474,6 +605,18 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		userName = fmt.Sprintf("u%d", req.UserID)
 	}
 	terminal := result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED
+	// Keep the submit outputs on the record so terminal-at-submit (sync)
+	// generators answer polls from storage instead of re-hitting the
+	// provider (whose GetStatus may be a no-op with empty outputs).
+	storedResult := &StatusResult{
+		Status: result.Status,
+		Raw:    result.Raw,
+	}
+	if len(outputs) > 0 {
+		storedResult.VideoURL = outputs[0].URL
+		storedResult.LocalURL = outputs[0].LocalURL
+		storedResult.ImageURL = outputs[0].URL
+	}
 	s.mu.Lock()
 	s.tasks[result.TaskID] = &TaskRecord{
 		TaskID: result.TaskID,
@@ -489,10 +632,7 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		UserID:       req.UserID,
 		PushNotified: terminal,
 		ResourceType: req.ResourceType,
-		Result: &StatusResult{
-			Status: result.Status,
-			Raw:    result.Raw,
-		},
+		Result:       storedResult,
 	}
 	s.mu.Unlock()
 
@@ -558,7 +698,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		}
 	}
 
-	m := LookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model for task %s not found: %s", taskID, record.ModelName)
 	}
@@ -572,7 +712,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -655,6 +795,7 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		// Persist the video under the server's own outputs and serve it from
 		// our domain instead of the expiring signed provider URL.
 		s.ensureLocalVideo(taskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
@@ -699,8 +840,9 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		Outputs: []OutputResource{},
 	}
 
-	// Prefer the server-owned copy of the video over the expiring signed
-	// provider URL so playback survives provider URL expiry.
+	// Prefer the server-owned copy of the output over the expiring signed
+	// provider URL so playback/render survives provider URL expiry. Label the
+	// resource by its real kind (image vs video) instead of assuming video.
 	localURL := sr.LocalURL
 	providerURL := sr.VideoURL
 	if localURL == "" {
@@ -710,7 +852,7 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		resp.Outputs = append(resp.Outputs, OutputResource{
 			URL:      s.absoluteOutputURL(localURL),
 			LocalURL: localURL,
-			Type:     "video",
+			Type:     mediaKindForURL(localURL),
 		})
 	}
 	if sr.ImageURL != "" && sr.ImageURL != sr.VideoURL && sr.ImageURL != localURL {
@@ -753,7 +895,7 @@ func (s *Core) CancelTask(taskID string) error {
 		return fmt.Errorf("unknown task: %s", taskID)
 	}
 
-	m := LookupModel(record.ModelName)
+	m := s.lookupModel(record.ModelName, "")
 	if m == nil {
 		return fmt.Errorf("model for task %s not found", taskID)
 	}
@@ -767,7 +909,7 @@ func (s *Core) CancelTask(taskID string) error {
 	} else {
 		creds = &credential.Resolve{}
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -780,7 +922,7 @@ func (s *Core) CancelTask(taskID string) error {
 
 // PreviewPayload builds the AI API payload without sending it or saving logs.
 func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, error) {
-	m := LookupModel(req.Model)
+	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
 	}
@@ -826,7 +968,7 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 		genReq.GenerateAudio = *req.GenerateAudio
 	}
 
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return nil, fmt.Errorf("no generator available for model: %s", m.Name)
 	}
@@ -866,11 +1008,11 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		return sr, nil
 	}
 
-	m := LookupModel(logEntry.ModelName)
+	m := s.lookupModel(logEntry.ModelName, "")
 	if m == nil {
 		return &StatusResult{Status: logEntry.Status, Error: "model not found for task " + logEntry.TaskID}, nil
 	}
-	gen := s.pickGenerator(m.Name)
+	gen := s.pickGenerator(m.Name, "")
 	if gen == nil {
 		return &StatusResult{Status: logEntry.Status}, nil
 	}
@@ -910,6 +1052,7 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 
 	if result.Status == config.STATUS_SUCCESS || result.Status == config.STATUS_FAILED {
 		s.ensureLocalVideo(logEntry.TaskID, result)
+		s.publishLocalOutputs(result)
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
@@ -1031,9 +1174,16 @@ type taskNotifyInfo struct {
 	GenerationNumber int
 }
 
-// notifyTaskCompletion sends a Web Push to the task owner (video only today).
+// notifyTaskCompletion alerts the task owner (video only today) via Web Push
+// and the tenant's external channels, honoring the user's opt-in.
 func (s *Core) notifyTaskCompletion(userID int, info taskNotifyInfo) {
-	if s.pushNotifier == nil || userID <= 0 || info.ResourceType != "video" {
+	if userID <= 0 || info.ResourceType != "video" {
+		return
+	}
+	if s.notificationsChecker != nil && !s.notificationsChecker(int64(userID)) {
+		return
+	}
+	if s.pushNotifier == nil && s.channelNotifier == nil {
 		return
 	}
 
@@ -1058,10 +1208,19 @@ func (s *Core) notifyTaskCompletion(userID int, info taskNotifyInfo) {
 		}
 	}
 
-	go s.pushNotifier.SendToUser(int64(userID), title, body, map[string]string{
+	data := map[string]string{
 		"type":    ntype,
 		"task_id": info.TaskID,
-	})
+	}
+	if s.notifyRecorder != nil {
+		go s.notifyRecorder(int64(userID), ntype, title, body, info.TaskID)
+	}
+	if s.pushNotifier != nil {
+		go s.pushNotifier.SendToUser(int64(userID), title, body, data)
+	}
+	if s.channelNotifier != nil {
+		go s.channelNotifier.SendToUser(int64(userID), title, body, data)
+	}
 }
 
 // resolveContent maps file IDs to public serve URLs, or asset:// URIs when
@@ -1110,7 +1269,7 @@ func (s *Core) SyncAsset(modelName, fileID string) (*SyncAssetResult, error) {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
 
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}
@@ -1248,7 +1407,7 @@ func (s *Core) GallerySyncContent(items []ContentItem, modelName string) ([]Cont
 	if s.assetStore == nil {
 		return nil, fmt.Errorf("asset sync store not available")
 	}
-	m := LookupModel(modelName)
+	m := LookupModel(modelName, "")
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", modelName)
 	}
@@ -1293,8 +1452,12 @@ func defaultBaseURLFor(p string) string {
 		return "https://generativelanguage.googleapis.com/v1beta"
 	case "anthropic":
 		return "https://api.anthropic.com/v1"
+	case "ollama", "lmstudio":
+		return model.DefaultLocalBaseURL(model.CredentialProvider(p))
 	default:
-		return ""
+		// Hosted inference clouds (RunPod, Together, DeepInfra, …) carry
+		// their API root in the model registry.
+		return model.InferenceProviderBaseURL(model.CredentialProvider(p))
 	}
 }
 
@@ -1307,7 +1470,14 @@ func defaultEndpointFor(p string) string {
 		return ""
 	case "anthropic":
 		return "/messages"
+	case "ollama", "lmstudio":
+		return "/chat/completions"
 	default:
+		// RunPod needs the endpoint id (carried by the model entry itself),
+		// so there is no provider-wide route to default to.
+		if model.InferenceProviderBaseURL(model.CredentialProvider(p)) != "" {
+			return "/chat/completions"
+		}
 		return ""
 	}
 }
@@ -1430,6 +1600,115 @@ func (s *Core) ListGeneratedVideos(page, limit int, eventID string) (*ListLogsRe
 // narrows the list to one project.
 func (s *Core) ListGeneratedImages(page, limit int, eventID string) (*ListLogsResponse, error) {
 	return s.listGeneratedByModality(page, limit, config.ModalityImage, eventID)
+}
+
+// TrashLog moves one generation to the trash (recoverable for 30 days).
+func (s *Core) TrashLog(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.logStore.TrashLog(id)
+}
+
+// RestoreLog returns a trashed generation to the gallery.
+func (s *Core) RestoreLog(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.logStore.RestoreLog(id)
+}
+
+// DeleteLogPermanent removes one generation forever (row + local files).
+func (s *Core) DeleteLogPermanent(id string) error {
+	if s.logStore == nil {
+		return fmt.Errorf("log store not available")
+	}
+	return s.purgeLogRows([]ExpiredTrashRow{{ID: id}})
+}
+
+// ListTrash returns paginated trashed generations (video/image/all).
+func (s *Core) ListTrash(page, limit int, resourceType string) (*ListLogsResponse, error) {
+	if s.logStore == nil {
+		return nil, fmt.Errorf("log store not available")
+	}
+	logs, total, err := s.logStore.ListTrash(page, limit, resourceType)
+	if err != nil {
+		return nil, err
+	}
+	if logs == nil {
+		logs = []GenerationLog{}
+	}
+	totalPages := (total + limit - 1) / limit
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	return &ListLogsResponse{Logs: logs, Total: total, Page: page, Limit: limit, TotalPages: totalPages}, nil
+}
+
+// TrashRetentionDays is how long trashed generations survive before the
+// nightly purge removes them permanently.
+const TrashRetentionDays = 30
+
+// PurgeTrash permanently removes generations trashed more than
+// TrashRetentionDays ago (rows + their local output files, best-effort).
+func (s *Core) PurgeTrash() (int, error) {
+	if s.logStore == nil {
+		return 0, fmt.Errorf("log store not available")
+	}
+	cutoff := time.Now().AddDate(0, 0, -TrashRetentionDays)
+	total := 0
+	for {
+		rows, err := s.logStore.ListExpiredTrash(cutoff, 200)
+		if err != nil {
+			return total, err
+		}
+		if len(rows) == 0 {
+			return total, nil
+		}
+		if err := s.purgeLogRows(rows); err != nil {
+			return total, err
+		}
+		total += len(rows)
+	}
+}
+
+// purgeLogRows removes local output files (best-effort) then hard-deletes
+// the rows. With no outputs recorded it just deletes the row.
+func (s *Core) purgeLogRows(rows []ExpiredTrashRow) error {
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Outputs == "" {
+			ids = append(ids, r.ID)
+			continue
+		}
+		var outputs []OutputResource
+		if err := json.Unmarshal([]byte(r.Outputs), &outputs); err != nil {
+			ids = append(ids, r.ID)
+			continue
+		}
+		for _, o := range outputs {
+			s.removeLocalOutput(o.LocalURL)
+		}
+		ids = append(ids, r.ID)
+	}
+	return s.logStore.DeleteLogsByIDs(ids)
+}
+
+// removeLocalOutput deletes a file served from the local outputs dir
+// ("/outputs/..."). Anything else (bucket URLs, provider URLs) is left
+// alone: buckets are tenant-managed and provider links already expired.
+func (s *Core) removeLocalOutput(localURL string) {
+	const prefix = "/outputs/"
+	if !strings.HasPrefix(localURL, prefix) || s.outputsDir == "" {
+		return
+	}
+	rel := strings.TrimPrefix(localURL, prefix)
+	if rel == "" || strings.Contains(rel, "..") {
+		return
+	}
+	if err := os.Remove(s.outputsDir + "/" + rel); err != nil && !os.IsNotExist(err) {
+		log.Printf("[agency-purge] remove %s: %v", rel, err)
+	}
 }
 
 func (s *Core) listGeneratedByModality(page, limit int, modality, eventID string) (*ListLogsResponse, error) {

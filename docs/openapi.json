@@ -162,8 +162,8 @@
     "/api/v1/models": {
       "get": {
         "tags": ["Models"],
-        "summary": "List models (API + live downloaded)",
-        "description": "Merged catalog: 'api' models (static, external providers) and 'downloaded' models (read live from the inference worker; absent when the worker is unreachable — header X-Worker-Status: unreachable). Nothing is cached.",
+        "summary": "List usable models (API + live downloaded)",
+        "description": "Usable catalog only: 'api' models with a stored tenant credential plus 'downloaded' models the worker reports as available. Unavailable entries never appear here; manage them through GET /api/v1/worker/models. The inference worker is optional: a dead worker degrades to API-only (header X-Worker-Status: unreachable) and, with type=downloaded, to an empty list with 200 — never a 5xx, because no worker is a valid deployment state. Nothing is cached.",
         "operationId": "listModels",
         "parameters": [
           { "name": "modality", "in": "query", "schema": { "type": "string", "enum": ["video", "audio", "image", "text"] } },
@@ -192,10 +192,77 @@
       "get": {
         "tags": ["Models"],
         "summary": "Live inference worker status",
-        "description": "Reads worker telemetry and catalog live on every call (no cache). Reports reachability, device and model count. connected=false when the worker is unreachable.",
+        "description": "Reads worker telemetry and catalog live on every call (no cache). Reports reachability, device and usable model count. connected=false when the worker is unreachable.",
         "operationId": "workerStatus",
         "responses": {
           "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseWorkerStatus" } } } }
+        }
+      }
+    },
+    "/api/v1/worker/models": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List worker models for management",
+        "description": "Tenant admin only. Full live worker catalog, including unavailable models, download progress and on-disk size. Use it for download/delete management in /gpu.",
+        "operationId": "listWorkerModels",
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModels" } } } }
+        }
+      }
+    },
+    "/api/v1/worker/models": {
+      "delete": {
+        "tags": ["Models"],
+        "summary": "Delete all model weights",
+        "description": "Tenant admin only. Removes every downloaded weight from worker disk (uninstall everything). Per-model failures are reported without aborting the rest.",
+        "operationId": "deleteAllWorkerModels",
+        "responses": {
+          "200": { "description": "Bulk delete summary", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseBulkDelete" } } } },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}/download": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Start a model download",
+        "description": "Tenant admin only. Starts a background weight download on the worker and returns its current operation state. Poll GET /api/v1/worker/models for progress.",
+        "operationId": "downloadWorkerModel",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": { "description": "Download started", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "409": { "description": "Conflicting weight operation" },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}/cancel": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Cancel a model download",
+        "description": "Tenant admin only. Aborts an in-progress background weight download on the worker.",
+        "operationId": "cancelWorkerModelDownload",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": { "description": "Download cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "503": { "description": "Worker unreachable" }
+        }
+      }
+    },
+    "/api/v1/worker/models/{key}": {
+      "delete": {
+        "tags": ["Models"],
+        "summary": "Delete model weights",
+        "description": "Tenant admin only. Removes a model's weights from worker disk.",
+        "operationId": "deleteWorkerModel",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Weights deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseModelOperation" } } } },
+          "404": { "description": "Unknown model key" },
+          "409": { "description": "Cannot delete while another weight operation runs" },
+          "503": { "description": "Worker unreachable" }
         }
       }
     },
@@ -357,16 +424,106 @@
         "responses": { "200": { "description": "Deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseMessage" } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
       }
     },
+    "/api/v1/files/presign": {
+      "post": {
+        "operationId": "presignFileUpload",
+        "summary": "Presigned direct-to-bucket upload URL",
+        "description": "Signs a short-lived PUT URL for the TENANT's own MinIO/S3 bucket (see /files/storage). The client uploads the bytes straight to the bucket with the returned headers; the API never proxies them. The object key is namespaced per tenant (tenant/category/YYYY/MM/uuid.ext). Only image/video/audio extensions are accepted. Answers 503 when the tenant has no bucket configured: in that case the client keeps using POST /files/upload (local disk).",
+        "tags": ["Files"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["filename"],
+                "properties": {
+                  "filename": { "type": "string", "description": "Original file name; its extension picks the category (images | videos | audio)" },
+                  "content_type": { "type": "string", "description": "MIME type to store. Defaults from the extension and must match its media family" },
+                  "size": { "type": "integer", "description": "Declared size in bytes (0 = unknown)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Presigned URL",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiResponsePresign" }
+              }
+            }
+          },
+          "400": { "description": "Invalid file name, type or size" },
+          "503": { "description": "Object storage not configured" }
+        }
+      }
+    },
+    "/api/v1/files/storage": {
+      "get": {
+        "operationId": "getFileStorageConfig",
+        "summary": "Tenant bucket configuration (secrets masked)",
+        "description": "Returns the tenant's own S3/MinIO configuration. configured=false means the tenant stores files on local disk and /files/presign answers 503.",
+        "tags": ["Files"],
+        "responses": {
+          "200": {
+            "description": "Configuration",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiResponseStorageConfig" }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "saveFileStorageConfig",
+        "summary": "Configure the tenant bucket",
+        "description": "Validates the endpoint/bucket and verifies access with a signed HEAD before saving; credentials are encrypted at rest in the tenant schema. On update, omit access_key_id/secret_access_key to keep the stored ones. Tenant admin only.",
+        "tags": ["Files"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StorageConfigRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved configuration (masked)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiResponseStorageConfig" }
+              }
+            }
+          },
+          "400": { "description": "Invalid payload or unreachable/rejected bucket" },
+          "403": { "description": "Tenant admin required" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteFileStorageConfig",
+        "summary": "Remove the tenant bucket (back to local disk)",
+        "tags": ["Files"],
+        "responses": {
+          "200": { "description": "Removed" },
+          "403": { "description": "Tenant admin required" }
+        }
+      }
+    },
     "/api/v1/files/upload": {
       "post": {
         "tags": ["Files"],
         "summary": "Upload file (multipart)",
+        "description": "The bytes always go through the API and the tenant's storage configuration decides where they land: local disk (UPLOAD_DIR) or the tenant's own bucket (see /files/storage). The response and the file URL are identical either way, so clients do not need to change. MAX_UPLOAD_BYTES is enforced here (413 when exceeded).",
         "operationId": "uploadFile",
         "requestBody": {
           "required": true,
-          "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "file": { "type": "string", "format": "binary" }, "category": { "type": "string", "description": "File category" }, "storage": { "type": "string", "enum": ["disk"], "description": "Storage backend" } }, "required": ["file"] } } }
+          "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "file": { "type": "string", "format": "binary" }, "category": { "type": "string", "description": "File category: images | videos | audio | temp" }, "storage": { "type": "string", "enum": ["persistent", "temp"], "description": "Persistence (default persistent)" }, "force": { "type": "boolean", "description": "Store a new copy even if identical bytes already exist" }, "event_id": { "type": "string", "description": "Project (event) to assign the resource to" } }, "required": ["file", "category"] } } }
         },
-        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseFile" } } } } }
+        "responses": { "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponseFile" } } } }, "413": { "description": "File exceeds MAX_UPLOAD_BYTES" } }
       }
     },
     "/api/v1/files/page": {
@@ -412,9 +569,10 @@
       "get": {
         "tags": ["Files"],
         "summary": "Serve file content (binary)",
+        "description": "Streams the bytes from disk for local files. Files stored in the tenant bucket answer 302 to a short-lived presigned GET, so the bucket serves the bandwidth and range requests; the public URL is the same in both cases.",
         "operationId": "serveFile",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-        "responses": { "200": { "description": "File content", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "404": { "$ref": "#/components/responses/NotFound" }, "410": { "$ref": "#/components/responses/Gone" } }
+        "responses": { "200": { "description": "File content", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "302": { "description": "Redirect to the presigned bucket URL", "headers": { "Location": { "schema": { "type": "string" } } } }, "404": { "$ref": "#/components/responses/NotFound" }, "410": { "$ref": "#/components/responses/Gone" } }
       }
     },
     "/api/v1/files/{id}/thumbnail": {
@@ -1390,6 +1548,12 @@
           "vram_gb": { "type": "integer" },
           "family": { "type": "string" },
           "available": { "type": "boolean", "description": "false when the worker lists the model but cannot run it" },
+          "downloaded": { "type": "boolean", "description": "true when the weights are fully on the worker disk" },
+          "downloading": { "type": "boolean", "description": "true while a background weight download is running" },
+          "download_percent": { "type": "number", "description": "Live 0-100 download progress" },
+          "size_bytes": { "type": "integer", "description": "On-disk weight size when downloaded" },
+          "download_error": { "type": "string", "description": "Last download failure, when present" },
+          "download_path": { "type": "string", "description": "Absolute path of the weights on the worker's machine; empty when unknown or the agent predates the field" },
           "notes": { "type": "string" }
         }
       },
@@ -1408,7 +1572,42 @@
           "connected": { "type": "boolean" },
           "device_name": { "type": "string" },
           "cuda_available": { "type": "boolean" },
-          "model_count": { "type": "integer" }
+          "model_count": { "type": "integer", "description": "Usable models reported by the worker" }
+        }
+      },
+      "ModelOperation": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "state": { "type": "string", "enum": ["idle", "downloading", "ready", "failed", "deleted", "cancelled"] },
+          "progress": { "type": "number" },
+          "bytes_downloaded": { "type": "integer" },
+          "total_bytes": { "type": "integer" },
+          "error": { "type": "string" }
+        }
+      },
+      "ApiResponseModelOperation": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/ModelOperation" }
+        }
+      },
+      "BulkDeleteResult": {
+        "type": "object",
+        "properties": {
+          "deleted": { "type": "array", "items": { "type": "string" } },
+          "failed": { "type": "object", "additionalProperties": { "type": "string" } },
+          "freed_bytes": { "type": "integer" }
+        }
+      },
+      "ApiResponseBulkDelete": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/BulkDeleteResult" }
         }
       },
       "ApiResponseWorkerStatus": {
@@ -1521,6 +1720,66 @@
           "success": { "type": "boolean" },
           "message": { "type": "string" },
           "data": { "$ref": "#/components/schemas/File" }
+        }
+      },
+      "ApiResponsePresign": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/PresignResult" }
+        }
+      },
+      "ApiResponseStorageConfig": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "data": { "$ref": "#/components/schemas/StorageConfig" }
+        }
+      },
+      "StorageConfig": {
+        "type": "object",
+        "properties": {
+          "configured": { "type": "boolean", "description": "false = the tenant stores files on local disk" },
+          "endpoint": { "type": "string" },
+          "bucket": { "type": "string" },
+          "region": { "type": "string" },
+          "public_base": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "access_key_id": { "type": "string", "description": "Masked: first 4 + last 4 characters" },
+          "has_secret": { "type": "boolean" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "StorageConfigRequest": {
+        "type": "object",
+        "required": ["endpoint", "bucket"],
+        "properties": {
+          "endpoint": { "type": "string", "description": "S3/MinIO endpoint, e.g. https://bucket.synappta.cloud" },
+          "bucket": { "type": "string", "description": "Lowercase bucket name (3-63 chars)" },
+          "region": { "type": "string", "description": "SigV4 region (default us-east-1)" },
+          "access_key_id": { "type": "string", "description": "Required on create; omit on update to keep the stored one" },
+          "secret_access_key": { "type": "string", "description": "Required on create; omit on update to keep the stored one" },
+          "public_base": { "type": "string", "description": "Optional public/CDN base for read URLs" },
+          "enabled": { "type": "boolean", "description": "false keeps the config but reverts the tenant to local storage" }
+        }
+      },
+      "PresignResult": {
+        "type": "object",
+        "properties": {
+          "upload_url": { "type": "string", "description": "Presigned PUT URL (SigV4); expires in expires_in seconds" },
+          "method": { "type": "string", "enum": ["PUT"] },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Headers the PUT must send exactly (Content-Type is signed)"
+          },
+          "key": { "type": "string", "description": "Object key inside the bucket, namespaced per tenant" },
+          "bucket": { "type": "string" },
+          "public_url": { "type": "string", "description": "Read URL (requires a public-read policy or MINIO_PUBLIC_BASE)" },
+          "expires_in": { "type": "integer" },
+          "max_size": { "type": "integer", "description": "Advisory size cap in bytes" }
         }
       },
       "ApiResponsePaginatedFiles": {

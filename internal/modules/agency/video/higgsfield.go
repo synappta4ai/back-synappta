@@ -23,6 +23,7 @@ import (
 
 	"synapta/config"
 	"synapta/internal/modules/agency"
+	"synapta/internal/modules/model"
 	"synapta/internal/utils"
 )
 
@@ -62,9 +63,12 @@ func (g *HiggsfieldGenerator) Name() string { return g.label }
 // ContentType returns "video".
 func (g *HiggsfieldGenerator) ContentType() string { return "video" }
 
-// Match reports whether this generator handles the model name.
+// Match reports whether this generator handles the model name: any video
+// model of the curated Higgsfield catalog (declarative — adding a model is
+// a catalog row, no code change).
 func (g *HiggsfieldGenerator) Match(modelName string) bool {
-	return strings.Contains(strings.ToLower(modelName), "higgsfield-")
+	m := model.ByName(modelName)
+	return m != nil && m.Generator == "higgsfield" && m.Modality == model.ModalityVideo
 }
 
 // Validate checks the request against Higgsfield constraints.
@@ -247,7 +251,13 @@ func (g *HiggsfieldGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 	case strings.Contains(lowerModel, "-i2v"), strings.Contains(lowerModel, "image-to-video"),
 		strings.HasSuffix(req.Endpoint, "/image-to-video"):
 		// Dedicated image-to-video route: the schema takes one image_url.
-		useSingularImage = true
+		// More than one image (or any audio/video) cannot ride it: use the
+		// model's multi-reference route when the catalog defines one.
+		if (len(imageURLs) > 1 || len(videoURLs) > 0 || len(audioURLs) > 0) && req.ReferenceEndpoint != "" {
+			req.Endpoint = req.ReferenceEndpoint
+		} else {
+			useSingularImage = true
+		}
 	case strings.Contains(lowerModel, "reference"), strings.HasSuffix(req.Endpoint, "/reference-to-video"):
 		// Dedicated multi-reference route: image_urls / video_urls arrays are
 		// the documented shape — no rerouting needed.

@@ -1,6 +1,7 @@
 package agency
 
 import (
+	"database/sql"
 	"strings"
 	"time"
 
@@ -174,6 +175,15 @@ func (h *Handler) GetGenerationLogsCostSummary(c *gin.Context) {
 	utils.Success(c, result)
 }
 
+// BackfillGenerationCosts recomputes missing spend (and empty video shape)
+// from the stored request payloads. Idempotent: provider-reported rows are
+// never touched. The front fires it on every login so past $0 rows heal
+// without manual intervention.
+func (h *Handler) BackfillGenerationCosts(c *gin.Context) {
+	result := h.core.BackfillMissingCosts(500)
+	utils.Success(c, result)
+}
+
 // GetGenerationLog handles GET /agency/logs/generation/:id
 func (h *Handler) GetGenerationLog(c *gin.Context) {
 	id := c.Param("id")
@@ -269,6 +279,59 @@ func (h *Handler) listGeneratedByModality(c *gin.Context, list func(page, limit 
 		return
 	}
 	utils.Success(c, result)
+}
+
+// ─── Gallery trash (papelera) ───────────────────────────────────
+
+// ListTrash handles GET /agency/gallery/trash — trashed generations with
+// paging. Optional ?resource_type=video|image narrows the section.
+func (h *Handler) ListTrash(c *gin.Context) {
+	page := atoiDefault(c.Query("page"), 1)
+	limit := atoiDefault(c.Query("limit"), 20)
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	result, err := h.core.ListTrash(page, limit, c.Query("resource_type"))
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, result)
+}
+
+// TrashLog handles PUT /agency/logs/generation/:id/trash.
+func (h *Handler) TrashLog(c *gin.Context) {
+	if err := h.core.TrashLog(c.Param("id")); err != nil {
+		if err == sql.ErrNoRows {
+			utils.NotFound(c, "generation not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "moved to trash")
+}
+
+// RestoreLog handles PUT /agency/logs/generation/:id/restore.
+func (h *Handler) RestoreLog(c *gin.Context) {
+	if err := h.core.RestoreLog(c.Param("id")); err != nil {
+		if err == sql.ErrNoRows {
+			utils.NotFound(c, "trashed generation not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "restored from trash")
+}
+
+// DeleteLogPermanent handles DELETE /agency/logs/generation/:id/permanent.
+func (h *Handler) DeleteLogPermanent(c *gin.Context) {
+	if err := h.core.DeleteLogPermanent(c.Param("id")); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "permanently deleted")
 } // ─── Module ─────────────────────────────────────────────────────
 
 // CoreResolver supplies the tenant-scoped core for each request.
@@ -321,6 +384,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 
 		// The caller's recent tasks (own rows only) — take-reel hydration.
 		g.GET("/tasks/recent", m.priv("RecentTasks"))
+		// Login-triggered cost repair (any authenticated tenant user; the
+		// pass is tenant-scoped and idempotent).
+		g.POST("/tasks/backfill-costs", m.priv("BackfillGenerationCosts"))
 		// The caller's generations by date window (session recovery) and the
 		// two-check rating of a task (owner-only, body carries task_id).
 		g.GET("/tasks/history", m.priv("TaskHistory"))
@@ -332,6 +398,10 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		gallery.GET("/assets", m.priv("ListGeneratedAssets"))
 		gallery.GET("/videos", m.priv("ListGeneratedVideos"))
 		gallery.GET("/images", m.priv("ListGeneratedImages"))
+		gallery.GET("/gallery/trash", m.priv("ListTrash"))
+		gallery.PUT("/logs/generation/:id/trash", m.priv("TrashLog"))
+		gallery.PUT("/logs/generation/:id/restore", m.priv("RestoreLog"))
+		gallery.DELETE("/logs/generation/:id/permanent", m.priv("DeleteLogPermanent"))
 
 		// Modality routes (video/image/audio/text).
 		for name, fn := range m.modalities {
@@ -360,6 +430,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListGenerationLogs(c)
 		case "RecentTasks":
 			hdl.RecentTasks(c)
+		case "BackfillGenerationCosts":
+			hdl.BackfillGenerationCosts(c)
 		case "TaskHistory":
 			hdl.TaskHistory(c)
 		case "UpdateTaskRating":
@@ -378,6 +450,14 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListGeneratedVideos(c)
 		case "ListGeneratedImages":
 			hdl.ListGeneratedImages(c)
+		case "ListTrash":
+			hdl.ListTrash(c)
+		case "TrashLog":
+			hdl.TrashLog(c)
+		case "RestoreLog":
+			hdl.RestoreLog(c)
+		case "DeleteLogPermanent":
+			hdl.DeleteLogPermanent(c)
 		default:
 			utils.InternalError(c, "unknown handler method: "+method)
 		}

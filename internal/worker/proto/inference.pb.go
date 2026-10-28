@@ -58,20 +58,26 @@ func (*ListModelsRequest) Descriptor() ([]byte, []int) {
 }
 
 type ModelInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Label         string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
-	Mode          string                 `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`     // "image" | "video" | "tts" | "audio"
-	Engine        string                 `protobuf:"bytes,4,opt,name=engine,proto3" json:"engine,omitempty"` // "diffusers" | "v1_bridge" | "mock"
-	Pipeline      string                 `protobuf:"bytes,5,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
-	Repo          string                 `protobuf:"bytes,6,opt,name=repo,proto3" json:"repo,omitempty"`
-	Steps         int32                  `protobuf:"varint,7,opt,name=steps,proto3" json:"steps,omitempty"`
-	VramGb        int32                  `protobuf:"varint,8,opt,name=vram_gb,json=vramGb,proto3" json:"vram_gb,omitempty"`
-	Family        string                 `protobuf:"bytes,9,opt,name=family,proto3" json:"family,omitempty"`
-	Available     bool                   `protobuf:"varint,10,opt,name=available,proto3" json:"available,omitempty"` // false si requiere volumen V1 no montado
-	Notes         string                 `protobuf:"bytes,11,opt,name=notes,proto3" json:"notes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Key             string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Label           string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+	Mode            string                 `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`     // "image" | "video" | "tts" | "audio"
+	Engine          string                 `protobuf:"bytes,4,opt,name=engine,proto3" json:"engine,omitempty"` // "diffusers" | "v1_bridge" | "mock"
+	Pipeline        string                 `protobuf:"bytes,5,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
+	Repo            string                 `protobuf:"bytes,6,opt,name=repo,proto3" json:"repo,omitempty"`
+	Steps           int32                  `protobuf:"varint,7,opt,name=steps,proto3" json:"steps,omitempty"`
+	VramGb          int32                  `protobuf:"varint,8,opt,name=vram_gb,json=vramGb,proto3" json:"vram_gb,omitempty"`
+	Family          string                 `protobuf:"bytes,9,opt,name=family,proto3" json:"family,omitempty"`
+	Available       bool                   `protobuf:"varint,10,opt,name=available,proto3" json:"available,omitempty"` // listo para generar YA (pesos en disco; + volumen V1 montado si aplica)
+	Notes           string                 `protobuf:"bytes,11,opt,name=notes,proto3" json:"notes,omitempty"`
+	Downloaded      bool                   `protobuf:"varint,12,opt,name=downloaded,proto3" json:"downloaded,omitempty"`                                   // pesos completos en disco (no se vuelve a bajar)
+	Downloading     bool                   `protobuf:"varint,13,opt,name=downloading,proto3" json:"downloading,omitempty"`                                 // descarga en curso ahora mismo
+	DownloadPercent float32                `protobuf:"fixed32,14,opt,name=download_percent,json=downloadPercent,proto3" json:"download_percent,omitempty"` // 0..100 mientras descarga
+	SizeBytes       int64                  `protobuf:"varint,15,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`                    // pesos completos en disco (0 si no hay ninguno)
+	DownloadError   string                 `protobuf:"bytes,16,opt,name=download_error,json=downloadError,proto3" json:"download_error,omitempty"`         // último error de descarga/borrado
+	DownloadPath    string                 `protobuf:"bytes,17,opt,name=download_path,json=downloadPath,proto3" json:"download_path,omitempty"`            // ruta absoluta de los pesos en disco
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ModelInfo) Reset() {
@@ -181,6 +187,48 @@ func (x *ModelInfo) GetNotes() string {
 	return ""
 }
 
+func (x *ModelInfo) GetDownloaded() bool {
+	if x != nil {
+		return x.Downloaded
+	}
+	return false
+}
+
+func (x *ModelInfo) GetDownloading() bool {
+	if x != nil {
+		return x.Downloading
+	}
+	return false
+}
+
+func (x *ModelInfo) GetDownloadPercent() float32 {
+	if x != nil {
+		return x.DownloadPercent
+	}
+	return 0
+}
+
+func (x *ModelInfo) GetSizeBytes() int64 {
+	if x != nil {
+		return x.SizeBytes
+	}
+	return 0
+}
+
+func (x *ModelInfo) GetDownloadError() string {
+	if x != nil {
+		return x.DownloadError
+	}
+	return ""
+}
+
+func (x *ModelInfo) GetDownloadPath() string {
+	if x != nil {
+		return x.DownloadPath
+	}
+	return ""
+}
+
 type ListModelsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Models        []*ModelInfo           `protobuf:"bytes,1,rep,name=models,proto3" json:"models,omitempty"`
@@ -241,6 +289,284 @@ func (x *ListModelsResponse) GetCudaAvailable() bool {
 	return false
 }
 
+// Resultado de una operación de gestión de pesos (descarga / borrado).
+type ModelOperationResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// "idle" | "downloading" | "ready" | "failed" | "deleted"
+	State           string  `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	Progress        float32 `protobuf:"fixed32,3,opt,name=progress,proto3" json:"progress,omitempty"` // 0..100
+	BytesDownloaded int64   `protobuf:"varint,4,opt,name=bytes_downloaded,json=bytesDownloaded,proto3" json:"bytes_downloaded,omitempty"`
+	TotalBytes      int64   `protobuf:"varint,5,opt,name=total_bytes,json=totalBytes,proto3" json:"total_bytes,omitempty"`
+	Error           string  `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"` // vacío si no hubo error
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ModelOperationResponse) Reset() {
+	*x = ModelOperationResponse{}
+	mi := &file_inference_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelOperationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelOperationResponse) ProtoMessage() {}
+
+func (x *ModelOperationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_inference_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelOperationResponse.ProtoReflect.Descriptor instead.
+func (*ModelOperationResponse) Descriptor() ([]byte, []int) {
+	return file_inference_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ModelOperationResponse) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *ModelOperationResponse) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *ModelOperationResponse) GetProgress() float32 {
+	if x != nil {
+		return x.Progress
+	}
+	return 0
+}
+
+func (x *ModelOperationResponse) GetBytesDownloaded() int64 {
+	if x != nil {
+		return x.BytesDownloaded
+	}
+	return 0
+}
+
+func (x *ModelOperationResponse) GetTotalBytes() int64 {
+	if x != nil {
+		return x.TotalBytes
+	}
+	return 0
+}
+
+func (x *ModelOperationResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+type DownloadModelRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`        // clave del catálogo (engines/base.py)
+	Cancel        bool                   `protobuf:"varint,2,opt,name=cancel,proto3" json:"cancel,omitempty"` // true = abortar la descarga en curso
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DownloadModelRequest) Reset() {
+	*x = DownloadModelRequest{}
+	mi := &file_inference_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DownloadModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DownloadModelRequest) ProtoMessage() {}
+
+func (x *DownloadModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_inference_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DownloadModelRequest.ProtoReflect.Descriptor instead.
+func (*DownloadModelRequest) Descriptor() ([]byte, []int) {
+	return file_inference_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DownloadModelRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *DownloadModelRequest) GetCancel() bool {
+	if x != nil {
+		return x.Cancel
+	}
+	return false
+}
+
+type DeleteModelRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteModelRequest) Reset() {
+	*x = DeleteModelRequest{}
+	mi := &file_inference_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteModelRequest) ProtoMessage() {}
+
+func (x *DeleteModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_inference_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteModelRequest.ProtoReflect.Descriptor instead.
+func (*DeleteModelRequest) Descriptor() ([]byte, []int) {
+	return file_inference_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DeleteModelRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+type GetModelStateRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"` // vacío = estado de todos los modelos
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetModelStateRequest) Reset() {
+	*x = GetModelStateRequest{}
+	mi := &file_inference_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetModelStateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetModelStateRequest) ProtoMessage() {}
+
+func (x *GetModelStateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_inference_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetModelStateRequest.ProtoReflect.Descriptor instead.
+func (*GetModelStateRequest) Descriptor() ([]byte, []int) {
+	return file_inference_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetModelStateRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+type GetModelStateResponse struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	States        []*ModelOperationResponse `protobuf:"bytes,1,rep,name=states,proto3" json:"states,omitempty"`
+	BytesOnDisk   int64                     `protobuf:"varint,2,opt,name=bytes_on_disk,json=bytesOnDisk,proto3" json:"bytes_on_disk,omitempty"` // peso total de los pesos descargados
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetModelStateResponse) Reset() {
+	*x = GetModelStateResponse{}
+	mi := &file_inference_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetModelStateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetModelStateResponse) ProtoMessage() {}
+
+func (x *GetModelStateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_inference_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetModelStateResponse.ProtoReflect.Descriptor instead.
+func (*GetModelStateResponse) Descriptor() ([]byte, []int) {
+	return file_inference_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetModelStateResponse) GetStates() []*ModelOperationResponse {
+	if x != nil {
+		return x.States
+	}
+	return nil
+}
+
+func (x *GetModelStateResponse) GetBytesOnDisk() int64 {
+	if x != nil {
+		return x.BytesOnDisk
+	}
+	return 0
+}
+
 type MediaGenerationRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	JobId          string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
@@ -262,7 +588,7 @@ type MediaGenerationRequest struct {
 
 func (x *MediaGenerationRequest) Reset() {
 	*x = MediaGenerationRequest{}
-	mi := &file_inference_proto_msgTypes[3]
+	mi := &file_inference_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -274,7 +600,7 @@ func (x *MediaGenerationRequest) String() string {
 func (*MediaGenerationRequest) ProtoMessage() {}
 
 func (x *MediaGenerationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[3]
+	mi := &file_inference_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -287,7 +613,7 @@ func (x *MediaGenerationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MediaGenerationRequest.ProtoReflect.Descriptor instead.
 func (*MediaGenerationRequest) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{3}
+	return file_inference_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MediaGenerationRequest) GetJobId() string {
@@ -392,7 +718,7 @@ type LoraConfig struct {
 
 func (x *LoraConfig) Reset() {
 	*x = LoraConfig{}
-	mi := &file_inference_proto_msgTypes[4]
+	mi := &file_inference_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -404,7 +730,7 @@ func (x *LoraConfig) String() string {
 func (*LoraConfig) ProtoMessage() {}
 
 func (x *LoraConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[4]
+	mi := &file_inference_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -417,7 +743,7 @@ func (x *LoraConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoraConfig.ProtoReflect.Descriptor instead.
 func (*LoraConfig) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{4}
+	return file_inference_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *LoraConfig) GetName() string {
@@ -458,7 +784,7 @@ type GenerationProgressResponse struct {
 
 func (x *GenerationProgressResponse) Reset() {
 	*x = GenerationProgressResponse{}
-	mi := &file_inference_proto_msgTypes[5]
+	mi := &file_inference_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -470,7 +796,7 @@ func (x *GenerationProgressResponse) String() string {
 func (*GenerationProgressResponse) ProtoMessage() {}
 
 func (x *GenerationProgressResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[5]
+	mi := &file_inference_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -483,7 +809,7 @@ func (x *GenerationProgressResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerationProgressResponse.ProtoReflect.Descriptor instead.
 func (*GenerationProgressResponse) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{5}
+	return file_inference_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GenerationProgressResponse) GetJobId() string {
@@ -558,7 +884,7 @@ type CancelRequest struct {
 
 func (x *CancelRequest) Reset() {
 	*x = CancelRequest{}
-	mi := &file_inference_proto_msgTypes[6]
+	mi := &file_inference_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -570,7 +896,7 @@ func (x *CancelRequest) String() string {
 func (*CancelRequest) ProtoMessage() {}
 
 func (x *CancelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[6]
+	mi := &file_inference_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -583,7 +909,7 @@ func (x *CancelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRequest.ProtoReflect.Descriptor instead.
 func (*CancelRequest) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{6}
+	return file_inference_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *CancelRequest) GetJobId() string {
@@ -603,7 +929,7 @@ type CancelResponse struct {
 
 func (x *CancelResponse) Reset() {
 	*x = CancelResponse{}
-	mi := &file_inference_proto_msgTypes[7]
+	mi := &file_inference_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +941,7 @@ func (x *CancelResponse) String() string {
 func (*CancelResponse) ProtoMessage() {}
 
 func (x *CancelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[7]
+	mi := &file_inference_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +954,7 @@ func (x *CancelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelResponse.ProtoReflect.Descriptor instead.
 func (*CancelResponse) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{7}
+	return file_inference_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CancelResponse) GetJobId() string {
@@ -656,7 +982,7 @@ type AudioTranscriptionRequest struct {
 
 func (x *AudioTranscriptionRequest) Reset() {
 	*x = AudioTranscriptionRequest{}
-	mi := &file_inference_proto_msgTypes[8]
+	mi := &file_inference_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -668,7 +994,7 @@ func (x *AudioTranscriptionRequest) String() string {
 func (*AudioTranscriptionRequest) ProtoMessage() {}
 
 func (x *AudioTranscriptionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[8]
+	mi := &file_inference_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -681,7 +1007,7 @@ func (x *AudioTranscriptionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AudioTranscriptionRequest.ProtoReflect.Descriptor instead.
 func (*AudioTranscriptionRequest) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{8}
+	return file_inference_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *AudioTranscriptionRequest) GetAudioPath() string {
@@ -716,7 +1042,7 @@ type TranscriptionResponse struct {
 
 func (x *TranscriptionResponse) Reset() {
 	*x = TranscriptionResponse{}
-	mi := &file_inference_proto_msgTypes[9]
+	mi := &file_inference_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -728,7 +1054,7 @@ func (x *TranscriptionResponse) String() string {
 func (*TranscriptionResponse) ProtoMessage() {}
 
 func (x *TranscriptionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[9]
+	mi := &file_inference_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -741,7 +1067,7 @@ func (x *TranscriptionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TranscriptionResponse.ProtoReflect.Descriptor instead.
 func (*TranscriptionResponse) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{9}
+	return file_inference_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *TranscriptionResponse) GetText() string {
@@ -777,7 +1103,7 @@ type AudioSegment struct {
 
 func (x *AudioSegment) Reset() {
 	*x = AudioSegment{}
-	mi := &file_inference_proto_msgTypes[10]
+	mi := &file_inference_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -789,7 +1115,7 @@ func (x *AudioSegment) String() string {
 func (*AudioSegment) ProtoMessage() {}
 
 func (x *AudioSegment) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[10]
+	mi := &file_inference_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -802,7 +1128,7 @@ func (x *AudioSegment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AudioSegment.ProtoReflect.Descriptor instead.
 func (*AudioSegment) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{10}
+	return file_inference_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *AudioSegment) GetStartTime() float32 {
@@ -844,7 +1170,7 @@ type PromptEnhanceRequest struct {
 
 func (x *PromptEnhanceRequest) Reset() {
 	*x = PromptEnhanceRequest{}
-	mi := &file_inference_proto_msgTypes[11]
+	mi := &file_inference_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -856,7 +1182,7 @@ func (x *PromptEnhanceRequest) String() string {
 func (*PromptEnhanceRequest) ProtoMessage() {}
 
 func (x *PromptEnhanceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[11]
+	mi := &file_inference_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -869,7 +1195,7 @@ func (x *PromptEnhanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromptEnhanceRequest.ProtoReflect.Descriptor instead.
 func (*PromptEnhanceRequest) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{11}
+	return file_inference_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PromptEnhanceRequest) GetRawPrompt() string {
@@ -903,7 +1229,7 @@ type PromptEnhanceResponse struct {
 
 func (x *PromptEnhanceResponse) Reset() {
 	*x = PromptEnhanceResponse{}
-	mi := &file_inference_proto_msgTypes[12]
+	mi := &file_inference_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -915,7 +1241,7 @@ func (x *PromptEnhanceResponse) String() string {
 func (*PromptEnhanceResponse) ProtoMessage() {}
 
 func (x *PromptEnhanceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[12]
+	mi := &file_inference_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -928,7 +1254,7 @@ func (x *PromptEnhanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromptEnhanceResponse.ProtoReflect.Descriptor instead.
 func (*PromptEnhanceResponse) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{12}
+	return file_inference_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PromptEnhanceResponse) GetEnhancedPrompt() string {
@@ -953,7 +1279,7 @@ type GpuTelemetryRequest struct {
 
 func (x *GpuTelemetryRequest) Reset() {
 	*x = GpuTelemetryRequest{}
-	mi := &file_inference_proto_msgTypes[13]
+	mi := &file_inference_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -965,7 +1291,7 @@ func (x *GpuTelemetryRequest) String() string {
 func (*GpuTelemetryRequest) ProtoMessage() {}
 
 func (x *GpuTelemetryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[13]
+	mi := &file_inference_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -978,7 +1304,7 @@ func (x *GpuTelemetryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GpuTelemetryRequest.ProtoReflect.Descriptor instead.
 func (*GpuTelemetryRequest) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{13}
+	return file_inference_proto_rawDescGZIP(), []int{18}
 }
 
 type GpuTelemetryResponse struct {
@@ -995,7 +1321,7 @@ type GpuTelemetryResponse struct {
 
 func (x *GpuTelemetryResponse) Reset() {
 	*x = GpuTelemetryResponse{}
-	mi := &file_inference_proto_msgTypes[14]
+	mi := &file_inference_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1007,7 +1333,7 @@ func (x *GpuTelemetryResponse) String() string {
 func (*GpuTelemetryResponse) ProtoMessage() {}
 
 func (x *GpuTelemetryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_inference_proto_msgTypes[14]
+	mi := &file_inference_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1020,7 +1346,7 @@ func (x *GpuTelemetryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GpuTelemetryResponse.ProtoReflect.Descriptor instead.
 func (*GpuTelemetryResponse) Descriptor() ([]byte, []int) {
-	return file_inference_proto_rawDescGZIP(), []int{14}
+	return file_inference_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GpuTelemetryResponse) GetDeviceName() string {
@@ -1070,7 +1396,7 @@ var File_inference_proto protoreflect.FileDescriptor
 const file_inference_proto_rawDesc = "" +
 	"\n" +
 	"\x0finference.proto\x12\x14maestro.inference.v1\"\x13\n" +
-	"\x11ListModelsRequest\"\x8a\x02\n" +
+	"\x11ListModelsRequest\"\xe2\x03\n" +
 	"\tModelInfo\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05label\x18\x02 \x01(\tR\x05label\x12\x12\n" +
@@ -1083,12 +1409,39 @@ const file_inference_proto_rawDesc = "" +
 	"\x06family\x18\t \x01(\tR\x06family\x12\x1c\n" +
 	"\tavailable\x18\n" +
 	" \x01(\bR\tavailable\x12\x14\n" +
-	"\x05notes\x18\v \x01(\tR\x05notes\"\x95\x01\n" +
+	"\x05notes\x18\v \x01(\tR\x05notes\x12\x1e\n" +
+	"\n" +
+	"downloaded\x18\f \x01(\bR\n" +
+	"downloaded\x12 \n" +
+	"\vdownloading\x18\r \x01(\bR\vdownloading\x12)\n" +
+	"\x10download_percent\x18\x0e \x01(\x02R\x0fdownloadPercent\x12\x1d\n" +
+	"\n" +
+	"size_bytes\x18\x0f \x01(\x03R\tsizeBytes\x12%\n" +
+	"\x0edownload_error\x18\x10 \x01(\tR\rdownloadError\x12#\n" +
+	"\rdownload_path\x18\x11 \x01(\tR\fdownloadPath\"\x95\x01\n" +
 	"\x12ListModelsResponse\x127\n" +
 	"\x06models\x18\x01 \x03(\v2\x1f.maestro.inference.v1.ModelInfoR\x06models\x12\x1f\n" +
 	"\vdevice_name\x18\x02 \x01(\tR\n" +
 	"deviceName\x12%\n" +
-	"\x0ecuda_available\x18\x03 \x01(\bR\rcudaAvailable\"\x81\x03\n" +
+	"\x0ecuda_available\x18\x03 \x01(\bR\rcudaAvailable\"\xbe\x01\n" +
+	"\x16ModelOperationResponse\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12\x1a\n" +
+	"\bprogress\x18\x03 \x01(\x02R\bprogress\x12)\n" +
+	"\x10bytes_downloaded\x18\x04 \x01(\x03R\x0fbytesDownloaded\x12\x1f\n" +
+	"\vtotal_bytes\x18\x05 \x01(\x03R\n" +
+	"totalBytes\x12\x14\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"@\n" +
+	"\x14DownloadModelRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x16\n" +
+	"\x06cancel\x18\x02 \x01(\bR\x06cancel\"&\n" +
+	"\x12DeleteModelRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\"(\n" +
+	"\x14GetModelStateRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\"\x81\x01\n" +
+	"\x15GetModelStateResponse\x12D\n" +
+	"\x06states\x18\x01 \x03(\v2,.maestro.inference.v1.ModelOperationResponseR\x06states\x12\"\n" +
+	"\rbytes_on_disk\x18\x02 \x01(\x03R\vbytesOnDisk\"\x81\x03\n" +
 	"\x16MediaGenerationRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\tR\x04mode\x12\x1d\n" +
@@ -1163,7 +1516,7 @@ const file_inference_proto_rawDesc = "" +
 	"\ffree_vram_mb\x18\x04 \x01(\x03R\n" +
 	"freeVramMb\x12'\n" +
 	"\x0fgpu_utilization\x18\x05 \x01(\x02R\x0egpuUtilization\x12#\n" +
-	"\rtemperature_c\x18\x06 \x01(\x02R\ftemperatureC2\x8a\x05\n" +
+	"\rtemperature_c\x18\x06 \x01(\x02R\ftemperatureC2\xc6\a\n" +
 	"\x10InferenceService\x12q\n" +
 	"\rGenerateMedia\x12,.maestro.inference.v1.MediaGenerationRequest\x1a0.maestro.inference.v1.GenerationProgressResponse0\x01\x12]\n" +
 	"\x10CancelGeneration\x12#.maestro.inference.v1.CancelRequest\x1a$.maestro.inference.v1.CancelResponse\x12o\n" +
@@ -1171,7 +1524,10 @@ const file_inference_proto_rawDesc = "" +
 	"\rEnhancePrompt\x12*.maestro.inference.v1.PromptEnhanceRequest\x1a+.maestro.inference.v1.PromptEnhanceResponse\x12h\n" +
 	"\x0fGetGpuTelemetry\x12).maestro.inference.v1.GpuTelemetryRequest\x1a*.maestro.inference.v1.GpuTelemetryResponse\x12_\n" +
 	"\n" +
-	"ListModels\x12'.maestro.inference.v1.ListModelsRequest\x1a(.maestro.inference.v1.ListModelsResponseB5Z3brain-master/backend/proto/inference/v1;inferencev1b\x06proto3"
+	"ListModels\x12'.maestro.inference.v1.ListModelsRequest\x1a(.maestro.inference.v1.ListModelsResponse\x12i\n" +
+	"\rDownloadModel\x12*.maestro.inference.v1.DownloadModelRequest\x1a,.maestro.inference.v1.ModelOperationResponse\x12e\n" +
+	"\vDeleteModel\x12(.maestro.inference.v1.DeleteModelRequest\x1a,.maestro.inference.v1.ModelOperationResponse\x12h\n" +
+	"\rGetModelState\x12*.maestro.inference.v1.GetModelStateRequest\x1a+.maestro.inference.v1.GetModelStateResponseB+Z)synapta/internal/worker/proto;inferencev1b\x06proto3"
 
 var (
 	file_inference_proto_rawDescOnce sync.Once
@@ -1185,45 +1541,57 @@ func file_inference_proto_rawDescGZIP() []byte {
 	return file_inference_proto_rawDescData
 }
 
-var file_inference_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_inference_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_inference_proto_goTypes = []any{
 	(*ListModelsRequest)(nil),          // 0: maestro.inference.v1.ListModelsRequest
 	(*ModelInfo)(nil),                  // 1: maestro.inference.v1.ModelInfo
 	(*ListModelsResponse)(nil),         // 2: maestro.inference.v1.ListModelsResponse
-	(*MediaGenerationRequest)(nil),     // 3: maestro.inference.v1.MediaGenerationRequest
-	(*LoraConfig)(nil),                 // 4: maestro.inference.v1.LoraConfig
-	(*GenerationProgressResponse)(nil), // 5: maestro.inference.v1.GenerationProgressResponse
-	(*CancelRequest)(nil),              // 6: maestro.inference.v1.CancelRequest
-	(*CancelResponse)(nil),             // 7: maestro.inference.v1.CancelResponse
-	(*AudioTranscriptionRequest)(nil),  // 8: maestro.inference.v1.AudioTranscriptionRequest
-	(*TranscriptionResponse)(nil),      // 9: maestro.inference.v1.TranscriptionResponse
-	(*AudioSegment)(nil),               // 10: maestro.inference.v1.AudioSegment
-	(*PromptEnhanceRequest)(nil),       // 11: maestro.inference.v1.PromptEnhanceRequest
-	(*PromptEnhanceResponse)(nil),      // 12: maestro.inference.v1.PromptEnhanceResponse
-	(*GpuTelemetryRequest)(nil),        // 13: maestro.inference.v1.GpuTelemetryRequest
-	(*GpuTelemetryResponse)(nil),       // 14: maestro.inference.v1.GpuTelemetryResponse
+	(*ModelOperationResponse)(nil),     // 3: maestro.inference.v1.ModelOperationResponse
+	(*DownloadModelRequest)(nil),       // 4: maestro.inference.v1.DownloadModelRequest
+	(*DeleteModelRequest)(nil),         // 5: maestro.inference.v1.DeleteModelRequest
+	(*GetModelStateRequest)(nil),       // 6: maestro.inference.v1.GetModelStateRequest
+	(*GetModelStateResponse)(nil),      // 7: maestro.inference.v1.GetModelStateResponse
+	(*MediaGenerationRequest)(nil),     // 8: maestro.inference.v1.MediaGenerationRequest
+	(*LoraConfig)(nil),                 // 9: maestro.inference.v1.LoraConfig
+	(*GenerationProgressResponse)(nil), // 10: maestro.inference.v1.GenerationProgressResponse
+	(*CancelRequest)(nil),              // 11: maestro.inference.v1.CancelRequest
+	(*CancelResponse)(nil),             // 12: maestro.inference.v1.CancelResponse
+	(*AudioTranscriptionRequest)(nil),  // 13: maestro.inference.v1.AudioTranscriptionRequest
+	(*TranscriptionResponse)(nil),      // 14: maestro.inference.v1.TranscriptionResponse
+	(*AudioSegment)(nil),               // 15: maestro.inference.v1.AudioSegment
+	(*PromptEnhanceRequest)(nil),       // 16: maestro.inference.v1.PromptEnhanceRequest
+	(*PromptEnhanceResponse)(nil),      // 17: maestro.inference.v1.PromptEnhanceResponse
+	(*GpuTelemetryRequest)(nil),        // 18: maestro.inference.v1.GpuTelemetryRequest
+	(*GpuTelemetryResponse)(nil),       // 19: maestro.inference.v1.GpuTelemetryResponse
 }
 var file_inference_proto_depIdxs = []int32{
 	1,  // 0: maestro.inference.v1.ListModelsResponse.models:type_name -> maestro.inference.v1.ModelInfo
-	4,  // 1: maestro.inference.v1.MediaGenerationRequest.loras:type_name -> maestro.inference.v1.LoraConfig
-	10, // 2: maestro.inference.v1.TranscriptionResponse.segments:type_name -> maestro.inference.v1.AudioSegment
-	3,  // 3: maestro.inference.v1.InferenceService.GenerateMedia:input_type -> maestro.inference.v1.MediaGenerationRequest
-	6,  // 4: maestro.inference.v1.InferenceService.CancelGeneration:input_type -> maestro.inference.v1.CancelRequest
-	8,  // 5: maestro.inference.v1.InferenceService.TranscribeAudio:input_type -> maestro.inference.v1.AudioTranscriptionRequest
-	11, // 6: maestro.inference.v1.InferenceService.EnhancePrompt:input_type -> maestro.inference.v1.PromptEnhanceRequest
-	13, // 7: maestro.inference.v1.InferenceService.GetGpuTelemetry:input_type -> maestro.inference.v1.GpuTelemetryRequest
-	0,  // 8: maestro.inference.v1.InferenceService.ListModels:input_type -> maestro.inference.v1.ListModelsRequest
-	5,  // 9: maestro.inference.v1.InferenceService.GenerateMedia:output_type -> maestro.inference.v1.GenerationProgressResponse
-	7,  // 10: maestro.inference.v1.InferenceService.CancelGeneration:output_type -> maestro.inference.v1.CancelResponse
-	9,  // 11: maestro.inference.v1.InferenceService.TranscribeAudio:output_type -> maestro.inference.v1.TranscriptionResponse
-	12, // 12: maestro.inference.v1.InferenceService.EnhancePrompt:output_type -> maestro.inference.v1.PromptEnhanceResponse
-	14, // 13: maestro.inference.v1.InferenceService.GetGpuTelemetry:output_type -> maestro.inference.v1.GpuTelemetryResponse
-	2,  // 14: maestro.inference.v1.InferenceService.ListModels:output_type -> maestro.inference.v1.ListModelsResponse
-	9,  // [9:15] is the sub-list for method output_type
-	3,  // [3:9] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	3,  // 1: maestro.inference.v1.GetModelStateResponse.states:type_name -> maestro.inference.v1.ModelOperationResponse
+	9,  // 2: maestro.inference.v1.MediaGenerationRequest.loras:type_name -> maestro.inference.v1.LoraConfig
+	15, // 3: maestro.inference.v1.TranscriptionResponse.segments:type_name -> maestro.inference.v1.AudioSegment
+	8,  // 4: maestro.inference.v1.InferenceService.GenerateMedia:input_type -> maestro.inference.v1.MediaGenerationRequest
+	11, // 5: maestro.inference.v1.InferenceService.CancelGeneration:input_type -> maestro.inference.v1.CancelRequest
+	13, // 6: maestro.inference.v1.InferenceService.TranscribeAudio:input_type -> maestro.inference.v1.AudioTranscriptionRequest
+	16, // 7: maestro.inference.v1.InferenceService.EnhancePrompt:input_type -> maestro.inference.v1.PromptEnhanceRequest
+	18, // 8: maestro.inference.v1.InferenceService.GetGpuTelemetry:input_type -> maestro.inference.v1.GpuTelemetryRequest
+	0,  // 9: maestro.inference.v1.InferenceService.ListModels:input_type -> maestro.inference.v1.ListModelsRequest
+	4,  // 10: maestro.inference.v1.InferenceService.DownloadModel:input_type -> maestro.inference.v1.DownloadModelRequest
+	5,  // 11: maestro.inference.v1.InferenceService.DeleteModel:input_type -> maestro.inference.v1.DeleteModelRequest
+	6,  // 12: maestro.inference.v1.InferenceService.GetModelState:input_type -> maestro.inference.v1.GetModelStateRequest
+	10, // 13: maestro.inference.v1.InferenceService.GenerateMedia:output_type -> maestro.inference.v1.GenerationProgressResponse
+	12, // 14: maestro.inference.v1.InferenceService.CancelGeneration:output_type -> maestro.inference.v1.CancelResponse
+	14, // 15: maestro.inference.v1.InferenceService.TranscribeAudio:output_type -> maestro.inference.v1.TranscriptionResponse
+	17, // 16: maestro.inference.v1.InferenceService.EnhancePrompt:output_type -> maestro.inference.v1.PromptEnhanceResponse
+	19, // 17: maestro.inference.v1.InferenceService.GetGpuTelemetry:output_type -> maestro.inference.v1.GpuTelemetryResponse
+	2,  // 18: maestro.inference.v1.InferenceService.ListModels:output_type -> maestro.inference.v1.ListModelsResponse
+	3,  // 19: maestro.inference.v1.InferenceService.DownloadModel:output_type -> maestro.inference.v1.ModelOperationResponse
+	3,  // 20: maestro.inference.v1.InferenceService.DeleteModel:output_type -> maestro.inference.v1.ModelOperationResponse
+	7,  // 21: maestro.inference.v1.InferenceService.GetModelState:output_type -> maestro.inference.v1.GetModelStateResponse
+	13, // [13:22] is the sub-list for method output_type
+	4,  // [4:13] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_inference_proto_init() }
@@ -1237,7 +1605,7 @@ func file_inference_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_inference_proto_rawDesc), len(file_inference_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   15,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

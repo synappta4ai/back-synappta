@@ -1,0 +1,38 @@
+// 1. Recibir datos de OpenTelemetry (Faro)
+otelcol.receiver.otlp "faro" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  output {
+    metrics = [otelcol.exporter.prometheus.faro_metrics.input]
+    logs    = [otelcol.exporter.loki.faro_logs.input]
+  }
+}
+
+// 2. Puente para Métricas: OTLP -> Prometheus
+otelcol.exporter.prometheus "faro_metrics" {
+  forward_to = [prometheus.remote_write.local_prometheus.receiver]
+}
+
+// 3. Puente para Logs: OTLP -> Loki
+otelcol.exporter.loki "faro_logs" {
+  forward_to = [loki.write.local_loki.receiver]
+}
+
+// 4. Destino Final: Prometheus
+prometheus.remote_write "local_prometheus" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
+
+// 5. Destino Final: Loki
+loki.write "local_loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

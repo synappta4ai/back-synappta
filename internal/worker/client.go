@@ -1,5 +1,5 @@
-// Package worker is the stateless gRPC client for the brain-master
-// inference worker (Python).
+// Package worker is the stateless gRPC client for the inference worker
+// (Python, repo `inference-worker`).
 //
 // Stateless by design — "nothing cached":
 //   - No persistent connection is kept. Every call dials the worker, runs the
@@ -107,6 +107,69 @@ func (c *Client) GpuTelemetry(ctx context.Context, addr string) (*inferencev1.Gp
 	return resp, nil
 }
 
+// DownloadModel starts (or cancels, when cancel is true) a background weight
+// download on the worker. The call returns immediately with the model's
+// current operation state; callers poll GetModelState for progress.
+func (c *Client) DownloadModel(ctx context.Context, addr, key string, cancel bool) (*inferencev1.ModelOperationResponse, error) {
+	ctx, stop := context.WithTimeout(ctx, DefaultTimeout)
+	defer stop()
+
+	var resp *inferencev1.ModelOperationResponse
+	err := c.call(ctx, addr, func(api inferencev1.InferenceServiceClient) error {
+		out, err := api.DownloadModel(ctx, &inferencev1.DownloadModelRequest{Key: key, Cancel: cancel})
+		if err != nil {
+			return fmt.Errorf("DownloadModel: %w", err)
+		}
+		resp = out
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// DeleteModel removes a model's weights from the worker disk.
+func (c *Client) DeleteModel(ctx context.Context, addr, key string) (*inferencev1.ModelOperationResponse, error) {
+	ctx, stop := context.WithTimeout(ctx, DefaultTimeout)
+	defer stop()
+
+	var resp *inferencev1.ModelOperationResponse
+	err := c.call(ctx, addr, func(api inferencev1.InferenceServiceClient) error {
+		out, err := api.DeleteModel(ctx, &inferencev1.DeleteModelRequest{Key: key})
+		if err != nil {
+			return fmt.Errorf("DeleteModel: %w", err)
+		}
+		resp = out
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetModelState returns download/availability state for one model, or for the
+// whole worker catalog when key is empty. No copy is kept on the Synapta side.
+func (c *Client) GetModelState(ctx context.Context, addr, key string) (*inferencev1.GetModelStateResponse, error) {
+	ctx, stop := context.WithTimeout(ctx, DefaultTimeout)
+	defer stop()
+
+	var resp *inferencev1.GetModelStateResponse
+	err := c.call(ctx, addr, func(api inferencev1.InferenceServiceClient) error {
+		out, err := api.GetModelState(ctx, &inferencev1.GetModelStateRequest{Key: key})
+		if err != nil {
+			return fmt.Errorf("GetModelState: %w", err)
+		}
+		resp = out
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 // Ping probes the worker cheaply (telemetry RPC) to report reachability.
 func (c *Client) Ping(ctx context.Context, addr string) error {
 	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
@@ -119,10 +182,10 @@ func (c *Client) Ping(ctx context.Context, addr string) error {
 
 // StreamEvent is one progress event of a GenerateMedia stream.
 type StreamEvent struct {
-	Percent   float64
-	Status    string // LOADING_MODEL | GENERATING | POSTPROCESSING | COMPLETED | FAILED | CANCELLED
+	Percent    float64
+	Status     string // LOADING_MODEL | GENERATING | POSTPROCESSING | COMPLETED | FAILED | CANCELLED
 	OutputPath string // worker-side artifact path (set on COMPLETED)
-	ErrMsg    string
+	ErrMsg     string
 }
 
 // Terminal reports whether the event ends the generation stream.

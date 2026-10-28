@@ -30,8 +30,8 @@ const (
 
 // ModelType distinguishes how a model is served:
 //   - "api": external provider HTTP API (per-tenant credentials).
-//   - "downloaded": weights executed by the brain-master inference worker
-//     (gRPC). Listed live from the worker; never cached by Synapta.
+//   - "downloaded": weights executed by the inference worker (gRPC). Listed
+//     live from the worker; never cached by Synapta.
 type ModelType string
 
 const (
@@ -79,14 +79,42 @@ type Model struct {
 	// GallerySync: uploads reference files to the BytePlus asset library
 	// before generation and references them as asset://<id>.
 	GallerySync bool `json:"gallery_sync"`
+	// MaxReferences is how many input reference images the model accepts.
+	// Zero means the model is text-only (or the capability is unknown), so
+	// tools that depend on reference images can filter it out.
+	MaxReferences int `json:"max_references,omitempty"`
+	// Reasoning reports that a text model accepts reasoning controls. The
+	// agency "brain" only offers text models with this flag, so image/video
+	// generators and plain chat models never leak into that picker.
+	Reasoning bool `json:"reasoning,omitempty"`
+	// InputModalities lists what a text model can read besides text (image,
+	// video, audio, file), as the provider declares it. Empty when unknown.
+	InputModalities []string `json:"input_modalities,omitempty"`
 	// DisplayName for UIs.
 	DisplayName string `json:"display_name"`
+	// Recommended marks the platform-curated efficient models (master pref).
+	Recommended bool `json:"recommended,omitempty"`
+	// RecommendTags holds the master's recommendation labels (empty when
+	// not recommended).
+	RecommendTags []string `json:"recommend_tags,omitempty"`
+	// Favorite marks a master or tenant favorite: it sorts first in listings.
+	Favorite bool `json:"favorite,omitempty"`
 	// Defaults the UI can offer (ratios, resolutions, durations).
 	Defaults Defaults `json:"defaults"`
+	// WorkerID identifies the paired GPU that reported this entry when the
+	// catalog comes from bridge snapshots. Empty for central/live entries:
+	// there the worker is the back's own, addressed by BM_WORKER_ADDR.
+	WorkerID string `json:"worker_id,omitempty"`
+	// WorkerName is that GPU's display name, so the UI can say where a
+	// download will run.
+	WorkerName string `json:"worker_name,omitempty"`
+	// WorkerVersion is the bridge agent version behind the snapshot: the UI
+	// can spot a stale agent still reporting an old catalog.
+	WorkerVersion string `json:"worker_version,omitempty"`
 }
 
-// DownloadedModel describes a model whose weights run on the brain-master
-// inference worker. Every field is reported live by the worker's ListModels
+// DownloadedModel describes a model whose weights run on the inference
+// worker. Every field is reported live by the worker's ListModels
 // RPC; Synapta never persists or caches it.
 type DownloadedModel struct {
 	// Mode as the worker reports it: image | video | tts | audio.
@@ -104,8 +132,26 @@ type DownloadedModel struct {
 	// Family groups related models (sd, sdxl, wan, ...).
 	Family string `json:"family,omitempty"`
 	// Available: false when the worker lists the model but cannot run it
-	// (e.g. V1 bridge volume not mounted).
+	// (missing provider configuration, weights not downloaded, or an
+	// unmounted external volume).
 	Available bool `json:"available"`
+	// Downloaded reports complete weights on disk. It is what the panel uses
+	// to offer "delete weights" instead of "download"; Available is not the
+	// same question (a mounted-volume or engine check can differ).
+	Downloaded bool `json:"downloaded"`
+	// Downloading reports an in-progress background weights download.
+	Downloading bool `json:"downloading"`
+	// DownloadPercent is the live 0-100 progress of that download.
+	DownloadPercent float32 `json:"download_percent"`
+	// SizeBytes is the on-disk weight size when downloaded (0 otherwise).
+	SizeBytes int64 `json:"size_bytes"`
+	// DownloadError carries the last download failure, if any.
+	DownloadError string `json:"download_error,omitempty"`
+	// DownloadPath is the absolute path the worker reports for the weights
+	// on its own disk. Empty when it has no weights folder (or an older
+	// worker that predates the field). Never rewritten here: the path means
+	// nothing on the back's filesystem.
+	DownloadPath string `json:"download_path,omitempty"`
 	// Notes from the worker catalog.
 	Notes string `json:"notes,omitempty"`
 }
@@ -160,12 +206,97 @@ var catalog = []Model{
 	},
 
 	// ─── Image ────────────────────────────────────────────────
+	// Order matters: the front resolves "Automático" to the first image
+	// model of this list, so Higgsfield (single API key) comes before
+	// BytePlus/Google ones. Curated additions — Endpoint IDs verified
+	// against docs.higgsfield.ai.
+	{
+		Name: "higgsfield-soul-2-standard", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/higgsfield-ai/soul/v2/standard",
+		DisplayName: "Soul 2",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
+			// The standard tier only accepts 720p/1080p (the provider rejects
+			// 2K/4K here with "resolution: '2K' is not one of [...]").
+			Resolutions: []string{"720p", "1080p"},
+		},
+	},
+	{
+		Name: "higgsfield-ideogram-4-0", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:       "https://api.higgsfield.ai",
+		Endpoint:      "/ideogram/v4.0",
+		DisplayName:   "Ideogram 4.0",
+		MaxReferences: 1,
+		Defaults: Defaults{
+			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
+			Resolutions: nil, // no resolution tier: rendering_speed-driven
+		},
+	},
+	{
+		Name: "higgsfield-recraft-4-1", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/recraft/v4.1/text-to-image",
+		DisplayName: "Recraft 4.1",
+		Defaults: Defaults{
+			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
+			Resolutions: []string{"1K"},
+		},
+	},
+	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai
+	// and the official JS/Python SDK examples (2026-10). They share the
+	// generic payload (prompt + aspect_ratio); the generator adds
+	// family-specific fields only for soul/ideogram/recraft.
+	{
+		Name: "higgsfield-flux-kontext-max", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/flux-pro/kontext/max/text-to-image",
+		DisplayName: "Flux Kontext Max",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"},
+		},
+	},
+	{
+		Name: "higgsfield-seedream-4-0", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/bytedance/seedream/v4/text-to-image",
+		DisplayName: "Seedream 4.0",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"},
+		},
+	},
+	{
+		Name: "higgsfield-marketing-studio", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/marketing-studio/image",
+		DisplayName: "Marketing Studio Image",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
+		},
+	},
+	{
+		Name: "higgsfield-marketing-sunburst", Modality: ModalityImage,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:     "https://api.higgsfield.ai",
+		Endpoint:    "/marketing-studio/image/sunburst",
+		DisplayName: "Marketing Studio Sunburst",
+		Defaults: Defaults{
+			Ratios: []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
+		},
+	},
 	{
 		Name: "dola-seedream-5-0-pro-260628", Modality: ModalityImage,
 		Generator: "seedream", CredentialProvider: ProviderBytePlus,
-		BaseURL:     "https://ark.ap-southeast.bytepluses.com/api/v3",
-		Endpoint:    "/images/generations",
-		DisplayName: "Dola Seedream 5.0 Pro",
+		BaseURL:       "https://ark.ap-southeast.bytepluses.com/api/v3",
+		Endpoint:      "/images/generations",
+		DisplayName:   "Dola Seedream 5.0 Pro",
+		MaxReferences: 10,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p", "2K"},
@@ -174,9 +305,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-nano-banana", Modality: ModalityImage,
 		Generator: "gemini-nano", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-nano-banana:generateContent",
-		DisplayName: "Gemini Nano Banana",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-nano-banana:generateContent",
+		DisplayName:   "Gemini Nano Banana",
+		MaxReferences: 3,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},
@@ -185,9 +317,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-3-pro-image-preview", Modality: ModalityImage,
 		Generator: "gemini-nano-pro", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-3-pro-image-preview:generateContent",
-		DisplayName: "Gemini 3 Pro Image",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-3-pro-image-preview:generateContent",
+		DisplayName:   "Gemini 3 Pro Image",
+		MaxReferences: 14,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},
@@ -196,9 +329,10 @@ var catalog = []Model{
 	{
 		Name: "gemini-3.1-flash-image-preview", Modality: ModalityImage,
 		Generator: "gemini-nano", CredentialProvider: ProviderGemini,
-		BaseURL:     "https://generativelanguage.googleapis.com",
-		Endpoint:    "/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
-		DisplayName: "Gemini 3.1 Flash Image",
+		BaseURL:       "https://generativelanguage.googleapis.com",
+		Endpoint:      "/v1beta/models/gemini-3.1-flash-image-preview:generateContent",
+		DisplayName:   "Gemini 3.1 Flash Image",
+		MaxReferences: 14,
 		Defaults: Defaults{
 			Ratios:      []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4"},
 			Resolutions: []string{"1K", "2K", "4K"},
@@ -212,6 +346,7 @@ var catalog = []Model{
 		BaseURL:     "https://api.anthropic.com",
 		Endpoint:    "/v1/messages",
 		DisplayName: "Claude Text",
+		Reasoning:   true,
 	},
 
 	// ─── Video (Higgsfield) ──────────────────────────────────
@@ -230,9 +365,10 @@ var catalog = []Model{
 	{
 		Name: "higgsfield-wan-2-6-reference", Modality: ModalityVideo,
 		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/wan/v2.6/reference-to-video",
-		DisplayName: "Wan 2.6 Reference",
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/wan/v2.6/reference-to-video",
+		ReferenceEndpoint: "/wan/v2.6/reference-to-video",
+		DisplayName:       "Wan 2.6 Reference",
 		Defaults: Defaults{
 			Ratios:      []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p"},
@@ -266,6 +402,22 @@ var catalog = []Model{
 		DisplayName:       "Seedance 2.5 (Imagen a Video)",
 		Defaults: Defaults{
 			Ratios:      nil, // framing follows the input image
+			Resolutions: []string{"480p", "720p"},
+			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
+		},
+	},
+	// Seedance 2.5 multi-reference: images, audio and video ride together as
+	// ingredients (image_urls / audio_urls / video_urls) and aspect_ratio is
+	// honoured. VideoMachine's default model.
+	{
+		Name: "higgsfield-seedance-2-5-reference", Modality: ModalityVideo,
+		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
+		BaseURL:           "https://api.higgsfield.ai",
+		Endpoint:          "/bytedance/seedance-2.5/reference-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+		DisplayName:       "Seedance 2.5 (Referencias)",
+		Defaults: Defaults{
+			Ratios:      []string{"9:16", "16:9", "4:3", "1:1", "3:4", "21:9"},
 			Resolutions: []string{"480p", "720p"},
 			Durations:   []int{4, 5, 8, 10, 15, 20, 25, 30},
 		},
@@ -304,42 +456,6 @@ var catalog = []Model{
 			Ratios:      []string{"16:9", "9:16", "1:1", "4:3", "3:4"},
 			Resolutions: []string{"720p", "1080p"},
 			Durations:   []int{3, 5, 8, 10, 15},
-		},
-	},
-
-	// ─── Image (Higgsfield) ──────────────────────────────
-	// Curated additions — Endpoint IDs verified against docs.higgsfield.ai.
-	{
-		Name: "higgsfield-soul-2-standard", Modality: ModalityImage,
-		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/higgsfield-ai/soul/v2/standard",
-		DisplayName: "Soul 2",
-		Defaults: Defaults{
-			Ratios:      []string{"1:1", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9"},
-			Resolutions: []string{"2K", "4K"},
-		},
-	},
-	{
-		Name: "higgsfield-ideogram-4-0", Modality: ModalityImage,
-		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/ideogram/v4.0",
-		DisplayName: "Ideogram 4.0",
-		Defaults: Defaults{
-			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
-			Resolutions: nil, // no resolution tier: rendering_speed-driven
-		},
-	},
-	{
-		Name: "higgsfield-recraft-4-1", Modality: ModalityImage,
-		Generator: "higgsfield", CredentialProvider: ProviderHiggsfield,
-		BaseURL:     "https://api.higgsfield.ai",
-		Endpoint:    "/recraft/v4.1/text-to-image",
-		DisplayName: "Recraft 4.1",
-		Defaults: Defaults{
-			Ratios:      []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5"},
-			Resolutions: []string{"1K"},
 		},
 	},
 }

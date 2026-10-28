@@ -11,6 +11,8 @@ package agency
 import (
 	"fmt"
 	"strings"
+
+	"synapta/internal/modules/model"
 )
 
 // ─── Unified payload types ──────────────────────────────────────
@@ -53,6 +55,11 @@ type GenerateRequest struct {
 	UserID           int    `json:"user_id"`
 	// ResourceType — lo setea cada dominio (video/image/audio/text) automáticamente.
 	ResourceType string `json:"-"`
+	// WorkerAddr es la dirección del inference worker de este usuario para
+	// modelos "downloaded". Si va vacío, el back usa BM_WORKER_ADDR global
+	// (el único del deploy). Cada usuario puede apuntar a su propio worker
+	// local sin que haya que quemar IPs en los env.
+	WorkerAddr string `json:"worker_addr,omitempty"`
 }
 
 // OutputResource represents a single generated output (video, image, audio, text).
@@ -122,7 +129,12 @@ type VideoMetadata struct {
 
 // GeneratorRequest is the unified request payload for the generator pipeline.
 type GeneratorRequest struct {
-	Model         string
+	Model string
+	// Modality is the resolved catalog modality of Model (image | video | …).
+	// El generator de modelos descargados la usa para despachar el modo
+	// correcto al worker: sin ella una imagen de una GPU emparejada viajaba
+	// como video.
+	Modality      model.Modality
 	Content       []ContentItem
 	Ratio         string
 	Duration      int
@@ -152,6 +164,9 @@ type GeneratorRequest struct {
 	// carries more than one reference, which the single-image i2v route cannot
 	// express.
 	ReferenceEndpoint string
+	// WorkerAddr es la dirección del inference worker para modelos descargados.
+	// Si va vacío, el generator usa su dirección global (BM_WORKER_ADDR).
+	WorkerAddr string
 }
 
 // GeneratorResult is the response returned by a generator.
@@ -200,6 +215,14 @@ type CostCalculator interface {
 // SetPushNotifier so the core can alert a user when an async task completes.
 type PushNotifier interface {
 	SendToUser(userID int64, title, body string, data map[string]string)
+}
+
+// OutputPublisher stores a generated artifact in the tenant's own storage and
+// returns its public URL. stored=false means no bucket is configured (or the
+// upload failed): the caller keeps the bytes on local disk, so the bucket stays
+// optional, just like uploads.
+type OutputPublisher interface {
+	StoreOutput(relPath string, data []byte, contentType string) (url string, stored bool)
 }
 
 // GenerationSaver persists completed generation outputs to the piece's

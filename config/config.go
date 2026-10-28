@@ -32,10 +32,27 @@ type Config struct {
 	EncryptionKey       string // 32-byte key for credential encryption at rest
 	OutputsDir          string
 
-	// Inference worker (brain-master Python gRPC server) for downloaded
-	// models. Empty disables the downloaded-model side of the catalog.
+	// MaxUploadBytes caps direct uploads. Advisory for the PUT itself (S3
+	// ignores size on a plain presigned PUT) but the presign call rejects
+	// larger requests up front. Buckets are configured per tenant in the
+	// database (storage_config), never here: a tenant without one keeps
+	// storing files on local disk.
+	MaxUploadBytes int64
+	// StorageAllowPrivateEndpoints lets tenant bucket endpoints point at
+	// loopback/private addresses. Off by default: tenant admins supply those
+	// URLs and the server connects to them, so a private target would be an
+	// SSRF probe into the internal network. Development MinIO needs `true`.
+	StorageAllowPrivateEndpoints bool
+
+	// Inference worker (inference-worker repo, Python gRPC server) for
+	// downloaded models. Empty disables the downloaded-model side of the
+	// catalog.
 	WorkerAddr           string
 	WorkerTimeoutSeconds int
+
+	// Base URL del artifact server del worker (BM_WORKER_ARTIFACT_BASE),
+	// usado para listar y borrar artefactos (videos/imágenes generados).
+	WorkerArtifactBase string
 
 	// AgentServerURL is the standalone DCS Agent server (Inmobiliaria /
 	// Cine workflows) that the /agent/chat endpoint proxies to.
@@ -126,6 +143,13 @@ func Load() *Config {
 
 	outputsDir := getEnv("OUTPUTS_DIR", "./outputs")
 
+	maxUploadBytes := int64(10 << 20)
+	if v := os.Getenv("MAX_UPLOAD_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxUploadBytes = n
+		}
+	}
+
 	visionThumbnailSize := 1024
 	if v := os.Getenv("VISION_THUMBNAIL_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -196,8 +220,12 @@ func Load() *Config {
 		EncryptionKey: encryptionKey,
 		OutputsDir:    outputsDir,
 
+		MaxUploadBytes:               maxUploadBytes,
+		StorageAllowPrivateEndpoints: os.Getenv("STORAGE_ALLOW_PRIVATE_ENDPOINTS") == "true",
+
 		WorkerAddr:           strings.TrimSpace(os.Getenv("BM_WORKER_ADDR")),
 		WorkerTimeoutSeconds: workerTimeout,
+		WorkerArtifactBase:   strings.TrimRight(os.Getenv("BM_WORKER_ARTIFACT_BASE"), "/"),
 
 		AgentServerURL: getEnv("AGENT_SERVER_URL", "http://localhost:3200"),
 

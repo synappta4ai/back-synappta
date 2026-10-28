@@ -218,3 +218,52 @@ func TestHiggsfieldMatch(t *testing.T) {
 		t.Fatal("should not match seedance")
 	}
 }
+
+func TestHiggsfieldReferenceModelKeepsAspectAndAudio(t *testing.T) {
+	g := NewHiggsfieldGenerator()
+	req := &agency.GeneratorRequest{
+		Model: "higgsfield-seedance-2-5-reference",
+		Content: []agency.ContentItem{
+			{Type: "text", Text: "producto"},
+			{Type: "image", DataURL: "https://example.com/a.jpg"},
+			{Type: "audio", DataURL: "https://example.com/a.mp3"},
+		},
+		Ratio:             "9:16",
+		Endpoint:          "/bytedance/seedance-2.5/reference-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+	}
+	p := g.BuildPayload(req)
+	if arr, ok := p["image_urls"].([]string); !ok || len(arr) != 1 {
+		t.Fatalf("a single image still rides image_urls on the reference route: %v", p)
+	}
+	if arr, ok := p["audio_urls"].([]string); !ok || len(arr) != 1 {
+		t.Fatalf("audio_urls: %v", p["audio_urls"])
+	}
+	if p["aspect_ratio"] != "9:16" {
+		t.Fatalf("aspect_ratio must be kept: %v", p["aspect_ratio"])
+	}
+}
+
+func TestHiggsfieldI2VWithManyRefsUsesReferenceRoute(t *testing.T) {
+	g := NewHiggsfieldGenerator()
+	req := &agency.GeneratorRequest{
+		Model: "higgsfield-seedance-2-5-i2v",
+		Content: []agency.ContentItem{
+			{Type: "image", DataURL: "https://example.com/a.jpg"},
+			{Type: "image", DataURL: "https://example.com/b.jpg"},
+		},
+		Ratio:             "9:16",
+		Endpoint:          "/bytedance/seedance-2.5/image-to-video",
+		ReferenceEndpoint: "/bytedance/seedance-2.5/reference-to-video",
+	}
+	p := g.BuildPayload(req)
+	if req.Endpoint != "/bytedance/seedance-2.5/reference-to-video" {
+		t.Fatalf("endpoint: %s", req.Endpoint)
+	}
+	if arr, ok := p["image_urls"].([]string); !ok || len(arr) != 2 {
+		t.Fatalf("image_urls: %v", p["image_urls"])
+	}
+	if p["aspect_ratio"] != "9:16" {
+		t.Fatalf("aspect_ratio: %v", p["aspect_ratio"])
+	}
+}

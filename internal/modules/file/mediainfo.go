@@ -16,15 +16,20 @@ func ReadMediaDuration(path string) float64 {
 		return 0
 	}
 	defer f.Close()
+	return MediaDuration(f, path)
+}
 
-	ext := strings.ToLower(path)
+// MediaDuration is ReadMediaDuration over an in-memory / remote stream, so the
+// upload path can compute it without materializing the file on disk.
+func MediaDuration(r io.ReadSeeker, filename string) float64 {
+	ext := strings.ToLower(filename)
 	switch {
 	case strings.HasSuffix(ext, ".mp4"), strings.HasSuffix(ext, ".mov"), strings.HasSuffix(ext, ".m4v"):
-		return readMP4Duration(f)
+		return readMP4Duration(r)
 	case strings.HasSuffix(ext, ".wav"):
-		return readWAVDuration(f)
+		return readWAVDuration(r)
 	case strings.HasSuffix(ext, ".mp3"):
-		return readMP3Duration(f)
+		return readMP3Duration(r)
 	}
 	return 0
 }

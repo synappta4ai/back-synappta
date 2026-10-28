@@ -1,54 +1,21 @@
 package credential
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
+	"synapta/internal/secretbox"
 )
 
 // encrypt seals plaintext with AES-256-GCM using the 32-byte key.
 func encrypt(key, plaintext []byte) (string, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("failed to create cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("failed to create GCM: %w", err)
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", fmt.Errorf("failed to read nonce: %w", err)
-	}
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return secretbox.Seal(key, string(plaintext))
 }
 
 // decrypt opens a base64 AES-256-GCM sealed value.
 func decrypt(key []byte, sealed string) ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(sealed)
+	plain, err := secretbox.Open(key, sealed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode sealed value: %w", err)
+		return nil, err
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-	if len(data) < gcm.NonceSize() {
-		return nil, fmt.Errorf("sealed value too short")
-	}
-	nonce, ciphertext := data[:gcm.NonceSize()], data[gcm.NonceSize():]
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt: %w", err)
-	}
-	return plaintext, nil
+	return []byte(plain), nil
 }
 
 // mask returns a masked representation of a secret for API responses.

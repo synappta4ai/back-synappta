@@ -3,16 +3,19 @@
 package tenant
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"synapta/internal/modules/credential"
+	"synapta/internal/modules/file"
 	"synapta/internal/modules/model"
 	"synapta/internal/tenancy"
 	"synapta/internal/utils"
@@ -128,6 +131,10 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 	}
 
 	configured := map[string]bool{}
+	// localEndpoints holds the base URL of every local OpenAI-compatible
+	// server the tenant configured: their models are not in the static
+	// catalog and have to be read live, same as the public listing.
+	localEndpoints := map[string]string{}
 	if pool, err := s.reg.Pool(t.Slug); err == nil {
 		rows, err := pool.Query(`SELECT DISTINCT provider FROM credentials`)
 		if err == nil {
@@ -139,6 +146,14 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 			}
 			rows.Close()
 		}
+		for _, provider := range []string{credential.ProviderOllama, credential.ProviderLMStudio} {
+			var baseURL string
+			err := pool.QueryRow(`SELECT COALESCE(base_url,'') FROM credentials WHERE provider = $1`, provider).Scan(&baseURL)
+			if err != nil {
+				continue // no credential for this provider
+			}
+			localEndpoints[provider] = baseURL
+		}
 		// A missing/failing read only means "nothing configured".
 	}
 
@@ -149,6 +164,30 @@ func (s *Service) ModelsForTenant(id int64) ([]TenantModelView, error) {
 			Model:                m,
 			CredentialConfigured: configured[string(m.CredentialProvider)],
 		})
+	}
+	// Local models: whatever the tenant's servers report right now. A stopped
+	// server contributes nothing, so the admin view never invents entries.
+	for provider, baseURL := range localEndpoints {
+		discovered, derr := model.DiscoverLocalModels(context.Background(), model.CredentialProvider(provider), baseURL)
+		if derr != nil {
+			log.Printf("[tenant] local catalog %s unavailable: %v", provider, derr)
+			continue
+		}
+		for _, m := range discovered {
+			out = append(out, TenantModelView{Model: m, CredentialConfigured: true})
+		}
+	}
+	// Hosted inference clouds: the admin view lists the same discovered models
+	// the public catalog offers, so the panel can show the credential as
+	// configured and let ops pick a model that actually runs.
+	if store, err := s.credentialStore(t); err != nil {
+		log.Printf("[tenant] credential store for %q: %v", t.Slug, err)
+	} else if endpoints, err := store.InferenceEndpoints(); err != nil {
+		log.Printf("[tenant] inference endpoints for %q: %v", t.Slug, err)
+	} else {
+		for _, m := range model.DiscoverAllInferenceModels(context.Background(), endpoints) {
+			out = append(out, TenantModelView{Model: m, CredentialConfigured: true})
+		}
 	}
 	return out, nil
 }
@@ -345,6 +384,101 @@ func parseTenantID(c *gin.Context) (int64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// ─── Per-tenant object storage (platform superadmin) ────────────
+
+// StorageAdmin is the tenant-bucket surface the platform endpoints need. It is
+// implemented by the tenant's file handler so the same service, encryption key
+// and probe are used as in /files/storage.
+type StorageAdmin interface {
+	StorageConfigForAdmin() (*file.StorageConfig, error)
+	SaveStorageConfigForAdmin(file.StorageConfigRequest) (*file.StorageConfig, error)
+	DeleteStorageConfigForAdmin() error
+}
+
+// storageForTenant resolves a tenant's storage surface by numeric id. Wired
+// from main (it needs the runtime bundle manager).
+var storageForTenant func(id int64) (StorageAdmin, error)
+
+// SetTenantStorageResolver connects the per-tenant file services. The routes
+// answer 500 until it is set.
+func SetTenantStorageResolver(fn func(id int64) (StorageAdmin, error)) {
+	storageForTenant = fn
+}
+
+// storageAdmin resolves the target tenant's storage surface, writing the
+// response itself when the tenant or the resolver is missing.
+func storageAdmin(c *gin.Context) (StorageAdmin, bool) {
+	id, ok := parseTenantID(c)
+	if !ok {
+		return nil, false
+	}
+	if storageForTenant == nil {
+		utils.InternalError(c, "storage admin is not available")
+		return nil, false
+	}
+	admin, err := storageForTenant(id)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return nil, false
+	}
+	if admin == nil {
+		utils.NotFound(c, fmt.Sprintf("tenant %d not found", id))
+		return nil, false
+	}
+	return admin, true
+}
+
+// TenantStorage handles GET /tenants/:id/storage (platform superadmin).
+// Returns the bucket configuration with secrets masked (configured=false means
+// the tenant stores files on local disk).
+func (h *Handler) TenantStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	cfg, err := admin.StorageConfigForAdmin()
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, cfg)
+}
+
+// TenantSaveStorage handles PUT /tenants/:id/storage (platform superadmin).
+// Saving runs the signed HEAD probe, so an unreachable bucket is rejected with
+// 400 and nothing is persisted.
+func (h *Handler) TenantSaveStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	var req file.StorageConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "invalid body: "+err.Error())
+		return
+	}
+	cfg, err := admin.SaveStorageConfigForAdmin(req)
+	if err != nil {
+		utils.BadRequest(c, err.Error())
+		return
+	}
+	utils.Success(c, cfg)
+}
+
+// TenantDeleteStorage handles DELETE /tenants/:id/storage (platform
+// superadmin): the tenant goes back to local disk storage.
+func (h *Handler) TenantDeleteStorage(c *gin.Context) {
+	admin, ok := storageAdmin(c)
+	if !ok {
+		return
+	}
+	if err := admin.DeleteStorageConfigForAdmin(); err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Message(c, "storage config removed; the tenant stores files locally")
 }
 
 // TenantModels handles GET /tenants/:id/models (platform superadmin).
@@ -587,6 +721,11 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, _, _ gin.HandlerFunc) {
 				utils.Success(c, CatalogPermissions())
 			})
 		}
+
+		// Per-tenant object storage (platform superadmin).
+		g.GET("/:id/storage", m.hdl.TenantStorage)
+		g.PUT("/:id/storage", m.hdl.TenantSaveStorage)
+		g.DELETE("/:id/storage", m.hdl.TenantDeleteStorage)
 
 		// Per-tenant model/credential management (platform superadmin).
 		g.GET("/:id/models", m.hdl.TenantModels)

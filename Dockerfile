@@ -3,6 +3,9 @@ FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
+# Install git for go mod download
+RUN apk add --no-cache git
+
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -12,7 +15,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /synapta .
 # Runtime stage
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata && \
+RUN apk add --no-cache ca-certificates tzdata ffmpeg yt-dlp fontconfig ttf-dejavu && \
     addgroup -S app && adduser -S app -G app
 
 WORKDIR /app

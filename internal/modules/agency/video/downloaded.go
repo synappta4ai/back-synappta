@@ -1,6 +1,6 @@
 // Package agencyvideo: downloaded-model generator.
 //
-// Runs models whose weights live on the brain-master inference worker
+// Runs models whose weights live on the inference worker
 // (type "downloaded" in the model catalog). Unlike the API generators, there
 // is no external provider: Synapta dials the worker directly over gRPC.
 //
@@ -15,6 +15,7 @@ package agencyvideo
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -26,24 +27,50 @@ import (
 	"synapta/config"
 	"synapta/internal/modules/agency"
 	"synapta/internal/modules/model"
+	"synapta/internal/modules/workerbridge"
 	"synapta/internal/utils"
 	"synapta/internal/worker"
 	workerpb "synapta/internal/worker/proto"
+
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// streamTimeout bounds a whole generation stream. The worker of brain-master
-// can take a long time for heavy jobs, so this is generous — it only guards
+// streamTimeout bounds a whole generation stream. The inference worker can
+// take a long time for heavy jobs, so this is generous — it only guards
 // against a silently dead worker (no events, no EOF).
 const streamTimeout = 6 * time.Hour
 
+// BridgeQueue es la cola del bridge saliente (Fase A del plan distribuido):
+// el back encola el trabajo y la GPU del usuario lo reclama por HTTP.
+// workerbridge.Store la implementa; los tests usan un fake.
+type BridgeQueue interface {
+	// Enqueue encola el trabajo. workerID fija la GPU destino cuando se sabe
+	// cuál tiene los pesos ("" = lo puede tomar cualquier GPU del tenant).
+	Enqueue(ctx context.Context, tenantID int64, taskID, workerID string, payload json.RawMessage) error
+	JobByTaskID(ctx context.Context, tenantID int64, taskID string) (*workerbridge.Job, error)
+	RequestCancel(ctx context.Context, tenantID int64, taskID string) error
+	HasOnlineWorker(ctx context.Context, tenantID int64) (bool, error)
+	SnapshotsForTenant(ctx context.Context, tenantID int64) ([]workerbridge.WorkerModel, error)
+}
+
 // DownloadedGenerator serves every model type "downloaded": the worker owns
-// the weights, Synapta only dispatches jobs over gRPC.
+// the weights, Synapta only dispatches jobs.
+//
+// Dos caminos, elegidos por configuración:
+//   - gRPC directo (BM_WORKER_ADDR): worker en la misma red (modo local o
+//     VM alquilada con túnel). Streaming de progreso en vivo.
+//   - bridge saliente (SetBridge): la GPU del usuario está detrás de su NAT;
+//     el trabajo se encola en worker_jobs y la máquina lo reclama por HTTP.
+//     El estado vive en la DB (sobrevive reinicios de back y de worker).
 type DownloadedGenerator struct {
 	client  *worker.Client
 	addr    string // BM_WORKER_ADDR
 	outputs string // Synapta outputs dir (informational; utils handles storage)
 	store   *downloadedTaskStore
 	label   string
+
+	bridge   BridgeQueue // nil → solo gRPC directo
+	tenantID int64       // dueño de la cola de bridge
 }
 
 // NewDownloadedGenerator builds the generator over the stateless worker
@@ -58,32 +85,153 @@ func NewDownloadedGenerator(client *worker.Client, addr, outputsDir string) *Dow
 	}
 }
 
+// SetBridge activa el camino saliente (GPU del usuario detrás de NAT) y
+// fija el tenant dueño de la cola. Sin bridge, el generator vive solo del
+// gRPC directo como siempre.
+func (g *DownloadedGenerator) SetBridge(q BridgeQueue, tenantID int64) {
+	g.bridge = q
+	g.tenantID = tenantID
+}
+
+// hasBridge reports whether the tenant has paired GPUs (multi-usuario: cada
+// usuario empareja su propia máquina y el store la aísla por tenant_id).
+func (g *DownloadedGenerator) hasBridge() bool { return g.bridge != nil }
+
+// bridgeMode reports whether jobs must flow through the outbound queue
+// instead of the direct gRPC stream (legacy: bridge sin worker central).
+// En despliegues híbridos (central + bridge) la decisión es por job en
+// useBridgeFor: la GPU propia del tenant primero, el central como fallback.
+func (g *DownloadedGenerator) bridgeMode() bool { return g.bridge != nil && g.addr == "" }
+
+// SetWorkerAddr sobreescribe la dirección del worker para este generador.
+// Útil como fallback global; se prefiere WorkerAddr del request (Option B).
+func (g *DownloadedGenerator) SetWorkerAddr(addr string) { g.addr = addr }
+
+// effectiveAddr devuelve la dirección del worker a usar: la del request si
+// se proporcionó (Option B), o la global del generador (BM_WORKER_ADDR), o la
+// global del paquete model como último recurso.
+func (g *DownloadedGenerator) effectiveAddr(reqAddr string) string {
+	if strings.TrimSpace(reqAddr) != "" {
+		return reqAddr
+	}
+	if g.addr != "" {
+		return g.addr
+	}
+	return model.WorkerAddr()
+}
+
 func (g *DownloadedGenerator) Name() string        { return g.label }
 func (g *DownloadedGenerator) ContentType() string { return "video" }
 
-// Match claims every catalog model of type "downloaded" (resolved live
-// against the worker). API models resolve as "api" and unknown names as nil:
-// neither is claimed here — API generators get first pick because this
-// generator is registered last in runtime.go.
+// Match claims every catalog model of type "downloaded". Con bridge
+// activo se reclama además todo nombre fuera del catálogo API y la
+// validación real (¿alguna GPU del tenant puede correrlo?) ocurre en
+// Validate contra el snapshot del registry y, finalmente, en el worker al
+// ejecutar.
 func (g *DownloadedGenerator) Match(modelName string) bool {
-	m := agency.LookupModel(modelName)
-	return m != nil && m.Type == model.TypeDownloaded
+	m := agency.LookupModel(modelName, g.addr)
+	if m != nil {
+		return m.Type == model.TypeDownloaded
+	}
+	return g.hasBridge()
 }
 
-// Validate checks the shared requirements plus a live worker.
+// bridgeSnapshotFor devuelve la entrada del snapshot del tenant para el
+// modelo (nil cuando ninguna GPU emparejada lo declara). Es una lectura de
+// DB barata y con scope de tenant: cada usuario ve solo sus máquinas.
+func (g *DownloadedGenerator) bridgeSnapshotFor(ctx context.Context, modelName string) *workerbridge.WorkerModel {
+	if g.bridge == nil {
+		return nil
+	}
+	snapshots, err := g.bridge.SnapshotsForTenant(ctx, g.tenantID)
+	if err != nil {
+		return nil
+	}
+	for i, s := range snapshots {
+		if strings.EqualFold(s.Key, modelName) {
+		return &snapshots[i]
+		}
+	}
+	return nil
+}
+
+// bridgeCanRun informa si una GPU online del tenant tiene los pesos del
+// modelo listos ahora (el camino preferido: la máquina propia del usuario).
+func (g *DownloadedGenerator) bridgeCanRun(modelName string) bool {
+	if g.bridge == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+	defer cancel()
+	if online, err := g.bridge.HasOnlineWorker(ctx, g.tenantID); err != nil || !online {
+		return false
+	}
+	snap := g.bridgeSnapshotFor(ctx, modelName)
+	return snap != nil && snap.Available
+}
+
+// useBridgeFor decide el despacho de un job: la GPU propia del tenant cuando
+// tiene los pesos (local-first multi-usuario), el worker central en caso
+// contrario. Así un central caído o sin el modelo no bloquea a los usuarios
+// con worker propio emparejado.
+func (g *DownloadedGenerator) useBridgeFor(modelName string) bool {
+	return g.bridgeCanRun(modelName)
+}
+
+// Validate checks the shared requirements plus a reachable dispatch path:
+// la GPU propia del tenant (bridge) cuando tiene los pesos, o el worker
+// central por gRPC como fallback.
 func (g *DownloadedGenerator) Validate(req *agency.GeneratorRequest) error {
 	if err := agency.ValidateCommon(req); err.HasErrors() {
 		return err
 	}
-	if g.addr == "" {
-		return fmt.Errorf("inference worker not configured (BM_WORKER_ADDR)")
+	// Camino preferido: la máquina del propio usuario (multi-usuario).
+	if g.bridgeCanRun(req.Model) {
+		return nil
 	}
+	// Fallback: worker central por gRPC (modo local / VM con túnel).
+	addr := g.effectiveAddr(req.WorkerAddr)
+	if addr != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		if err := g.client.Ping(ctx, addr); err != nil {
+			// El central no responde: si hay bridge con GPUs online el
+			// problema es el modelo, no la conectividad.
+			if g.hasBridge() {
+				return g.bridgeValidateError(req.Model)
+			}
+			return fmt.Errorf("inference worker unreachable: %w", err)
+		}
+		return nil
+	}
+	// Sin central: el error preciso lo da el estado del bridge.
+	if g.hasBridge() {
+		return g.bridgeValidateError(req.Model)
+	}
+	return fmt.Errorf("inference worker not configured (BM_WORKER_ADDR)")
+}
+
+// bridgeValidateError explica por qué la GPU del tenant no puede correr el
+// modelo: sin GPU online, modelo no declarado, o pesos sin descargar (con la
+// acción concreta para cada caso).
+func (g *DownloadedGenerator) bridgeValidateError(modelName string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	if err := g.client.Ping(ctx, g.addr); err != nil {
-		return fmt.Errorf("inference worker unreachable: %w", err)
+	online, err := g.bridge.HasOnlineWorker(ctx, g.tenantID)
+	if err != nil {
+		return fmt.Errorf("worker registry unavailable: %w", err)
 	}
-	return nil
+	if !online {
+		return fmt.Errorf("no hay GPU conectada: emparejá una máquina con tu GPU desde Tu GPU para usar modelos descargados")
+	}
+	if snap := g.bridgeSnapshotFor(ctx, modelName); snap != nil {
+		// El catálogo de la GPU declara el modelo pero no tiene los pesos:
+		// encolar el job lo haría fallar tarde; se avisa ahora y con la
+		// acción concreta (descargarlo desde el panel).
+		return fmt.Errorf("la GPU conectada no bajó %q todavía: "+
+			"descargalo en Tu GPU → Modelos del worker", modelName)
+	}
+	return fmt.Errorf("la GPU conectada no tiene el modelo %q", modelName)
 }
 
 // Generate submits the job to the worker and starts a background consumer of
@@ -97,11 +245,13 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		return nil, fmt.Errorf("downloaded models need a text prompt")
 	}
 
-	// Mode follows the model's live modality (image vs video): downloaded
-	// models of both kinds are served through this generator.
-	mode := "video"
-	if m := agency.LookupModel(req.Model); m != nil && m.Modality != "" {
-		mode = string(m.Modality)
+	// Mode follows the model's resolved modality (image vs video): downloaded
+	// models of both kinds are served through this generator. El core la
+	// resolvió en el catálogo (incluidos los snapshots del bridge), así que
+	// acá no se vuelve a consultar: en modo bridge no hay catálogo gRPC vivo.
+	mode := string(req.Modality)
+	if mode == "" {
+		mode = "video"
 	}
 
 	// The worker's engines read width/height; map the agency ratio onto
@@ -142,8 +292,41 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		gReq.NumFrames = int32(clampInt(req.Duration*16, 8, 257)) // 16 fps
 	}
 
-	// Register the running task before the goroutine can race a poll.
-	g.store.init(jobID, req.Model)
+	// Dirección del worker para este job: per-request (Option B) o global.
+	addr := g.effectiveAddr(req.WorkerAddr)
+
+	// Registro el task ANTES de arrancar cualquier goroutine/encolado: un
+	// poll inmediato no debe ver el estado "unknown".
+	g.store.init(jobID, req.Model, addr)
+
+	// ── Camino bridge (GPU propia del tenant): el trabajo queda en la DB y
+	// la máquina del usuario lo reclama por HTTP. El estado vive en
+	// worker_jobs, no en memoria. Local-first: si la GPU del tenant tiene
+	// los pesos, se usa aunque haya central configurado (multi-usuario).
+	if g.useBridgeFor(req.Model) {
+		payload, err := protojson.Marshal(gReq)
+		if err != nil {
+			g.store.fail(jobID, fmt.Sprintf("marshal job payload: %v", err))
+			return nil, fmt.Errorf("marshal job payload: %w", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		target := g.bridgeTarget(ctx, req.Model)
+		if err := g.bridge.Enqueue(ctx, g.tenantID, jobID, target, payload); err != nil {
+			g.store.fail(jobID, fmt.Sprintf("enqueue: %v", err))
+			return nil, fmt.Errorf("enqueue job for GPU worker: %w", err)
+		}
+		log.Printf("[downloaded] job %s enqueued for bridge (model=%s tenant=%d worker=%s)",
+			jobID, req.Model, g.tenantID, shortWorker(target))
+		return &agency.GeneratorResult{
+			TaskID: jobID,
+			Model:  req.Model,
+			Status: config.STATUS_RUNNING,
+			Raw: map[string]interface{}{
+				"job_id": jobID, "engine": "inference-worker-bridge", "model": req.Model,
+			},
+		}, nil
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g.store.attachCancel(jobID, cancel)
@@ -152,7 +335,7 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 			cancel()
 			g.store.detachCancel(jobID)
 		}()
-		if err := g.streamJob(ctx, gReq); err != nil {
+		if err := g.streamJob(ctx, gReq, addr); err != nil {
 			log.Printf("[downloaded] job %s stream error: %v", jobID, err)
 			g.store.fail(jobID, fmt.Sprintf("stream lost: %v", err))
 		}
@@ -166,14 +349,44 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 	}, nil
 }
 
+// bridgeTarget devuelve la GPU que declara el modelo (la que tiene —o está
+// bajando— los pesos). Con varias máquinas emparejadas el job debe fijarse a
+// esa: si lo tomara otra, fallaría al no encontrar el modelo. "" significa
+// "cualquier GPU del tenant", que es la única opción honesta cuando el
+// snapshot no identifica a nadie.
+func (g *DownloadedGenerator) bridgeTarget(ctx context.Context, modelName string) string {
+	snapshots, err := g.bridge.SnapshotsForTenant(ctx, g.tenantID)
+	if err != nil {
+		log.Printf("[downloaded] snapshots for pin (model=%s tenant=%d): %v", modelName, g.tenantID, err)
+		return ""
+	}
+	for _, s := range snapshots {
+		if strings.EqualFold(s.Key, modelName) {
+			return s.WorkerID
+		}
+	}
+	return ""
+}
+
+// shortWorker recorta un worker id para los logs (vacío → "any").
+func shortWorker(id string) string {
+	if id == "" {
+		return "any"
+	}
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
 // streamJob consumes one GenerateMedia stream and mirrors every event into
 // the task store. On COMPLETED the artifact is pulled from the worker
 // (shared disk or artifact server) and re-hosted under Synapta's outputs.
-func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.MediaGenerationRequest) error {
+func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.MediaGenerationRequest, addr string) error {
 	sctx, scancel := context.WithTimeout(ctx, streamTimeout)
 	defer scancel()
 
-	return g.client.StreamGeneration(sctx, g.addr, req, func(ev worker.StreamEvent) {
+	return g.client.StreamGeneration(sctx, addr, req, func(ev worker.StreamEvent) {
 		switch ev.Status {
 		case "COMPLETED":
 			g.store.complete(req.JobId, ev.OutputPath)
@@ -191,9 +404,31 @@ func (g *DownloadedGenerator) streamJob(ctx context.Context, req *workerpb.Media
 	})
 }
 
-// GetStatus returns the task's live state; all real state flows in through
-// the background stream.
+// bridgeJobForTask devuelve el job del bridge cuando el task se encoló por
+// ese camino (multi-usuario híbrido: el mismo generator mezcla tasks
+// centrales en memoria y tasks de bridge en la DB del tenant).
+func (g *DownloadedGenerator) bridgeJobForTask(taskID string) *workerbridge.Job {
+	if g.bridge == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+	defer cancel()
+	job, err := g.bridge.JobByTaskID(ctx, g.tenantID, taskID)
+	if err != nil || job == nil {
+		return nil
+	}
+	return job
+}
+
+// GetStatus returns the task's live state. Los jobs de bridge se leen de
+// worker_jobs (la GPU reporta por HTTP y el artefacto se sube al back) en
+// cada poll; los centrales del mapa local en memoria.
 func (g *DownloadedGenerator) GetStatus(taskID, apiKey, baseURL, endpoint string) (*agency.GeneratorResult, error) {
+	// Un solo read de worker_jobs por poll: el job ya traído se mapea
+	// directo en vez de consultar la DB dos veces por cada encuesta.
+	if job := g.bridgeJobForTask(taskID); job != nil {
+		return g.bridgeStatusFromJob(job, taskID), nil
+	}
 	ts, ok := g.store.get(taskID)
 	if !ok {
 		// Unknown task (e.g. after a restart): report running with worker
@@ -236,14 +471,64 @@ func outputType(name string) string {
 	}
 }
 
+// bridgeStatusFromJob mapea una fila de worker_jobs al resultado del
+// generator. Recibe el job ya leído por bridgeJobForTask: un solo read de
+// DB por poll, importante cuando el front encuesta cada pocos segundos.
+func (g *DownloadedGenerator) bridgeStatusFromJob(job *workerbridge.Job, taskID string) *agency.GeneratorResult {
+	result := &agency.GeneratorResult{
+		TaskID: taskID,
+		Status: config.STATUS_RUNNING,
+		Raw: map[string]interface{}{
+			"job_id":        taskID,
+			"engine":        "inference-worker-bridge",
+			"stream_status": job.StreamStatus,
+			"progress":      job.Progress,
+		},
+	}
+	switch job.Status {
+	case "completed":
+		result.Status = config.STATUS_SUCCESS
+		if job.ArtifactURL != "" {
+			result.Outputs = []agency.OutputResource{{
+				URL: job.ArtifactURL, LocalURL: job.ArtifactURL,
+				Type: outputType(job.ArtifactName),
+			}}
+		}
+	case "failed":
+		result.Status = config.STATUS_FAILED
+		result.Error = job.ErrorMessage
+		if result.Error == "" {
+			result.Error = "GPU worker reported failure"
+		}
+	case "cancelled":
+		result.Status = config.STATUS_FAILED
+		result.Error = "cancelled"
+	}
+	return result
+}
+
 // CancelTask drops the local stream and asks the worker to abort the job.
 func (g *DownloadedGenerator) CancelTask(taskID, apiKey, baseURL, endpoint string) error {
+	// Camino bridge: la cancelación viaja como flag en la fila del job y
+	// llega a la GPU en la próxima respuesta de heartbeat.
+	if g.bridgeJobForTask(taskID) != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
+		defer cancel()
+		if err := g.bridge.RequestCancel(ctx, g.tenantID, taskID); err != nil {
+			return fmt.Errorf("bridge cancel: %w", err)
+		}
+		return nil
+	}
 	if cancel, ok := g.store.cancelFunc(taskID); ok {
 		cancel()
 	}
+	addr := g.store.workerAddr(taskID)
+	if addr == "" {
+		addr = g.addr
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), worker.DefaultTimeout)
 	defer cancel()
-	accepted, err := g.client.CancelGeneration(ctx, g.addr, taskID)
+	accepted, err := g.client.CancelGeneration(ctx, addr, taskID)
 	if err != nil {
 		return fmt.Errorf("worker cancel: %w", err)
 	}
@@ -272,6 +557,7 @@ func (g *DownloadedGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 // downloadedTask is the live state of one job, filled by the stream consumer.
 type downloadedTask struct {
 	Model        string
+	WorkerAddr   string // dirección del worker usada para este job (per-request o global)
 	Status       string // config.STATUS_RUNNING until terminal
 	StreamStatus string // worker-side: SUBMITTED | LOADING_MODEL | GENERATING | ...
 	Percent      float64
@@ -294,10 +580,20 @@ func newDownloadedTaskStore() *downloadedTaskStore {
 	}
 }
 
-func (s *downloadedTaskStore) init(jobID, model string) {
+func (s *downloadedTaskStore) init(jobID, model, workerAddr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[jobID] = &downloadedTask{Model: model, Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED"}
+	s.tasks[jobID] = &downloadedTask{Model: model, WorkerAddr: workerAddr, Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED"}
+}
+
+// workerAddr devuelve la dirección del worker registrada para un job (o "" si no hay).
+func (s *downloadedTaskStore) workerAddr(jobID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if t, ok := s.tasks[jobID]; ok {
+		return t.WorkerAddr
+	}
+	return ""
 }
 
 func (s *downloadedTaskStore) progress(jobID string, pct float64, streamStatus string) {
