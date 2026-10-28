@@ -106,6 +106,7 @@ func (p *Provisioner) ProvisionSchema(slug string) error {
 		return fmt.Errorf("failed to set search_path for %s: %w", schema, err)
 	}
 
+	goose.SetDialect("postgres")
 	if err := goose.Up(pool, p.tenantMigrations); err != nil {
 		return fmt.Errorf("tenant migrations failed for schema %s: %w", schema, err)
 	}
@@ -297,6 +298,7 @@ func (p *Provisioner) EnsureDefaultTenant(slug, name string, superadminID int64)
 // MigrateSystem runs the system (public schema) migrations. Exposed so main
 // only depends on the provisioner for all migration concerns.
 func (p *Provisioner) MigrateSystem(systemMigrations string) error {
+	goose.SetDialect("postgres")
 	if err := goose.Up(p.reg.System(), systemMigrations); err != nil {
 		return fmt.Errorf("system migrations failed: %w", err)
 	}
