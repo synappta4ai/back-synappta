@@ -36,6 +36,15 @@ type AudioRef struct {
 	Note   string `json:"note"`
 }
 
+// VideoRef is one reference clip attached as a visual reference (camera
+// work, framing and edit rhythm). It is declared in the prompt and sent to
+// the generator as a video content item.
+type VideoRef struct {
+	FileID string `json:"file_id"`
+	Tag    string `json:"tag"`
+	Name   string `json:"name"`
+}
+
 // Segment is one generation of a multi-clip replica.
 type Segment struct {
 	Index  int     `json:"index"`
@@ -55,6 +64,7 @@ type VideoPrompt struct {
 	GenerateAudio bool         `json:"generate_audio"`
 	Ingredients   []Ingredient `json:"ingredients"`
 	AudioRefs     []AudioRef   `json:"audio_refs"`
+	VideoRefs     []VideoRef   `json:"video_refs"`
 	Segments      []Segment    `json:"segments"`
 	Warnings      []string     `json:"warnings"`
 }

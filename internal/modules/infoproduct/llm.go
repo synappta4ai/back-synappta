@@ -69,6 +69,22 @@ func (b *brain) chat(ctx context.Context, baseURL, apiKey, model, system string,
 
 // chatWith is chat with an explicit temperature (used by the recreate skill).
 func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system string, parts []map[string]any, maxTokens int, temperature float64) (string, usage, error) {
+	return b.chatWithOptions(ctx, baseURL, apiKey, model, system, parts, maxTokens, chatOptions{temperature: temperature})
+}
+
+// chatOptions tweaks a single call (never the shared client defaults).
+type chatOptions struct {
+	temperature float64
+	// timeout overrides the global client timeout for this call only.
+	timeout time.Duration
+	// jsonMode asks the provider for a JSON object (OpenRouter
+	// response_format), without pinning a strict schema.
+	jsonMode bool
+}
+
+// chatWithOptions is chatWith with per-call options; chat and chatWith keep
+// their previous behavior.
+func (b *brain) chatWithOptions(ctx context.Context, baseURL, apiKey, model, system string, parts []map[string]any, maxTokens int, opt chatOptions) (string, usage, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
@@ -79,12 +95,22 @@ func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system str
 			{"role": "user", "content": parts},
 		},
 		"max_tokens":  maxTokens,
-		"temperature": temperature,
+		"temperature": opt.temperature,
 		"usage":       map[string]any{"include": true},
+	}
+	if opt.jsonMode {
+		payload["response_format"] = map[string]any{"type": "json_object"}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", usage{}, err
+	}
+	client := b.http
+	if opt.timeout > 0 {
+		client = &http.Client{Timeout: opt.timeout, Transport: b.http.Transport}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opt.timeout)
+		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
@@ -94,7 +120,7 @@ func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system str
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("X-Title", "Synappta VideoMachine")
 
-	resp, err := b.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", usage{}, fmt.Errorf("el cerebro no respondio: %w", err)
 	}
@@ -108,6 +134,7 @@ func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system str
 			Message struct {
 				Content any `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int     `json:"prompt_tokens"`
@@ -130,6 +157,9 @@ func (b *brain) chatWith(ctx context.Context, baseURL, apiKey, model, system str
 	}
 	if len(parsed.Choices) == 0 {
 		return "", usage{}, errors.New("el cerebro devolvio una respuesta vacia")
+	}
+	if strings.TrimSpace(parsed.Choices[0].FinishReason) == "length" {
+		return "", usage{}, errors.New("el cerebro corto la respuesta por el limite de tokens: intenta de nuevo o baja el detalle")
 	}
 	text := contentText(parsed.Choices[0].Message.Content)
 	if strings.TrimSpace(text) == "" {
