@@ -48,6 +48,7 @@ const (
 	maxImages         = 8
 	maxImageBytes     = 5 << 20
 	maxAudios         = 2
+	maxVideos         = 2
 )
 
 // CredentialResolver, FilesResolver and PoolResolver supply the tenant-scoped
@@ -150,6 +151,37 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// staleForSkill reports a cached breakdown written by the previous analyzer
+// (no dcs_analyze block). With the skill enabled it is ignored, so the user
+// gets the new breakdown instead of an old cached one.
+func staleForSkill(sourceKey string, cached *Analysis) bool {
+	if !analyzeSkillEnabled() || cached == nil || len(cached.Breakdown) == 0 {
+		return false
+	}
+	var probe struct {
+		SchemaVersion string          `json:"schema_version"`
+		DCSAnalyze    json.RawMessage `json:"dcs_analyze"`
+	}
+	if err := json.Unmarshal(cached.Breakdown, &probe); err != nil {
+		return true
+	}
+	if len(probe.DCSAnalyze) == 0 {
+		log.Printf("[infoproduct] analyze: el analisis guardado (%s) no viene del skill: se re-analiza", sourceKey)
+		return true
+	}
+	if missing := missingAnalyzeSections(probe.DCSAnalyze); len(missing) > 0 {
+		log.Printf("[infoproduct] analyze: el analisis guardado (%s) esta incompleto (faltan %s): se re-analiza",
+			sourceKey, strings.Join(missing, ", "))
+		return true
+	}
+	if version := analysisPipelineVersion(probe.DCSAnalyze); version < analyzePipelineVersion {
+		log.Printf("[infoproduct] analyze: el analisis guardado (%s) viene del pipeline v%d (actual v%d): se re-analiza",
+			sourceKey, version, analyzePipelineVersion)
+		return true
+	}
+	return false
+}
+
 // Analyze handles POST /infoproduct/analyze.
 func (m *Module) Analyze(c *gin.Context) {
 	var req analyzeRequest
@@ -201,7 +233,7 @@ func (m *Module) Analyze(c *gin.Context) {
 		}
 	}
 	if sourceKey != "" && !req.Force {
-		if cached, err := st.byKey(sourceKey); err == nil && cached != nil {
+		if cached, err := st.byKey(sourceKey); err == nil && cached != nil && !staleForSkill(sourceKey, cached) {
 			cached.Cached = true
 			done()
 			utils.Success(c, cached)
@@ -242,7 +274,7 @@ func (m *Module) Analyze(c *gin.Context) {
 		}
 		sourceKey = "file:" + h
 		if !req.Force {
-			if cached, err := st.byKey(sourceKey); err == nil && cached != nil {
+			if cached, err := st.byKey(sourceKey); err == nil && cached != nil && !staleForSkill(sourceKey, cached) {
 				cached.Cached = true
 				done()
 				utils.Success(c, cached)
@@ -263,16 +295,32 @@ func (m *Module) Analyze(c *gin.Context) {
 	}
 
 	metaJSON, _ := json.Marshal(meta)
-	intro := "MEASURED DATA (ffprobe/ffmpeg, ground truth):\n" + string(metaJSON) +
-		"\n\nWatch the attached video and listen to its audio, then reply with the JSON object described in the system prompt."
-	parts := []map[string]any{
-		textPart(intro),
-		videoPart("data:video/mp4;base64," + base64.StdEncoding.EncodeToString(data)),
+	videoPayload := "data:video/mp4;base64," + base64.StdEncoding.EncodeToString(data)
+
+	// Step 1 runs the DCS-ANALYZE skill by default; any failure falls back to
+	// the previous analyzer (analyze.md) without breaking the response.
+	var answer json.RawMessage
+	var u usage
+	if analyzeSkillEnabled() {
+		// Resolve env/default here so the stored row records the model used.
+		req.Model = analyzeModel(req.Model)
+		merged, skillUsage, serr := m.analyzeWithSkill(ctx, baseURL, apiKey, req.Model, meta, data)
+		if serr != nil {
+			log.Printf("[infoproduct] skill DCS-ANALYZE no disponible (%v): se usa el analizador anterior", serr)
+		} else {
+			answer, u = merged, skillUsage
+		}
 	}
-	answer, u, err := m.brain.jsonAnswer(ctx, baseURL, apiKey, req.Model, analyzeSystem, parts, 8192)
-	if err != nil {
-		utils.Error(c, http.StatusBadGateway, err.Error())
-		return
+	if len(answer) == 0 {
+		intro := "MEASURED DATA (ffprobe/ffmpeg, ground truth):\n" + string(metaJSON) +
+			"\n\nWatch the attached video and listen to its audio, then reply with the JSON object described in the system prompt."
+		parts := []map[string]any{textPart(intro), videoPart(videoPayload)}
+		legacyAnswer, legacyUsage, lerr := m.brain.jsonAnswer(ctx, baseURL, apiKey, req.Model, analyzeSystem, parts, analyzeLegacyMaxTokens)
+		if lerr != nil {
+			utils.Error(c, http.StatusBadGateway, lerr.Error())
+			return
+		}
+		answer, u = legacyAnswer, legacyUsage
 	}
 	var head struct {
 		Summary string `json:"summary"`
@@ -352,6 +400,8 @@ type composeRequest struct {
 	TargetModel  string        `json:"target_model"`
 	ImageFileIDs []string      `json:"image_file_ids"`
 	AudioFileIDs []string      `json:"audio_file_ids"`
+	// VideoFileIDs son clips de referencia (modelos con reference video).
+	VideoFileIDs []string `json:"video_file_ids"`
 	// ImageRoles maps file ids to person|product for the recreate skill.
 	ImageRoles map[string]string `json:"image_roles"`
 	// FPS and AspectRatio describe the reference video (optional).
@@ -386,6 +436,10 @@ func (m *Module) Compose(c *gin.Context) {
 	}
 	if len(req.AudioFileIDs) > maxAudios {
 		utils.BadRequest(c, fmt.Sprintf("maximo %d audios de referencia", maxAudios))
+		return
+	}
+	if len(req.VideoFileIDs) > maxVideos {
+		utils.BadRequest(c, fmt.Sprintf("maximo %d videos de referencia", maxVideos))
 		return
 	}
 	files, ok := m.files(c)
@@ -516,6 +570,22 @@ func (m *Module) Compose(c *gin.Context) {
 			audioPart(base64.StdEncoding.EncodeToString(data), "mp3"))
 	}
 
+	// Referencia en video: solo se declara en el manifesto y en el prompt (no se
+	// reenvian los bytes al cerebro; el desglose ya describe el clip).
+	videoNames := make([]string, 0, len(req.VideoFileIDs))
+	for _, id := range req.VideoFileIDs {
+		info, err := files.Info(id)
+		if err != nil || info == nil {
+			utils.NotFound(c, "video de referencia no encontrado: "+id)
+			return
+		}
+		if !strings.HasPrefix(info.MimeType, "video/") {
+			utils.BadRequest(c, fmt.Sprintf("%s no es un video", info.Filename))
+			return
+		}
+		videoNames = append(videoNames, info.Filename)
+	}
+
 	images := make([]recreateImage, 0, len(req.ImageFileIDs))
 	for i, id := range req.ImageFileIDs {
 		name := ""
@@ -523,6 +593,14 @@ func (m *Module) Compose(c *gin.Context) {
 			name = imageNames[i]
 		}
 		images = append(images, recreateImage{FileID: id, Role: req.ImageRoles[id], Name: name})
+	}
+	videos := make([]recreateVideo, 0, len(req.VideoFileIDs))
+	for i, id := range req.VideoFileIDs {
+		name := ""
+		if i < len(videoNames) {
+			name = videoNames[i]
+		}
+		videos = append(videos, recreateVideo{FileID: id, Name: name})
 	}
 	audios := make([]recreateAudio, 0, len(req.AudioFileIDs))
 	for i, id := range req.AudioFileIDs {
@@ -541,6 +619,7 @@ func (m *Module) Compose(c *gin.Context) {
 				Breakdown:     req.Breakdown,
 				Images:        images,
 				Audios:        audios,
+				Videos:        videos,
 				Notes:         req.Notes,
 				AspectRatio:   firstNonEmpty(req.AspectRatio, ref.Ratio),
 				FPS:           req.FPS,

@@ -122,7 +122,7 @@ func TestBuildRecreateUserMessage(t *testing.T) {
 		"@Audio1 = soundtrack / rhythm reference (beat.mp3)",
 		"max_duration_s: 15",
 		"min_shot_s: 0.30",
-		"max_words: 700",
+		"max_words: 1600",
 		"total_duration_s: 12.5",
 		"target_model: seedance",
 	} {
@@ -161,6 +161,59 @@ func TestBuildRecreateUserMessage(t *testing.T) {
 	}
 }
 
+func TestSanitizeBreakdownIncludesTechnicalSheet(t *testing.T) {
+	raw := json.RawMessage(`{
+	  "summary": "resumen",
+	  "pacing": "ritmo",
+	  "setting_and_lighting": "estudio",
+	  "person": {"description": "no debe pasar"},
+	  "dcs_analyze": {
+	    "schema_version": "dcs-analyze/1.0",
+	    "talent": {"present": true, "people": [{"appearance": "no debe pasar"}]},
+	    "brand_elements": [{"type": "logo"}],
+	    "graphics_summary": {"items": []},
+	    "audio_observations": {"music": {"present": true}},
+	    "technical_signature": {"lens_family": "35mm prime", "dof_overall": "shallow"},
+	    "camera_summary": {"dominant_movement": "static"},
+	    "editing_style": {"primary": "fast_cut", "metrics": {"average_shot_length_s": 0.71}},
+	    "transitions_summary": {"distribution": [{"type": "hard_cut", "count": 20}]},
+	    "effects_summary": [{"name": "bloom"}],
+	    "recreation_blueprint": {"timing_template_s": [0.83, 1.67]},
+	    "visual_style": {"medium": "live_action"},
+	    "shots": [
+	      {"index": 1, "start_s": 0, "end_s": 0.83, "shot_size": "close_up",
+	       "camera_movement": {"type": "handheld"}, "lens": {"class": "35mm"},
+	       "lighting": {"setup": "ring_light"}, "subject_action": "gira el anillo",
+	       "transition_out": {"type": "hard_cut"}, "appearance": "no debe pasar"}
+	    ]
+	  }
+	}`)
+	out := sanitizeBreakdown(raw)
+	for _, want := range []string{"technical_signature", "camera_summary", "editing_style", "recreation_blueprint", "timing_template_s", "35mm prime", "subject_action", "gira el anillo"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("falta %q en el breakdown tecnico", want)
+		}
+	}
+	for _, banned := range []string{"talent", "brand_elements", "audio_observations", "no debe pasar", "graphics_summary"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("no debe incluir %q", banned)
+		}
+	}
+}
+
+func TestSanitizeBreakdownFallsBackToLegacyShape(t *testing.T) {
+	raw := json.RawMessage(`{"summary":"s","pacing":"p","setting_and_lighting":"l","shots":[{"index":1,"start":0,"end":1,"shot_type":"close-up"}]}`)
+	out := sanitizeBreakdown(raw)
+	for _, want := range []string{"\"summary\"", "\"pacing\"", "\"setting_and_lighting\"", "\"shots\"", "close-up"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("falta %q en el breakdown legacy", want)
+		}
+	}
+	if strings.Contains(out, "technical") {
+		t.Error("sin dcs_analyze no debe inventar un bloque technical")
+	}
+}
+
 func TestBuildRecreateUserMessageDefaults(t *testing.T) {
 	in := recreateInput{
 		Breakdown: json.RawMessage(`{"summary":"s"}`),
@@ -176,7 +229,7 @@ func TestBuildRecreateUserMessageDefaults(t *testing.T) {
 		"fps: 24",
 		"max_duration_s: 15",
 		"min_shot_s: 0.30",
-		"max_words: 700",
+		"max_words: 1600",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("falta el default %q", want)

@@ -19,8 +19,8 @@ var recreateSkillRaw string
 const (
 	defaultRecreateMaxDuration = 15
 	defaultRecreateMinShot     = 0.30
-	defaultRecreateMaxWords    = 700
-	recreateMaxTokens          = 2500
+	defaultRecreateMaxWords    = 1600
+	recreateMaxTokens          = 24000
 	recreateTemperature        = 0.35
 	recreateSkillName          = "DCS-RECREATE"
 )
@@ -155,10 +155,18 @@ type recreateAudio struct {
 	Name   string
 }
 
+// recreateVideo is a reference clip: the prompt names it and the generator
+// receives it as a video content item (reference video models).
+type recreateVideo struct {
+	FileID string
+	Name   string
+}
+
 type recreateInput struct {
 	Breakdown     json.RawMessage
 	Images        []recreateImage
 	Audios        []recreateAudio
+	Videos        []recreateVideo
 	Notes         string
 	AspectRatio   string
 	FPS           float64
@@ -185,9 +193,39 @@ type recreateBreakdown struct {
 	Shots              []recreateShot `json:"shots,omitempty"`
 }
 
-// sanitizeBreakdown keeps only what the recreate skill needs: summary, pacing,
-// setting/lighting and the shot table. Plain text is returned untouched.
+// technicalSections are the DCS-ANALYZE blocks the recreate skill reads. The
+// identity/appearance (talent), brand, on-screen graphics and audio blocks are
+// deliberately left out: Section 2 of the skill forbids them in the prompt.
+var technicalSections = []string{
+	"video", "visual_style", "camera_summary", "technical_signature",
+	"editing_style", "transitions_summary", "effects_summary",
+	"recreation_blueprint", "setting", "hook_and_structure", "product_presentation",
+}
+
+// technicalShotFields is the per-shot forensics kept for every shot.
+var technicalShotFields = []string{
+	"index", "start_s", "end_s", "duration_s", "micro_shot", "timing_precision",
+	"shot_role", "shot_size", "angle_vertical", "angle_horizontal",
+	"camera_movement", "stabilization", "lens", "depth_of_field", "lighting",
+	"exposure_and_color", "optical_artifacts", "effects", "transition_out",
+	"subject_action", "product_visible", "shot_purpose", "replicability", "confidence",
+}
+
+// sanitizeBreakdown keeps only what the recreate skill needs. When the step-1
+// analysis comes from DCS-ANALYZE it sends the technical sheet (camera, lens,
+// lighting, exposure/colour, transitions, effects, rhythm, blueprint) plus the
+// per-shot forensics; otherwise it keeps the previous summary/pacing/shots
+// shape. Plain text is returned untouched.
 func sanitizeBreakdown(raw json.RawMessage) string {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	if dcsRaw, ok := doc["dcs_analyze"]; ok && len(dcsRaw) > 0 {
+		if out, err := buildTechnicalBreakdown(doc, dcsRaw); err == nil {
+			return out
+		}
+	}
 	var b recreateBreakdown
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return strings.TrimSpace(string(raw))
@@ -197,6 +235,59 @@ func sanitizeBreakdown(raw json.RawMessage) string {
 		return strings.TrimSpace(string(raw))
 	}
 	return string(out)
+}
+
+// buildTechnicalBreakdown assembles the breakdown for the recreate skill from
+// the DCS-ANALYZE document, filtered to the sections and shot fields it uses.
+func buildTechnicalBreakdown(doc map[string]json.RawMessage, dcsRaw json.RawMessage) (string, error) {
+	var dcs map[string]json.RawMessage
+	if err := json.Unmarshal(dcsRaw, &dcs); err != nil {
+		return "", err
+	}
+	technical := make(map[string]json.RawMessage, len(technicalSections)+1)
+	for _, key := range technicalSections {
+		if value, ok := dcs[key]; ok && len(value) > 0 {
+			technical[key] = value
+		}
+	}
+	var shots []map[string]json.RawMessage
+	if err := json.Unmarshal(dcs["shots"], &shots); err == nil {
+		curated := make([]map[string]json.RawMessage, 0, len(shots))
+		for _, shot := range shots {
+			kept := make(map[string]json.RawMessage, len(technicalShotFields))
+			for _, field := range technicalShotFields {
+				if value, ok := shot[field]; ok && len(value) > 0 {
+					kept[field] = value
+				}
+			}
+			if len(kept) > 0 {
+				curated = append(curated, kept)
+			}
+		}
+		if len(curated) > 0 {
+			encoded, err := json.Marshal(curated)
+			if err != nil {
+				return "", err
+			}
+			technical["shots"] = encoded
+		}
+	}
+	encodedTechnical, err := json.MarshalIndent(technical, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	out := make(map[string]json.RawMessage, 4)
+	for _, key := range []string{"summary", "pacing", "setting_and_lighting"} {
+		if value, ok := doc[key]; ok && len(value) > 0 {
+			out[key] = value
+		}
+	}
+	out["technical"] = encodedTechnical
+	encoded, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func normalizeIngredientRole(raw string) string {
@@ -240,6 +331,15 @@ func buildIngredientManifest(in recreateInput) []string {
 	}
 	for i, a := range in.Audios {
 		lines = append(lines, "@Audio"+itoa(i+1)+" = soundtrack / rhythm reference"+nameSuffix(a.Name))
+	}
+	// Reference clips are named with their file name so the prompt can point at
+	// the exact file ("use the file <name> as visual reference").
+	for i, v := range in.Videos {
+		line := "@Video" + itoa(i+1) + " = reference video clip"
+		if name := strings.TrimSpace(v.Name); name != "" {
+			line += ` "` + name + `"`
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }
@@ -364,6 +464,7 @@ func buildRecreateVideoPrompt(prompt string, in recreateInput, target ComposeTar
 		Model:       target.Model,
 		Ingredients: []Ingredient{},
 		AudioRefs:   []AudioRef{},
+		VideoRefs:   []VideoRef{},
 	}
 	out.Duration = pickDuration(int(math.Ceil(refDuration)), target.Durations, target.MaxDuration)
 	if out.Duration <= 0 {
@@ -381,6 +482,9 @@ func buildRecreateVideoPrompt(prompt string, in recreateInput, target ComposeTar
 	}
 	for i, a := range in.Audios {
 		out.AudioRefs = append(out.AudioRefs, AudioRef{FileID: a.FileID, Tag: "@Audio" + itoa(i+1), Kind: "music"})
+	}
+	for i, v := range in.Videos {
+		out.VideoRefs = append(out.VideoRefs, VideoRef{FileID: v.FileID, Tag: "@Video" + itoa(i+1), Name: v.Name})
 	}
 	out.Segments = []Segment{{Index: 1, Start: 0, End: float64(out.Duration), Prompt: prompt}}
 	if refDuration > 0 && target.MaxDuration > 0 && int(math.Ceil(refDuration)) > target.MaxDuration {
