@@ -51,6 +51,7 @@ import (
 	"synapta/internal/modules/skill"
 	"synapta/internal/modules/tenant"
 	"synapta/internal/modules/workerbridge"
+	"synapta/internal/modules/writingcopilot"
 	"synapta/internal/runtime"
 	"synapta/internal/tenancy"
 	"synapta/internal/utils"
@@ -265,6 +266,9 @@ func main() {
 	registry.Register(workerbridge.NewModule(wbStore))
 	// VideoMachine "Infoproducto": analiza videos de referencia y compone el prompt.
 	registry.Register(infoproduct.NewModule(manager.CredentialsFor, manager.FilesFor, manager.TenantPoolFor))
+
+	// VideoMachine "Writing Copilot": convierte ideas o guiones en prompts cinematograficos.
+	registry.Register(writingcopilot.NewModule(manager.CredentialsFor, manager.FilesFor))
 	// Editor de video: proyectos (/editor) y render con ffmpeg (/render).
 	renderModule := render.NewModule(manager.FilesFor, manager.TenantPoolFor, cfg.OutputsDir)
 	registry.Register(renderModule)
