@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -370,10 +371,10 @@ func (s *ServerCommunicationStore) GetGenerateResponseBody(taskID string) (strin
 // a provider-reported spend.
 func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source string, duration int, resolution, ratio string) error {
 	query := `UPDATE generation_logs SET
-		estimated_cost = CASE WHEN $1 > 0 AND (cost_source NOT IN ('provider_estimate', 'provider_refund') OR (cost_source = 'provider_estimate' AND estimated_cost = 0)) THEN $1 ELSE estimated_cost END,
-		cost_source = CASE WHEN $2 <> '' AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $2 ELSE cost_source END,
-		video_duration = CASE WHEN video_duration = 0 AND $3 > 0 THEN $3 ELSE video_duration END,
-		video_resolution = CASE WHEN video_resolution = '' AND $4 <> '' THEN $4 ELSE video_resolution END,
+		estimated_cost = CASE WHEN $1::float8 > 0 AND (cost_source NOT IN ('provider_estimate', 'provider_refund') OR (cost_source = 'provider_estimate' AND estimated_cost = 0)) THEN $1::float8 ELSE estimated_cost END,
+		cost_source = CASE WHEN $2::text <> '' AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $2::text ELSE cost_source END,
+		video_duration = CASE WHEN video_duration = 0 AND $3::float8 > 0 THEN $3::float8 ELSE video_duration END,
+		video_resolution = CASE WHEN video_resolution = '' AND $4::text <> '' THEN $4::text ELSE video_resolution END,
 		video_ratio = CASE WHEN video_ratio = '' AND $5 <> '' THEN $5 ELSE video_ratio END,
 		updated_at = NOW()
 		WHERE id = $6 AND deleted_at IS NULL`
@@ -386,14 +387,54 @@ func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source s
 // Rows with a local cost are left to ApplyCostBackfill.
 func (s *GenerationLogStore) ApplyProviderCostByTaskID(taskID string, usd, credits float64, source string) error {
 	query := `UPDATE generation_logs SET
-		estimated_cost = CASE WHEN $2 > 0 THEN $2 ELSE estimated_cost END,
-		cost_credits = CASE WHEN $3 > 0 THEN $3 ELSE cost_credits END,
-		cost_source = CASE WHEN $4 <> '' THEN $4 ELSE cost_source END,
+		estimated_cost = CASE WHEN $2::float8 > 0 THEN $2::float8 ELSE estimated_cost END,
+		cost_credits = CASE WHEN $3::float8 > 0 THEN $3::float8 ELSE cost_credits END,
+		cost_source = CASE WHEN $4::text <> '' THEN $4::text ELSE cost_source END,
 		updated_at = NOW()
 		WHERE task_id = $1 AND deleted_at IS NULL
 		AND cost_source <> 'provider_refund'`
 	_, err := s.db.Exec(query, taskID, usd, credits, source)
 	return err
+}
+
+// ApplyProviderCostByID writes a recovered spend on the exact row the trace
+// read: a task ID can repeat across retried or refunded submits, so the
+// task-scoped update could land on a different row than the reported one.
+// Refunded rows are never touched. Returns the rows actually updated.
+func (s *GenerationLogStore) ApplyProviderCostByID(id string, usd, credits float64, source string) (int64, error) {
+	query := `UPDATE generation_logs SET
+		estimated_cost = CASE WHEN $2::float8 > 0 THEN $2::float8 ELSE estimated_cost END,
+		cost_credits = CASE WHEN $3::float8 > 0 THEN $3::float8 ELSE cost_credits END,
+		cost_source = CASE WHEN $4::text <> '' THEN $4::text ELSE cost_source END,
+		updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL
+		AND cost_source <> 'provider_refund'`
+	var appliedCost float64
+	var appliedSource string
+	err := s.db.QueryRow(query+` RETURNING estimated_cost, COALESCE(cost_source, '')`,
+		id, usd, credits, source).Scan(&appliedCost, &appliedSource)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("[cost-recovery] apply id=%s usd=%.4f source=%s: sin fila aplicable", id, usd, source)
+			return 0, nil
+		}
+		return 0, err
+	}
+	log.Printf("[cost-recovery] apply id=%s usd=%.4f credits=%.3f source=%s → stored cost=%.4f source=%s",
+		id, usd, credits, source, appliedCost, appliedSource)
+	return 1, nil
+}
+
+// GetCostByID returns the stored spend of one row so the recovery trace
+// reports exactly the row it repaired.
+func (s *GenerationLogStore) GetCostByID(id string) (CostRecoveryRow, error) {
+	var row CostRecoveryRow
+	err := s.db.QueryRow(
+		`SELECT estimated_cost, cost_credits, COALESCE(cost_source, '')
+		 FROM generation_logs WHERE id = $1 AND deleted_at IS NULL`,
+		id,
+	).Scan(&row.EstimatedCost, &row.CostCredits, &row.CostSource)
+	return row, err
 }
 
 // GetCostByTaskID returns the stored spend of a task: one cheap query so the
@@ -415,8 +456,8 @@ func (s *GenerationLogStore) UpdateMetadataByTaskID(taskID string, md VideoMetad
 	query := `UPDATE generation_logs SET
 		usage_tokens = GREATEST(usage_tokens, $1),
 		usage_completion_tokens = GREATEST(usage_completion_tokens, $2),
-		video_duration = CASE WHEN $3 > 0 THEN $3 ELSE video_duration END,
-		video_resolution = CASE WHEN $4 <> '' THEN $4 ELSE video_resolution END,
+		video_duration = CASE WHEN $3::float8 > 0 THEN $3::float8 ELSE video_duration END,
+		video_resolution = CASE WHEN $4::text <> '' THEN $4::text ELSE video_resolution END,
 		video_ratio = CASE WHEN $5 <> '' THEN $5 ELSE video_ratio END,
 		video_seed = CASE WHEN $6 > 0 THEN $6 ELSE video_seed END,
 		video_fps = CASE WHEN $7 > 0 THEN $7 ELSE video_fps END,

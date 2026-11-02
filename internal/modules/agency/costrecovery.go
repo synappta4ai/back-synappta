@@ -273,6 +273,60 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 		}
 	}
 
+	// Provider's own usage analytics: the numbers behind its billing screen.
+	// Useful to confirm whether the provider actually charged the task (failed
+	// and canceled requests are refunded) before trusting a local estimate.
+	provUsageStep := CostRecoveryStep{Key: "provider-usage"}
+	exactUsageUSD, exactUsageOK := 0.0, false
+	canUsage := trace.Provider == string(credential.ProviderHiggsfield) &&
+		creds != nil && creds.AuthKey() != "" && baseURL != ""
+	if canUsage {
+		var submittedAt time.Time
+		if genTrace != nil {
+			submittedAt = genTrace.StartedAt
+		}
+		usage := TraceHiggsfieldUsage(nil, baseURL, creds.AuthKey(), submittedAt, time.Time{})
+		provUsageStep.Method = usage.Method
+		provUsageStep.Endpoint = usage.URL
+		provUsageStep.StatusCode = usage.StatusCode
+		provUsageStep.ResponseBody = prettyJSON(usage.ResponseBody)
+		provUsageStep.USD = usage.Total
+		provUsageStep.Found = usage.OK && usage.Lines > 0
+		provUsageStep.DurationMs = usage.DurationMs
+		switch {
+		case !usage.OK:
+			provUsageStep.Note = "La ruta /models/usage no respondió con datos utilizables."
+			if usage.Error != "" {
+				provUsageStep.Note += " " + usage.Error
+			}
+		case usage.Lines == 0:
+			provUsageStep.Note = "El proveedor no reporta consumo en la ventana del submit: la generación pudo fallar, moderarse o reembolsarse."
+		default:
+			provUsageStep.Note = fmt.Sprintf(
+				"El proveedor reporta $%.4f en %d líneas de esa ventana (analítica del panel, no factura: puede incluir otras generaciones y demorar).",
+				usage.Total, usage.Lines,
+			)
+		}
+		// Una sola generación facturada para este modelo y esta API key: el
+		// monto del panel es el de esta tarea, no un agregado de la ventana.
+		exactUsageUSD, exactUsageOK = usage.ExactCost(endpoint, keyIDOf(creds))
+		if exactUsageOK {
+			provUsageStep.Note += fmt.Sprintf(" Coincide con esta generación: $%.4f por 1 unidad.", exactUsageUSD)
+		}
+	} else {
+		switch {
+		case trace.Provider == "":
+			provUsageStep.Note = "El modelo no está en el catálogo: no hay proveedor al que consultar consumo."
+		case trace.Provider != string(credential.ProviderHiggsfield):
+			provUsageStep.Note = "El proveedor " + trace.Provider + " no expone una ruta de consumo equivalente."
+		case creds == nil:
+			provUsageStep.Note = "El tenant no tiene credencial guardada para " + trace.Provider + "."
+		default:
+			provUsageStep.Note = "No se pudo resolver la base URL del proveedor para consultar consumo."
+		}
+	}
+	trace.Steps = append(trace.Steps, provUsageStep)
+
 	// Local calculator (Seedance/Seedream families).
 	calcUSD, calcName := 0.0, ""
 	if calc := s.pickCalculator(row.ModelName); calc != nil {
@@ -339,6 +393,9 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 		} else {
 			reason = fmt.Sprintf("Estimación del proveedor aceptada: %.3f créditos ≈ $%.4f.", credits, usd)
 		}
+	case exactUsageOK && exactUsageUSD > 0:
+		usd, source = exactUsageUSD, "provider_usage"
+		reason = fmt.Sprintf("El proveedor factura $%.4f por esta generación en su panel de consumo: se usa ese monto en lugar del calculado.", exactUsageUSD)
 	case calcUSD > 0:
 		usd, source = calcUSD, "calculator"
 		reason = fmt.Sprintf("Sin estimación del proveedor: se usa la calculadora %s ($%.4f).", calcName, calcUSD)
@@ -358,7 +415,7 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 	// figure may come from a failed/stale call); local costs only fill empty
 	// rows, and refunds are never touched.
 	apply := source != "" && row.CostSource != "provider_refund" &&
-		(row.EstimatedCost == 0 || source == "provider_estimate")
+		(row.EstimatedCost == 0 || source == "provider_estimate" || source == "provider_usage")
 	if !apply {
 		trace.After = trace.Before
 		if source != "" {
@@ -366,17 +423,34 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 		}
 		return trace, nil
 	}
-	if err := s.logStore.ApplyProviderCostByTaskID(taskID, usd, credits, source); err != nil {
+	applied, err := s.logStore.ApplyProviderCostByID(row.ID, usd, credits, source)
+	if err != nil {
 		return nil, err
 	}
-	trace.Applied = true
-	if after, cerr := s.logStore.GetCostByTaskID(taskID); cerr == nil {
+	trace.Applied = applied > 0
+	if applied == 0 {
+		trace.Reason = reason + " No se escribió nada: la fila es un reembolso del proveedor."
+	}
+	if after, cerr := s.logStore.GetCostByID(row.ID); cerr == nil {
 		trace.After = after
 	} else {
 		trace.After = CostRecoveryRow{EstimatedCost: usd, CostCredits: credits, CostSource: source}
 	}
 	s.recordRecoveredEstimate(row, genTrace, estStep.Endpoint, payloadBody, usd, credits, source)
 	return trace, nil
+}
+
+// keyIDOf returns the provider key id (the part before the secret) so usage
+// analytics lines can be filtered by the tenant's credential.
+func keyIDOf(creds *credential.Resolve) string {
+	if creds == nil {
+		return ""
+	}
+	key := creds.AuthKey()
+	if i := strings.Index(key, ":"); i > 0 {
+		return key[:i]
+	}
+	return key
 }
 
 // recordRecoveredEstimate stores the recovered spend as an estimate-phase trace

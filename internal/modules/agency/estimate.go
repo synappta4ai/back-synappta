@@ -57,7 +57,13 @@ func TraceHiggsfieldEstimate(
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	trace.Method = "POST"
-	trace.URL = strings.TrimSuffix(baseURL, "/") + "/estimate" + endpoint
+	// The route is /estimate + endpoint; an endpoint stored without its leading
+	// slash used to produce /estimatebytedance/... and a 404.
+	path := endpoint
+	if path != "" && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	trace.URL = strings.TrimSuffix(baseURL, "/") + "/estimate" + path
 	start := time.Now()
 	defer func() { trace.DurationMs = time.Since(start).Milliseconds() }()
 
