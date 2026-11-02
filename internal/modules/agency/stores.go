@@ -381,6 +381,33 @@ func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source s
 	return err
 }
 
+// ApplyProviderCostByTaskID writes a recovered spend for one task: each leg
+// updates only when a value was found, and refunded rows are never touched.
+// Rows with a local cost are left to ApplyCostBackfill.
+func (s *GenerationLogStore) ApplyProviderCostByTaskID(taskID string, usd, credits float64, source string) error {
+	query := `UPDATE generation_logs SET
+		estimated_cost = CASE WHEN $2 > 0 THEN $2 ELSE estimated_cost END,
+		cost_credits = CASE WHEN $3 > 0 THEN $3 ELSE cost_credits END,
+		cost_source = CASE WHEN $4 <> '' THEN $4 ELSE cost_source END,
+		updated_at = NOW()
+		WHERE task_id = $1 AND deleted_at IS NULL
+		AND cost_source <> 'provider_refund'`
+	_, err := s.db.Exec(query, taskID, usd, credits, source)
+	return err
+}
+
+// GetCostByTaskID returns the stored spend of a task: one cheap query so the
+// recovery trace reports the row after the repair.
+func (s *GenerationLogStore) GetCostByTaskID(taskID string) (CostRecoveryRow, error) {
+	var row CostRecoveryRow
+	err := s.db.QueryRow(
+		`SELECT estimated_cost, cost_credits, COALESCE(cost_source, '')
+		 FROM generation_logs WHERE task_id = $1 AND deleted_at IS NULL`,
+		taskID,
+	).Scan(&row.EstimatedCost, &row.CostCredits, &row.CostSource)
+	return row, err
+}
+
 // UpdateMetadataByTaskID persists video generation metadata + progress sampled
 // from the provider response. Only non-zero values overwrite existing ones so
 // partial responses never erase previously stored data.
@@ -988,6 +1015,32 @@ func (s *ServerCommunicationStore) AttachTaskIDByPhase(phase, taskID, modelName 
 	return nil
 }
 
+// GetByTaskIDAndPhase returns the newest trace of a task for one phase
+// ("generate", "estimate" or "poll"), or nil when there is none.
+func (s *ServerCommunicationStore) GetByTaskIDAndPhase(taskID, phase string) (*ServerCommunication, error) {
+	log := &ServerCommunication{}
+	err := s.db.QueryRow(
+		`SELECT `+serverCommCols+` FROM server_communications
+		 WHERE task_id = $1 AND phase = $2
+		 ORDER BY created_at DESC LIMIT 1`,
+		taskID, phase,
+	).Scan(
+		&log.ID, &log.TaskID, &log.ModelName, &log.Endpoint, &log.Method,
+		&log.Phase, &log.PollCount, &log.StartedAt, &log.FinishedAt, &log.TotalDurationMs,
+		&log.RequestBody, &log.ResponseBody,
+		&log.StatusCode, &log.DurationMs, &log.ErrorMessage,
+		&log.UserID, &log.Username, &log.TenantSlug, &log.CredentialProvider,
+		&log.APIKeyMask, &log.AccessKeyMask, &log.SecretKeyMask, &log.AuthType,
+		&log.CreatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return log, nil
+}
+
 // GetByID returns one trace, or nil.
 func (s *ServerCommunicationStore) GetByID(id string) (*ServerCommunication, error) {
 	log := &ServerCommunication{}
@@ -1009,9 +1062,16 @@ func (s *ServerCommunicationStore) GetByID(id string) (*ServerCommunication, err
 }
 
 // ServerCommFilter holds optional filters for listing server communications.
+// Status accepts "ok" (2xx) or "error" (0 or >= 400); empty lists every row.
+// Dates are ISO days (YYYY-MM-DD) filtering created_at.
 type ServerCommFilter struct {
 	TaskID    string
 	ModelName string
+	Provider  string
+	Status    string
+	Username  string
+	DateFrom  string
+	DateTo    string
 	Page      int
 	Limit     int
 }
@@ -1062,23 +1122,41 @@ func (s *ServerCommunicationStore) List(filter ServerCommFilter) (*ServerCommLis
 	}
 	offset := (filter.Page - 1) * filter.Limit
 
-	where := ""
+	conditions := []string{}
 	args := []interface{}{}
-	argIdx := 1
+	addArg := func(cond string, value interface{}) {
+		args = append(args, value)
+		conditions = append(conditions, fmt.Sprintf(cond, len(args)))
+	}
 	if filter.TaskID != "" {
-		where += fmt.Sprintf(" WHERE task_id = $%d", argIdx)
-		args = append(args, filter.TaskID)
-		argIdx++
+		addArg("task_id = $%d", filter.TaskID)
 	}
 	if filter.ModelName != "" {
-		prefix := " WHERE"
-		if where != "" {
-			prefix = " AND"
-		}
-		where += fmt.Sprintf("%s model_name = $%d", prefix, argIdx)
-		args = append(args, filter.ModelName)
-		argIdx++
+		addArg("model_name = $%d", filter.ModelName)
 	}
+	if filter.Provider != "" {
+		addArg("credential_provider = $%d", filter.Provider)
+	}
+	if filter.Username != "" {
+		addArg("username ILIKE $%d", "%"+filter.Username+"%")
+	}
+	switch filter.Status {
+	case "ok":
+		conditions = append(conditions, "status_code BETWEEN 200 AND 299")
+	case "error":
+		conditions = append(conditions, "(status_code = 0 OR status_code >= 400)")
+	}
+	if filter.DateFrom != "" {
+		addArg("created_at >= $%d::date", filter.DateFrom)
+	}
+	if filter.DateTo != "" {
+		addArg("created_at < ($%d::date + INTERVAL '1 day')", filter.DateTo)
+	}
+	where := ""
+	if len(conditions) > 0 {
+		where = " WHERE " + strings.Join(conditions, " AND ")
+	}
+	argIdx := len(args) + 1
 
 	var total int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM server_communications"+where, args...).Scan(&total); err != nil {

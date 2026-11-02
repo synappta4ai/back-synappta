@@ -212,6 +212,11 @@ func (h *Handler) ListServerCommunications(c *gin.Context) {
 	result, err := h.core.ListComms(ServerCommFilter{
 		TaskID:    c.Query("task_id"),
 		ModelName: c.Query("model_name"),
+		Provider:  c.Query("provider"),
+		Status:    c.Query("status"),
+		Username:  c.Query("username"),
+		DateFrom:  c.Query("date_from"),
+		DateTo:    c.Query("date_to"),
 		Page:      page,
 		Limit:     limit,
 	})
@@ -231,6 +236,36 @@ func (h *Handler) GetServerCommunication(c *gin.Context) {
 	}
 	if result == nil {
 		utils.NotFound(c, "server communication not found")
+		return
+	}
+	utils.Success(c, result)
+}
+
+// RecoverServerCommCost handles POST /agency/logs/server-communications/:id/cost-recovery.
+// Runs the spend resolution of the task behind the trace and answers every
+// step (endpoint, payload, response) plus the repaired row, so the admin can
+// see why a cost was not recovered correctly.
+func (h *Handler) RecoverServerCommCost(c *gin.Context) {
+	comm, err := h.core.GetComm(c.Param("id"))
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if comm == nil {
+		utils.NotFound(c, "server communication not found")
+		return
+	}
+	if comm.TaskID == "" {
+		utils.BadRequest(c, "server communication has no task id yet")
+		return
+	}
+	result, err := h.core.RecoverTaskCost(comm.TaskID)
+	if err != nil {
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if result == nil {
+		utils.NotFound(c, "generation log not found for task "+comm.TaskID)
 		return
 	}
 	utils.Success(c, result)
@@ -380,6 +415,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 			logs.GET("/generation/:id", m.priv("GetGenerationLog"))
 			logs.GET("/server-communications", m.priv("ListServerCommunications"))
 			logs.GET("/server-communications/:id", m.priv("GetServerCommunication"))
+			logs.POST("/server-communications/:id/cost-recovery", m.priv("RecoverServerCommCost"))
 		}
 
 		// The caller's recent tasks (own rows only) — take-reel hydration.
@@ -444,6 +480,8 @@ func (m *Module) priv(method string) gin.HandlerFunc {
 			hdl.ListServerCommunications(c)
 		case "GetServerCommunication":
 			hdl.GetServerCommunication(c)
+		case "RecoverServerCommCost":
+			hdl.RecoverServerCommCost(c)
 		case "ListGeneratedAssets":
 			hdl.ListGeneratedAssets(c)
 		case "ListGeneratedVideos":
