@@ -327,7 +327,6 @@ func (s *GenerationLogStore) ListCostBackfillCandidates(limit int) ([]Generation
 		AND cost_source <> 'provider_refund'
 		AND (cost_source = '' OR cost_source = 'pending'
 			OR (estimated_cost = 0 AND cost_source = 'calculator')
-			OR (cost_source = 'provider_estimate' AND estimated_cost = 0 AND cost_credits > 0)
 			OR (video_resolution = '' AND request_payload LIKE '%resolution%'))
 		ORDER BY created_at DESC LIMIT $1`
 	rows, err := s.db.Query(query, limit)
@@ -371,8 +370,8 @@ func (s *ServerCommunicationStore) GetGenerateResponseBody(taskID string) (strin
 // a provider-reported spend.
 func (s *GenerationLogStore) ApplyCostBackfill(id string, cost float64, source string, duration int, resolution, ratio string) error {
 	query := `UPDATE generation_logs SET
-		estimated_cost = CASE WHEN $1::float8 > 0 AND (cost_source NOT IN ('provider_estimate', 'provider_refund') OR (cost_source = 'provider_estimate' AND estimated_cost = 0)) THEN $1::float8 ELSE estimated_cost END,
-		cost_source = CASE WHEN $2::text <> '' AND cost_source NOT IN ('provider_estimate', 'provider_refund') THEN $2::text ELSE cost_source END,
+		estimated_cost = CASE WHEN $1::float8 > 0 AND cost_source NOT IN ('provider_estimate', 'provider_usage', 'provider_price', 'api_response', 'provider_refund') THEN $1::float8 ELSE estimated_cost END,
+		cost_source = CASE WHEN $2::text <> '' AND cost_source NOT IN ('provider_estimate', 'provider_usage', 'provider_price', 'api_response', 'provider_refund') THEN $2::text ELSE cost_source END,
 		video_duration = CASE WHEN video_duration = 0 AND $3::float8 > 0 THEN $3::float8 ELSE video_duration END,
 		video_resolution = CASE WHEN video_resolution = '' AND $4::text <> '' THEN $4::text ELSE video_resolution END,
 		video_ratio = CASE WHEN video_ratio = '' AND $5 <> '' THEN $5 ELSE video_ratio END,

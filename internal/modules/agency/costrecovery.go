@@ -50,8 +50,9 @@ type CostRecoveryTrace struct {
 	Generator string             `json:"generator"`
 	Before    CostRecoveryRow    `json:"before"`
 	After     CostRecoveryRow    `json:"after"`
-	Applied   bool               `json:"applied"`
-	Decision  string             `json:"decision"`
+	Applied    bool              `json:"applied"`
+	Preference string            `json:"preference,omitempty"`
+	Decision   string            `json:"decision"`
 	Reason    string             `json:"reason"`
 	Steps     []CostRecoveryStep `json:"steps"`
 }
@@ -127,10 +128,16 @@ func (sh recoveryShape) generatorRequest() *GeneratorRequest {
 }
 
 // RecoverTaskCost resolves the spend of one task: it replays the provider
-// estimate with the exact submitted payload, evaluates the local calculator and
-// the provider usage block, then repairs generation_logs when the stored value
-// is missing or provider-reported. Returns nil when the task has no log.
-func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
+// estimate with the exact submitted payload, evaluates the provider usage,
+// the model unit price, the local calculator and the inline usage block, then
+// repairs generation_logs when the stored value is missing or provider-
+// reported. Returns nil when the task has no log.
+//
+// preference picks which source wins when several are available: "" or
+// "provider" favours the provider's figures, "calculator" favours the local
+// calculator. The write guard still keeps a provider-reported spend over a
+// locally calculated one, so a preference never downgrades a real charge.
+func (s *Core) RecoverTaskCost(taskID, preference string) (*CostRecoveryTrace, error) {
 	if s.logStore == nil || taskID == "" {
 		return nil, nil
 	}
@@ -143,8 +150,9 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 	}
 
 	trace := &CostRecoveryTrace{
-		TaskID:    taskID,
-		ModelName: row.ModelName,
+		TaskID:     taskID,
+		ModelName:  row.ModelName,
+		Preference: preference,
 		Before: CostRecoveryRow{
 			EstimatedCost: row.EstimatedCost,
 			CostCredits:   row.CostCredits,
@@ -327,6 +335,85 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 	}
 	trace.Steps = append(trace.Steps, provUsageStep)
 
+	// Provider request id: the only per-generation identifier the API exposes.
+	// Its status route reports no price, but a completed request is proof that
+	// the generation was billed, which no time window can tell us.
+	requestStep := CostRecoveryStep{Key: "provider-request"}
+	charged := false
+	hasRequestID := row.ProviderTransactionID != ""
+	switch {
+	case !hasRequestID:
+		requestStep.Note = "La generación no guardó el request_id del proveedor: sin id no se puede cruzar con soporte ni con la factura."
+	case trace.Provider != string(credential.ProviderHiggsfield) || creds == nil || creds.AuthKey() == "" || baseURL == "":
+		requestStep.Found = true
+		requestStep.Note = "Request_id del proveedor: " + row.ProviderTransactionID + " (sin credencial para consultar su estado)."
+	default:
+		st := TraceHiggsfieldRequestStatus(nil, baseURL, creds.AuthKey(), row.ProviderTransactionID)
+		requestStep.Method = st.Method
+		requestStep.Endpoint = st.URL
+		requestStep.StatusCode = st.StatusCode
+		requestStep.ResponseBody = prettyJSON(st.ResponseBody)
+		requestStep.DurationMs = st.DurationMs
+		requestStep.Found = st.OK
+		requestStep.Note = "Request_id " + row.ProviderTransactionID + " consultado en el proveedor."
+		switch {
+		case !st.OK:
+			requestStep.Note += " No se pudo leer su estado."
+			if st.Error != "" {
+				requestStep.Note += " " + st.Error
+			}
+		case st.Status == "completed":
+			charged = true
+			requestStep.Note += " Estado: completed, la generación se cobró (el estado no informa el monto)."
+		default:
+			requestStep.Note += fmt.Sprintf(" Estado: %s, el proveedor no cobra generaciones fallidas, moderadas ni canceladas.", st.Status)
+		}
+	}
+	trace.Steps = append(trace.Steps, requestStep)
+
+	// Billed unit price of the model: attributes the charge without guessing
+	// the submit bucket, so several generations in the same hour no longer
+	// block the recovery.
+	priceStep := CostRecoveryStep{Key: "provider-price"}
+	priceUnits := shape.Quantity
+	if priceUnits <= 0 {
+		priceUnits = 1
+	}
+	unitPrice, priceUSD, unitPriceOK := 0.0, 0.0, false
+	switch {
+	case !canUsage:
+		priceStep.Note = "No hay un precio unitario consultable para este modelo."
+	default:
+		price := TraceHiggsfieldModelPrice(nil, baseURL, creds.AuthKey(), endpoint)
+		priceStep.Method = price.Method
+		priceStep.Endpoint = price.URL
+		priceStep.StatusCode = price.StatusCode
+		priceStep.ResponseBody = prettyJSON(price.ResponseBody)
+		priceStep.DurationMs = price.DurationMs
+		unit, ok := price.UnitPrice(endpoint, keyIDOf(creds))
+		switch {
+		case !price.OK:
+			priceStep.Note = "No se pudo consultar el precio unitario del modelo."
+			if price.Error != "" {
+				priceStep.Note += " " + price.Error
+			}
+		case !ok:
+			priceStep.Note = "El proveedor no reporta un precio unitario vigente para el modelo: el cargo no se puede atribuir por precio."
+		default:
+			unitPrice = unit
+			priceUSD = unitPrice * float64(priceUnits)
+			priceStep.USD = priceUSD
+			priceStep.Found = true
+			priceStep.Note = fmt.Sprintf("Precio unitario del proveedor: $%.4f × %d unidad(es) = $%.4f, sin depender de la fecha del submit.", unitPrice, priceUnits, priceUSD)
+			if hasRequestID && !charged {
+				priceStep.Note += " El request_id no figura completado: no se aplica."
+			} else {
+				unitPriceOK = true
+			}
+		}
+	}
+	trace.Steps = append(trace.Steps, priceStep)
+
 	// Local calculator (Seedance/Seedream families).
 	calcUSD, calcName := 0.0, ""
 	if calc := s.pickCalculator(row.ModelName); calc != nil {
@@ -381,11 +468,15 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 	}
 	trace.Steps = append(trace.Steps, usageStep)
 
-	// Resolution: provider estimate wins, then the local calculator, then the
-	// inline usage block — the same precedence as the generation core.
+	// Resolution: the provider's own figures win (real charge first, then its
+	// estimate, then the catalog unit price), and the local calculator only
+	// fills what the provider cannot price. The preference flips that order for
+	// the admin who wants to see the calculated value.
 	usd, credits, source, reason := 0.0, 0.0, "", ""
-	switch {
-	case est.OK && (est.USD > 0 || est.Credits > 0):
+	pickEstimate := func() bool {
+		if !(est.OK && (est.USD > 0 || est.Credits > 0)) {
+			return false
+		}
 		usd, credits, source = est.USD, est.Credits, "provider_estimate"
 		if usd == 0 && calcUSD > 0 {
 			usd = calcUSD
@@ -393,16 +484,50 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 		} else {
 			reason = fmt.Sprintf("Estimación del proveedor aceptada: %.3f créditos ≈ $%.4f.", credits, usd)
 		}
-	case exactUsageOK && exactUsageUSD > 0:
-		usd, source = exactUsageUSD, "provider_usage"
+		return true
+	}
+	pickUsage := func() bool {
+		if !(exactUsageOK && exactUsageUSD > 0) {
+			return false
+		}
+		usd, credits, source = exactUsageUSD, 0, "provider_usage"
 		reason = fmt.Sprintf("El proveedor factura $%.4f por esta generación en su panel de consumo: se usa ese monto en lugar del calculado.", exactUsageUSD)
-	case calcUSD > 0:
-		usd, source = calcUSD, "calculator"
-		reason = fmt.Sprintf("Sin estimación del proveedor: se usa la calculadora %s ($%.4f).", calcName, calcUSD)
-	case usageUSD > 0:
-		usd, source = usageUSD, "api_response"
-		reason = fmt.Sprintf("Sin estimación ni calculadora: se recupera usage.cost del submit ($%.4f).", usageUSD)
-	default:
+		return true
+	}
+	pickPrice := func() bool {
+		if !unitPriceOK || priceUSD <= 0 {
+			return false
+		}
+		usd, credits, source = priceUSD, 0, "provider_price"
+		reason = fmt.Sprintf("Precio unitario del proveedor ($%.4f × %d unidad(es)): $%.4f, atribuido por request_id y no por fecha.", unitPrice, priceUnits, priceUSD)
+		return true
+	}
+	pickCalculator := func() bool {
+		if calcUSD <= 0 {
+			return false
+		}
+		usd, credits, source = calcUSD, 0, "calculator"
+		reason = fmt.Sprintf("Se usa la calculadora local %s ($%.4f).", calcName, calcUSD)
+		return true
+	}
+	pickResponse := func() bool {
+		if usageUSD <= 0 {
+			return false
+		}
+		usd, credits, source = usageUSD, 0, "api_response"
+		reason = fmt.Sprintf("Se recupera usage.cost del submit ($%.4f).", usageUSD)
+		return true
+	}
+	order := []func() bool{pickUsage, pickEstimate, pickPrice, pickCalculator, pickResponse}
+	if preference == "calculator" {
+		order = []func() bool{pickCalculator, pickUsage, pickEstimate, pickPrice, pickResponse}
+	}
+	for _, pick := range order {
+		if pick() {
+			break
+		}
+	}
+	if source == "" {
 		reason = "Ninguna fuente devolvió un monto: no hay nada que recuperar para esta tarea."
 	}
 	trace.Decision = source
@@ -411,15 +536,17 @@ func (s *Core) RecoverTaskCost(taskID string) (*CostRecoveryTrace, error) {
 	}
 	trace.Reason = reason
 
-	// Provider-reported rows are refreshed with the live estimate (the stored
-	// figure may come from a failed/stale call); local costs only fill empty
-	// rows, and refunds are never touched.
+	// A provider figure always wins over a locally calculated one (the stored
+	// value may come from a stale or failed call). Local sources only fill empty
+	// rows, so the recovery stays the last resort and never downgrades a real
+	// charge; refunded rows are never touched.
+	providerSourced := source == "provider_usage" || source == "provider_estimate" || source == "provider_price"
 	apply := source != "" && row.CostSource != "provider_refund" &&
-		(row.EstimatedCost == 0 || source == "provider_estimate" || source == "provider_usage")
+		(providerSourced || row.EstimatedCost == 0)
 	if !apply {
 		trace.After = trace.Before
 		if source != "" {
-			trace.Reason = reason + " No se sobrescribe: la fila ya tiene un gasto local calculado."
+			trace.Reason = reason + " No se sobrescribe: la fila ya tiene un gasto y la fuente elegida no viene del proveedor."
 		}
 		return trace, nil
 	}

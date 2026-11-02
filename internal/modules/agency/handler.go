@@ -259,7 +259,21 @@ func (h *Handler) RecoverServerCommCost(c *gin.Context) {
 		utils.BadRequest(c, "server communication has no task id yet")
 		return
 	}
-	result, err := h.core.RecoverTaskCost(comm.TaskID)
+	preference := ""
+	if c.Request.ContentLength != 0 {
+		var body struct {
+			Preference string `json:"preference"`
+		}
+		if berr := c.ShouldBindJSON(&body); berr == nil {
+			preference = body.Preference
+		}
+	}
+	switch preference {
+	case "provider", "calculator":
+	default:
+		preference = ""
+	}
+	result, err := h.core.RecoverTaskCost(comm.TaskID, preference)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
