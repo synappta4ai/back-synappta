@@ -7,8 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	pdfreader "github.com/ledongthuc/pdf"
@@ -113,6 +117,11 @@ func extractBriefText(filename string, data []byte) (string, error) {
 }
 
 // pdfText extrae el texto de un PDF con capa de texto selectable.
+//
+// Muchos generadores escriben cada palabra (o cada glifo) como un bloque de
+// texto independiente, así que leer el content stream en crudo deja una
+// palabra por línea. Acá se reconstruyen las líneas y los párrafos a partir de
+// las coordenadas de cada glifo para que el texto fluya como se ve en el PDF.
 func pdfText(data []byte) (string, error) {
 	r, err := pdfreader.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -121,15 +130,217 @@ func pdfText(data []byte) (string, error) {
 	if r.NumPage() == 0 {
 		return "", errors.New("PDF sin páginas")
 	}
-	pr, err := r.GetPlainText()
-	if err != nil {
-		return "", fmt.Errorf("no se pudo extraer el texto del PDF: %w", err)
+	pages := make([]string, 0, r.NumPage())
+	for i := 1; i <= r.NumPage(); i++ {
+		p := r.Page(i)
+		if p.V.IsNull() {
+			continue
+		}
+		text, err := pdfPageText(p)
+		if err != nil {
+			plain, plainErr := p.GetPlainText(nil)
+			if plainErr != nil {
+				continue
+			}
+			text = plain
+		}
+		if text = strings.TrimSpace(text); text != "" {
+			pages = append(pages, text)
+		}
 	}
-	raw, err := io.ReadAll(io.LimitReader(pr, 4<<20))
-	if err != nil {
-		return "", fmt.Errorf("no se pudo leer el texto del PDF: %w", err)
+	if len(pages) == 0 {
+		return "", errors.New("no se pudo extraer el texto del PDF")
 	}
-	return string(raw), nil
+	return strings.Join(pages, "\n\n"), nil
+}
+
+// pdfGlyph es un fragmento de texto dibujado en una posición del PDF.
+type pdfGlyph struct {
+	x, y, w, size float64
+	text          string
+}
+
+// pdfLine es una línea reconstruida (glifos con la misma altura).
+type pdfLine struct {
+	y    float64
+	size float64
+	text string
+}
+
+func pdfPageText(p pdfreader.Page) (string, error) {
+	glyphs, err := pdfPageGlyphs(p)
+	if err != nil {
+		return "", err
+	}
+	if len(glyphs) == 0 {
+		return "", nil
+	}
+	return pdfGlyphsText(glyphs), nil
+}
+
+// pdfPageGlyphs interpreta la página (content stream) y devuelve cada glifo
+// con su posición. Content() completa X/Y/W (a diferencia del texto crudo).
+func pdfPageGlyphs(p pdfreader.Page) (glyphs []pdfGlyph, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			glyphs, err = nil, fmt.Errorf("no se pudo interpretar el PDF: %v", r)
+		}
+	}()
+	for _, t := range p.Content().Text {
+		s := strings.Map(func(r rune) rune {
+			if r == '\n' || r == '\r' || r == '\t' {
+				return -1
+			}
+			return r
+		}, t.S)
+		if s == "" {
+			continue
+		}
+		glyphs = append(glyphs, pdfGlyph{x: t.X, y: t.Y, w: t.W, size: t.FontSize, text: s})
+	}
+	return glyphs, nil
+}
+
+// pdfGlyphsText agrupa glifos en líneas por altura, separa palabras por el
+// espacio horizontal y arma párrafos según el salto vertical entre líneas.
+func pdfGlyphsText(glyphs []pdfGlyph) string {
+	size := medianSize(glyphs)
+	tol := math.Max(1, 0.35*size)
+
+	sort.SliceStable(glyphs, func(i, j int) bool {
+		if glyphs[i].y != glyphs[j].y {
+			return glyphs[i].y > glyphs[j].y
+		}
+		return glyphs[i].x < glyphs[j].x
+	})
+
+	lines := make([]pdfLine, 0, len(glyphs))
+	current := make([]pdfGlyph, 0, 64)
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		sort.SliceStable(current, func(i, j int) bool { return current[i].x < current[j].x })
+		lines = append(lines, pdfLine{
+			y:    current[0].y,
+			size: medianSize(current),
+			text: joinGlyphs(current),
+		})
+		current = current[:0]
+	}
+	for _, g := range glyphs {
+		if len(current) > 0 && math.Abs(g.y-current[0].y) > tol {
+			flush()
+		}
+		current = append(current, g)
+	}
+	flush()
+
+	return joinLines(lines)
+}
+
+// joinGlyphs concatena los glifos de una línea insertando un espacio cuando
+// la separación horizontal supera el ancho de un espacio tipográfico.
+func joinGlyphs(glyphs []pdfGlyph) string {
+	var b strings.Builder
+	endsSpace := false
+	for i, g := range glyphs {
+		if i > 0 && !endsSpace && !strings.HasPrefix(g.text, " ") {
+			prev := glyphs[i-1]
+			prevW := prev.w
+			if prevW <= 0 {
+				prevW = 0.5 * prev.size
+			}
+			space := 0.2 * math.Max(prev.size, g.size)
+			if g.x-(prev.x+prevW) > space {
+				b.WriteByte(' ')
+				endsSpace = true
+			}
+		}
+		b.WriteString(g.text)
+		endsSpace = strings.HasSuffix(g.text, " ")
+	}
+	return b.String()
+}
+
+// joinLines une las líneas de una página: espacio simple dentro de un
+// párrafo, línea en blanco cuando el salto vertical es mayor al interlineado
+// habitual, y une palabras cortadas con guion al final de línea.
+func joinLines(lines []pdfLine) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	leading := medianLeading(lines)
+	if leading <= 0 {
+		leading = math.Max(1, lines[0].size)
+	}
+	var paragraphs []string
+	var cur strings.Builder
+	cur.WriteString(lines[0].text)
+	for i := 1; i < len(lines); i++ {
+		prev, ln := lines[i-1], lines[i]
+		gap := prev.y - ln.y
+		hyphenated := strings.HasSuffix(prev.text, "-") && startsLower(ln.text)
+		switch {
+		case gap > 1.65*leading:
+			if s := strings.TrimSpace(cur.String()); s != "" {
+				paragraphs = append(paragraphs, s)
+			}
+			cur.Reset()
+			cur.WriteString(ln.text)
+		case hyphenated:
+			cur.Reset()
+			cur.WriteString(strings.TrimSuffix(cur.String(), "-"))
+			cur.WriteString(ln.text)
+		default:
+			cur.WriteByte(' ')
+			cur.WriteString(ln.text)
+		}
+	}
+	if s := strings.TrimSpace(cur.String()); s != "" {
+		paragraphs = append(paragraphs, s)
+	}
+	return strings.Join(paragraphs, "\n\n")
+}
+
+// medianLeading devuelve la mediana (inferior) de los saltos verticales
+// entre líneas consecutivas; es el interlineado típico de la página.
+func medianLeading(lines []pdfLine) float64 {
+	gaps := make([]float64, 0, len(lines)-1)
+	for i := 1; i < len(lines); i++ {
+		if gap := lines[i-1].y - lines[i].y; gap > 0 {
+			gaps = append(gaps, gap)
+		}
+	}
+	if len(gaps) == 0 {
+		return 0
+	}
+	sort.Float64s(gaps)
+	return gaps[(len(gaps)-1)/2]
+}
+
+func medianSize[T interface {
+	pdfGlyph | pdfLine
+}](items []T) float64 {
+	if len(items) == 0 {
+		return 0
+	}
+	sizes := make([]float64, len(items))
+	for i, it := range items {
+		switch v := any(it).(type) {
+		case pdfGlyph:
+			sizes[i] = v.size
+		case pdfLine:
+			sizes[i] = v.size
+		}
+	}
+	sort.Float64s(sizes)
+	return sizes[(len(sizes)-1)/2]
+}
+
+func startsLower(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsLower(r)
 }
 
 // docxText extrae el texto de un DOCX (word/document.xml dentro del zip),
