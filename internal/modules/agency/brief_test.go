@@ -12,8 +12,13 @@ import (
 // los offsets de la tabla xref (requeridos por el parser) al concatenar.
 func buildTestPDF(t *testing.T, text string) []byte {
 	t.Helper()
+	return buildTestPDFContent(t, fmt.Sprintf("BT /F1 12 Tf 72 720 Td (%s) Tj ET", text))
+}
 
-	content := fmt.Sprintf("BT /F1 12 Tf 72 720 Td (%s) Tj ET", text)
+// buildTestPDFContent arma un PDF de una página con el content stream dado.
+func buildTestPDFContent(t *testing.T, content string) []byte {
+	t.Helper()
+
 	objs := []string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -37,6 +42,26 @@ func buildTestPDF(t *testing.T, text string) []byte {
 	}
 	fmt.Fprintf(&buf, "trailer << /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xrefStart)
 	return buf.Bytes()
+}
+
+// testPDFLine describe una línea visual: una Y y sus palabras, cada una en su
+// propio bloque de texto (BT/ET), como hacen muchos generadores de PDF.
+type testPDFLine struct {
+	y     float64
+	words []string
+}
+
+func buildTestPDFLines(t *testing.T, lines ...testPDFLine) []byte {
+	t.Helper()
+	var content strings.Builder
+	for _, ln := range lines {
+		x := 72.0
+		for _, word := range ln.words {
+			fmt.Fprintf(&content, "BT /F1 12 Tf %.1f %.1f Td (%s) Tj ET\n", x, ln.y, word)
+			x += 7*float64(len(word)) + 6
+		}
+	}
+	return buildTestPDFContent(t, content.String())
 }
 
 // buildTestDOCX genera un DOCX mínimo (zip con word/document.xml) con los
@@ -92,6 +117,16 @@ func TestExtractBriefText(t *testing.T) {
 			filename: "folleto.pdf",
 			data:     buildTestPDF(t, "Hello Synapta"),
 			want:     "Hello Synapta",
+		},
+		{
+			name:     "pdf con una palabra por bloque de texto",
+			filename: "guion.pdf",
+			data: buildTestPDFLines(t,
+				testPDFLine{y: 720, words: []string{"VIDEO", "30", "SEGUNDOS"}},
+				testPDFLine{y: 704, words: []string{"DE", "ANIMA", "IDEAS"}},
+				testPDFLine{y: 660, words: []string{"Segunda", "escena", "del", "guion."}},
+			),
+			want: "VIDEO 30 SEGUNDOS DE ANIMA IDEAS\n\nSegunda escena del guion.",
 		},
 		{
 			name:     "docx con varios párrafos",
