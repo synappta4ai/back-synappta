@@ -238,7 +238,7 @@ func (s *GenerationLogStore) Create(log *GenerationLog) error {
 		nullIfEmptyStr(log.EventID),
 		nullIfEmptyStr(log.ProgramID),
 		nullIfEmptyStr(log.PieceID),
-		nullIfEmptyStr(log.PieceCode),
+		log.PieceCode,
 		log.GenerationNumber,
 		log.ResourceType,
 		log.ContentTypes,
@@ -247,8 +247,8 @@ func (s *GenerationLogStore) Create(log *GenerationLog) error {
 		log.CostCredits,
 		log.ProviderTransactionID,
 		log.VideoDuration,
-		nullIfEmptyStr(log.VideoResolution),
-		nullIfEmptyStr(log.VideoRatio),
+		log.VideoResolution,
+		log.VideoRatio,
 	).Scan(&log.ID, &log.CreatedAt, &log.UpdatedAt)
 }
 
