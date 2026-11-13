@@ -409,6 +409,8 @@ type composeRequest struct {
 	AspectRatio string  `json:"aspect_ratio"`
 	// Notes are the user's corrections and extra instructions.
 	Notes string `json:"notes"`
+	// Lighting is the art-direction/lighting block chosen in the UI.
+	Lighting string `json:"lighting"`
 }
 
 // Compose handles POST /infoproduct/compose.
@@ -500,6 +502,9 @@ func (m *Module) Compose(c *gin.Context) {
 	}
 	if notes := strings.TrimSpace(req.Notes); notes != "" {
 		legacy.WriteString("\n\nUSER NOTES:\n" + notes)
+	}
+	if lighting := strings.TrimSpace(req.Lighting); lighting != "" {
+		legacy.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n" + lighting)
 	}
 	fmt.Fprintf(&legacy, "\n\nProduct images attached: %d (labeled @Image1..). Audio references attached: %d.", len(req.ImageFileIDs), len(req.AudioFileIDs))
 
@@ -621,6 +626,7 @@ func (m *Module) Compose(c *gin.Context) {
 				Audios:        audios,
 				Videos:        videos,
 				Notes:         req.Notes,
+				Lighting:      req.Lighting,
 				AspectRatio:   firstNonEmpty(req.AspectRatio, ref.Ratio),
 				FPS:           req.FPS,
 				TotalDuration: ref.Duration,

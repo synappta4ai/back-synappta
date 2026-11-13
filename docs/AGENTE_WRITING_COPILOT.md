@@ -9,6 +9,17 @@ duración por plano.
   (`name: Synappta-WRITE`), copia idéntica del original de `internal/Prompt/`.
   El frontmatter se quita al cargar y se valida el nombre; si no coincide, el
   agente queda deshabilitado (no se usa otro prompt como reemplazo).
+- **Guía de estructura del paso 1**: `params.video_type` agrega al system prompt
+  el documento que estructura la idea antes de escribir los prompts:
+  `commercial_short` / `commercial_long` → `master-prompt-publicidad-adaptable.md`
+  (gancho, problema, solución y CTA); `story_short` / `story_long` →
+  `master-prompt-guion-cinematografico.md` (tres actos, arco y conflicto
+  causal). Vacío o ausente deja sólo el skill base; un valor desconocido
+  responde 400. Los originales viven en
+  `internal/Prompt/master-prompt-publicidad-adaptable.md` y
+  `internal/Prompt/master-prompt-guion-cinematografico.md`; `prompts/` guarda
+  copias idénticas (Go no puede embeber fuera del paquete) y un test falla si
+  se desincronizan.
 - **Endpoints**: `GET /api/v1/writing-copilot/availability` y
   `POST /api/v1/writing-copilot/chat` (`message`, `history`, `params`,
   `references` opcional). La respuesta trae `text` y `prompts[]` con el

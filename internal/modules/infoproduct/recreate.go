@@ -168,6 +168,7 @@ type recreateInput struct {
 	Audios        []recreateAudio
 	Videos        []recreateVideo
 	Notes         string
+	Lighting      string
 	AspectRatio   string
 	FPS           float64
 	TotalDuration float64
@@ -361,6 +362,10 @@ func buildRecreateUserMessage(in recreateInput) (string, error) {
 	if notes := strings.TrimSpace(in.Notes); notes != "" {
 		b.WriteString("\n\nUSER_NOTES:\n")
 		b.WriteString(notes)
+	}
+	if lighting := strings.TrimSpace(in.Lighting); lighting != "" {
+		b.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n")
+		b.WriteString(lighting)
 	}
 	ratio := strings.TrimSpace(in.AspectRatio)
 	if ratio == "" {

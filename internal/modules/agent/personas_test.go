@@ -75,6 +75,7 @@ func TestWorkflowFromSlug(t *testing.T) {
 		{slug: "real_estate", want: "real_estate", wantOK: true},
 		{slug: "cinema", want: "cinema", wantOK: true},
 		{slug: "Cinema", want: "cinema", wantOK: true},
+		{slug: "assistant", want: "assistant", wantOK: true},
 		{slug: "bogus", wantOK: false},
 		{slug: "", wantOK: false},
 	}
@@ -152,4 +153,23 @@ func TestConvStore(t *testing.T) {
 			t.Errorf("conversaciones=%d, want <= %d", n, convMaxConvs)
 		}
 	})
+}
+func TestAssistantPersona(t *testing.T) {
+	t.Parallel()
+
+	p := personaFor("assistant")
+	if p.Name != "Asistente Synapta" {
+		t.Errorf("Name=%q", p.Name)
+	}
+	for _, want := range []string{"asistente de ayuda", "brica de videos", "Estudio", "Recursos", "Herramientas"} {
+		if !strings.Contains(p.ChatSystem, want) {
+			t.Errorf("ChatSystem no menciona %q", want)
+		}
+	}
+	if !isAssistantWorkflow("assistant") || !isAssistantWorkflow("Assistant") {
+		t.Error("isAssistantWorkflow debe aceptar el slug en cualquier capitalizacion")
+	}
+	if isAssistantWorkflow("commercial") || isAssistantWorkflow("") {
+		t.Error("isAssistantWorkflow no debe marcar otros workflows")
+	}
 }

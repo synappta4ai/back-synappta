@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -242,5 +244,84 @@ func TestChatRejectsEmptyMessage(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("mensaje vacio = %d, se esperaba 400", rec.Code)
+	}
+}
+
+func TestValidVideoType(t *testing.T) {
+	for _, vt := range []string{"", VideoTypeCommercialShort, VideoTypeCommercialLong, VideoTypeStoryShort, VideoTypeStoryLong} {
+		if !ValidVideoType(vt) {
+			t.Errorf("ValidVideoType(%q) = false", vt)
+		}
+	}
+	for _, vt := range []string{"otro", "commercial", "short"} {
+		if ValidVideoType(vt) {
+			t.Errorf("ValidVideoType(%q) = true", vt)
+		}
+	}
+}
+
+func TestSystemPromptForVideoType(t *testing.T) {
+	base, err := LoadWritingCopilotSystemPrompt()
+	if err != nil {
+		t.Fatalf("LoadWritingCopilotSystemPrompt() error = %v", err)
+	}
+	cases := []struct {
+		videoType string
+		marker    string
+	}{
+		{VideoTypeCommercialShort, "MOTOR DE STORYTELLING COMERCIAL"},
+		{VideoTypeCommercialLong, "MOTOR DE STORYTELLING COMERCIAL"},
+		{VideoTypeStoryShort, "MOTOR DE REESTRUCTURACIÓN Y ENRIQUECIMIENTO NARRATIVO"},
+		{VideoTypeStoryLong, "NARRATIVE CORE (long story)"},
+	}
+	for _, tc := range cases {
+		prompt, err := SystemPromptForVideoType(tc.videoType)
+		if err != nil {
+			t.Fatalf("SystemPromptForVideoType(%q) error = %v", tc.videoType, err)
+		}
+		if !strings.HasPrefix(prompt, base) {
+			t.Errorf("%q: el prompt debe empezar con el skill base", tc.videoType)
+		}
+		if !strings.Contains(prompt, "STEP 1 STRUCTURE GUIDE") {
+			t.Errorf("%q: falta la seccion de estructura", tc.videoType)
+		}
+		if !strings.Contains(prompt, tc.marker) {
+			t.Errorf("%q: falta el marcador %q", tc.videoType, tc.marker)
+		}
+	}
+	for _, vt := range []string{"", "otro"} {
+		prompt, err := SystemPromptForVideoType(vt)
+		if err != nil {
+			t.Fatalf("SystemPromptForVideoType(%q) error = %v", vt, err)
+		}
+		if prompt != base {
+			t.Errorf("%q: sin tipo valido el prompt debe ser solo el skill base", vt)
+		}
+	}
+}
+
+func TestRenderParamsIncludesVideoType(t *testing.T) {
+	got := renderParams(&chatParams{VideoType: VideoTypeStoryLong})
+	if !strings.Contains(got, "video_type: story_long") {
+		t.Errorf("renderParams() = %q", got)
+	}
+}
+
+func TestEmbeddedGuidesMatchPromptOriginals(t *testing.T) {
+	cases := []struct {
+		file  string
+		guide string
+	}{
+		{"master-prompt-publicidad-adaptable.md", commercialGuide},
+		{"master-prompt-guion-cinematografico.md", narrativeGuide},
+	}
+	for _, tc := range cases {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "Prompt", tc.file))
+		if err != nil {
+			t.Fatalf("no se pudo leer internal/Prompt/%s: %v", tc.file, err)
+		}
+		if string(raw) != tc.guide {
+			t.Errorf("internal/Prompt/%s y prompts/%s estan desincronizados", tc.file, tc.file)
+		}
 	}
 }

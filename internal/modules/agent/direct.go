@@ -142,7 +142,7 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 	// sales_angles (mensaje que menciona "ángulo" sin marcar el artefacto)
 	// sigue cayendo en el mismo camino.
 	kind := req.Artifact
-	if kind == "" && angleRe.MatchString(req.Message) {
+	if kind == "" && !isAssistantWorkflow(req.Workflow) && angleRe.MatchString(req.Message) {
 		kind = artifactSalesAngles
 	}
 	if spec, ok := parseArtifactKind(kind); ok {
@@ -152,6 +152,11 @@ func (m *Module) directChat(c *gin.Context, req chatRequest, hdl *credential.Han
 
 	persona := personaFor(req.Workflow)
 	system := persona.ChatSystem
+	if isAssistantWorkflow(req.Workflow) {
+		if screen := strings.TrimSpace(req.Context); screen != "" {
+			system += "\n\nContexto de navegación: el usuario está viendo " + screen + ". Si la pregunta es sobre esta pantalla, usá ese contexto."
+		}
+	}
 	if deps != nil {
 		// Con herramientas disponibles el experto pasa a ser operador:
 		// consulta y ejecuta sobre el tenant antes de contestar.
@@ -379,6 +384,11 @@ func artifactUserMessage(req chatRequest, spec artifactSpec) string {
 		} else {
 			sb.Write(req.Payload)
 		}
+		sb.WriteString("\n\n")
+	}
+	if lighting := strField(decodePayload(req.Payload), "iluminacion"); lighting != "" {
+		sb.WriteString("ILUMINACIÓN / DIRECCIÓN DE ARTE (aplicar de forma coherente en todos los planos, imágenes y videos):\n")
+		sb.WriteString(lighting)
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString("Respondé EXCLUSIVAMENTE con el JSON de la SALIDA de ese paso, sin markdown ni texto alrededor.")

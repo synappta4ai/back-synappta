@@ -29,6 +29,23 @@ import (
 //go:embed "prompts/Synappta Skill writing copilot.md"
 var skillRaw string
 
+// Step-1 structure guides: each video type picks the document that tells the
+// brain how to structure the idea before writing the prompts.
+//
+//go:embed "prompts/master-prompt-publicidad-adaptable.md"
+var commercialGuide string
+
+//go:embed "prompts/master-prompt-guion-cinematografico.md"
+var narrativeGuide string
+
+// Video types accepted in params.video_type. Empty keeps the base skill only.
+const (
+	VideoTypeCommercialShort = "commercial_short"
+	VideoTypeCommercialLong  = "commercial_long"
+	VideoTypeStoryShort      = "story_short"
+	VideoTypeStoryLong       = "story_long"
+)
+
 const (
 	skillName = "Synappta-WRITE"
 
@@ -147,6 +164,60 @@ func LoadWritingCopilotSystemPrompt() (string, error) {
 	return loadSkill(skillRaw)
 }
 
+// structureGuide returns the step-1 guide for a video type: title, document
+// body and the short note that adapts it to the short/long variant.
+func structureGuide(videoType string) (title, body, note string, ok bool) {
+	switch strings.TrimSpace(videoType) {
+	case VideoTypeCommercialShort:
+		return "ADAPTIVE COMMERCIAL STORYTELLING (short form)", commercialGuide,
+			"Target length: 6 to 30 s. Compress the arc: the hook and the problem may share one action, the solution enters fast and the CTA closes the last shot.", true
+	case VideoTypeCommercialLong:
+		return "ADAPTIVE COMMERCIAL STORYTELLING (long form)", commercialGuide,
+			"Target length: 30 to 60 s. Keep the four phases with room for a before/after contrast and a clear product demonstration.", true
+	case VideoTypeStoryShort:
+		return "NARRATIVE CORE (short story)", narrativeGuide,
+			"Keep one protagonist, one conscious desire and one escalating conflict in a compact three-act skeleton that fits a short piece.", true
+	case VideoTypeStoryLong:
+		return "NARRATIVE CORE (long story)", narrativeGuide,
+			"Develop the full three-act architecture, midpoint, pinch points and character arc exactly as this guide requires.", true
+	}
+	return "", "", "", false
+}
+
+// ValidVideoType reports whether videoType is empty or one of the accepted
+// values.
+func ValidVideoType(videoType string) bool {
+	switch strings.TrimSpace(videoType) {
+	case "", VideoTypeCommercialShort, VideoTypeCommercialLong, VideoTypeStoryShort, VideoTypeStoryLong:
+		return true
+	}
+	return false
+}
+
+// SystemPromptForVideoType returns the base skill plus the step-1 structure
+// guide selected by videoType. An empty or unknown type keeps the base skill.
+func SystemPromptForVideoType(videoType string) (string, error) {
+	base, err := LoadWritingCopilotSystemPrompt()
+	if err != nil {
+		return "", err
+	}
+	title, guide, note, ok := structureGuide(videoType)
+	if !ok {
+		return base, nil
+	}
+	guide = strings.TrimSpace(strings.ReplaceAll(strings.TrimPrefix(guide, "\ufeff"), "\r\n", "\n"))
+	section := strings.Join([]string{
+		"## 0.5 STEP 1 STRUCTURE GUIDE — " + title,
+		"",
+		note,
+		"",
+		"Apply this guide to how you understand, diagnose and structure the idea in STEP 1. Build the beats, the acts and the duration distribution exactly as it requires, then translate that structure into the cinematographic prompts defined in Sections 5 to 9 of this skill. If the guide and this skill disagree, the guide wins for narrative structure, act distribution and timing; this skill wins for shot design, camera, lighting, acting and prompt format.",
+		"",
+		guide,
+	}, "\n")
+	return base + "\n\n" + section, nil
+}
+
 func init() {
 	sum := sha256.Sum256([]byte(skillRaw))
 	short := fmt.Sprintf("%x", sum)
@@ -230,6 +301,12 @@ type chatParams struct {
 	TargetModel    string   `json:"target_model"`  // video model the piece is written for
 	ResponseMode   string   `json:"response_mode"` // chat | prompt_only
 	ShotCount      *int     `json:"shot_count"`    // cuts inside the piece
+	CutsPerShot    *int     `json:"cuts_per_shot"` // framing changes inside each shot
+	// VideoType selects the step-1 structure guide: commercial_short |
+	// commercial_long | story_short | story_long.
+	VideoType string `json:"video_type"`
+	// Lighting is the art-direction/lighting block chosen in the UI.
+	Lighting string `json:"lighting"`
 }
 
 // chatRequest is POST /writing-copilot/chat.
@@ -318,6 +395,14 @@ func (m *Module) Chat(c *gin.Context) {
 		utils.BadRequest(c, fmt.Sprintf("el mensaje supera los %d caracteres", maxMessageChars))
 		return
 	}
+	videoType := ""
+	if req.Params != nil {
+		videoType = strings.TrimSpace(req.Params.VideoType)
+	}
+	if !ValidVideoType(videoType) {
+		utils.BadRequest(c, "video_type invalido: usa commercial_short, commercial_long, story_short o story_long")
+		return
+	}
 	hdl, ok := m.creds(c)
 	if !ok {
 		return
@@ -327,14 +412,14 @@ func (m *Module) Chat(c *gin.Context) {
 		utils.BadRequest(c, rerr.Error())
 		return
 	}
-	system, err := LoadWritingCopilotSystemPrompt()
+	system, err := SystemPromptForVideoType(videoType)
 	if err != nil {
 		utils.Error(c, http.StatusServiceUnavailable, "el skill de Writing Copilot no esta disponible")
 		return
 	}
 	started := time.Now()
-	log.Printf("[writingcopilot] chat provider=%s model=%s system_bytes=%d history=%d message_chars=%d",
-		provider, model, len(system), len(req.History), len(req.Message))
+	log.Printf("[writingcopilot] chat provider=%s model=%s video_type=%q system_bytes=%d history=%d message_chars=%d",
+		provider, model, videoType, len(system), len(req.History), len(req.Message))
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), callTimeout)
 	defer cancel()
@@ -424,6 +509,11 @@ func renderParams(p *chatParams) string {
 	if p.ShotCount != nil && *p.ShotCount > 0 {
 		add("shot_count", strconv.Itoa(*p.ShotCount))
 	}
+	if p.CutsPerShot != nil && *p.CutsPerShot > 0 {
+		add("cuts_per_shot", strconv.Itoa(*p.CutsPerShot))
+	}
+	add("video_type", p.VideoType)
+	add("lighting", p.Lighting)
 	return strings.Join(lines, "\n")
 }
 
