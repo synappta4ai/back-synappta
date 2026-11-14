@@ -294,8 +294,14 @@ func TestSystemPromptForVideoType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SystemPromptForVideoType(%q) error = %v", vt, err)
 		}
-		if prompt != base {
-			t.Errorf("%q: sin tipo valido el prompt debe ser solo el skill base", vt)
+		if !strings.HasPrefix(prompt, base) {
+			t.Errorf("%q: el prompt debe empezar con el skill base", vt)
+		}
+		if strings.Contains(prompt, "STEP 1 STRUCTURE GUIDE") {
+			t.Errorf("%q: sin tipo valido no debe haber guia de estructura", vt)
+		}
+		if !strings.Contains(prompt, "ACTING ENGINE") {
+			t.Errorf("%q: falta el motor de actuacion", vt)
 		}
 	}
 }
@@ -322,6 +328,18 @@ func TestEmbeddedGuidesMatchPromptOriginals(t *testing.T) {
 		}
 		if string(raw) != tc.guide {
 			t.Errorf("internal/Prompt/%s y prompts/%s estan desincronizados", tc.file, tc.file)
+		}
+	}
+}
+
+func TestSystemPromptIncludesActingEngine(t *testing.T) {
+	for _, videoType := range []string{"", VideoTypeCommercialShort, VideoTypeStoryLong} {
+		prompt, err := SystemPromptForVideoType(videoType)
+		if err != nil {
+			t.Fatalf("SystemPromptForVideoType(%q) error = %v", videoType, err)
+		}
+		if !strings.Contains(prompt, "ACTING ENGINE") || !strings.Contains(prompt, "Weston step") {
+			t.Errorf("%q: el prompt no incluye el motor de actuacion", videoType)
 		}
 	}
 }

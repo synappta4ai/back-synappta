@@ -173,3 +173,15 @@ func TestAssistantPersona(t *testing.T) {
 		t.Error("isAssistantWorkflow no debe marcar otros workflows")
 	}
 }
+
+func TestWithActingEngine(t *testing.T) {
+	t.Parallel()
+
+	prompt := withActingEngine("BASE", artifactClipPrompt)
+	if !strings.Contains(prompt, "ACTING ENGINE") || !strings.Contains(prompt, "Mamet step") {
+		t.Error("el artefacto de prompt no incluye el motor de actuacion")
+	}
+	if got := withActingEngine("BASE", artifactSalesAngles); got != "BASE" {
+		t.Errorf("los angulos no deben llevar el motor de actuacion: %q", got)
+	}
+}

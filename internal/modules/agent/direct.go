@@ -239,6 +239,7 @@ func (m *Module) artifactTurn(c *gin.Context, req chatRequest, hdl *credential.H
 		// Sin secciones del .md embebido cae al prompt de la persona.
 		system = personaFor(req.Workflow).AnglesSystem
 	}
+	system = withActingEngine(system, spec.Kind)
 
 	payload := decodePayload(req.Payload)
 	msgs := []chatMsg{{Role: "user", Content: artifactUserMessage(req, spec)}}
@@ -389,6 +390,11 @@ func artifactUserMessage(req chatRequest, spec artifactSpec) string {
 	if lighting := strField(decodePayload(req.Payload), "iluminacion"); lighting != "" {
 		sb.WriteString("ILUMINACIÓN / DIRECCIÓN DE ARTE (aplicar de forma coherente en todos los planos, imágenes y videos):\n")
 		sb.WriteString(lighting)
+		sb.WriteString("\n\n")
+	}
+	if camera := strField(decodePayload(req.Payload), "movimiento_camara"); camera != "" {
+		sb.WriteString("MOVIMIENTOS DE CÁMARA (respetar el orden elegido en cada toma):\n")
+		sb.WriteString(camera)
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString("Respondé EXCLUSIVAMENTE con el JSON de la SALIDA de ese paso, sin markdown ni texto alrededor.")

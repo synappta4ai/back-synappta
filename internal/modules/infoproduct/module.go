@@ -29,6 +29,7 @@ import (
 
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
+	"synapta/internal/skills"
 	"synapta/internal/utils"
 )
 
@@ -411,6 +412,8 @@ type composeRequest struct {
 	Notes string `json:"notes"`
 	// Lighting is the art-direction/lighting block chosen in the UI.
 	Lighting string `json:"lighting"`
+	// CameraMovements is the ordered camera-movement block chosen in the UI.
+	CameraMovements string `json:"camera_movements"`
 }
 
 // Compose handles POST /infoproduct/compose.
@@ -505,6 +508,9 @@ func (m *Module) Compose(c *gin.Context) {
 	}
 	if lighting := strings.TrimSpace(req.Lighting); lighting != "" {
 		legacy.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n" + lighting)
+	}
+	if camera := strings.TrimSpace(req.CameraMovements); camera != "" {
+		legacy.WriteString("\n\nCAMERA MOVEMENTS (respect the chosen order in every segment prompt):\n" + camera)
 	}
 	fmt.Fprintf(&legacy, "\n\nProduct images attached: %d (labeled @Image1..). Audio references attached: %d.", len(req.ImageFileIDs), len(req.AudioFileIDs))
 
@@ -621,17 +627,18 @@ func (m *Module) Compose(c *gin.Context) {
 			log.Printf("[infoproduct] recreate skill no disponible (%v): se usa el flujo anterior", serr)
 		} else {
 			in := recreateInput{
-				Breakdown:     req.Breakdown,
-				Images:        images,
-				Audios:        audios,
-				Videos:        videos,
-				Notes:         req.Notes,
-				Lighting:      req.Lighting,
-				AspectRatio:   firstNonEmpty(req.AspectRatio, ref.Ratio),
-				FPS:           req.FPS,
-				TotalDuration: ref.Duration,
-				MaxDuration:   req.Target.MaxDuration,
-				TargetModel:   firstNonEmpty(req.TargetModel, req.Target.Model),
+				Breakdown:       req.Breakdown,
+				Images:          images,
+				Audios:          audios,
+				Videos:          videos,
+				Notes:           req.Notes,
+				Lighting:        req.Lighting,
+				CameraMovements: req.CameraMovements,
+				AspectRatio:     firstNonEmpty(req.AspectRatio, ref.Ratio),
+				FPS:             req.FPS,
+				TotalDuration:   ref.Duration,
+				MaxDuration:     req.Target.MaxDuration,
+				TargetModel:     firstNonEmpty(req.TargetModel, req.Target.Model),
 			}
 			userMsg, berr := buildRecreateUserMessage(in)
 			if berr != nil {
@@ -677,7 +684,13 @@ func (m *Module) Compose(c *gin.Context) {
 	}
 
 	parts := append([]map[string]any{textPart(legacy.String())}, mediaParts...)
-	answer, u, err := m.brain.jsonAnswer(c.Request.Context(), baseURL, apiKey, req.Model, composeSystem, parts, 8192)
+	legacySystem := composeSystem
+	if acting, aerr := skills.ActingEngine(); aerr == nil && acting != "" {
+		legacySystem += "\n\n## ACTING ENGINE — APPLY TO EVERY CHARACTER PERFORMANCE\n\n" +
+			"Use this acting engine in every character shot you write: convert emotions into transitive actions and observable muscular facts, add one asynchronous micro-fidget in acting shots over 1 s, and translate prohibitions into positive locks. It enriches performance only: never change the story, camera, lighting, continuity or output format.\n\n" +
+			acting
+	}
+	answer, u, err := m.brain.jsonAnswer(c.Request.Context(), baseURL, apiKey, req.Model, legacySystem, parts, 8192)
 	if err != nil {
 		utils.Error(c, http.StatusBadGateway, err.Error())
 		return

@@ -9,6 +9,12 @@ duración por plano.
   (`name: Synappta-WRITE`), copia idéntica del original de `internal/Prompt/`.
   El frontmatter se quita al cargar y se valida el nombre; si no coincide, el
   agente queda deshabilitado (no se usa otro prompt como reemplazo).
+- **Motor de actuación**: al system prompt se anexa la sección 6 del skill
+  `Synappta Skill actuacion Infoproducto.md` (paquete `internal/skills`):
+  Weston/Mamet, diccionario anatómico, micro-fidgets y locks positivos. Se usa
+  en todos los turnos que producen prompts, incluido el prompt final; no es un
+  paso de UI. Los artefactos de prompt de `/agency` reciben el mismo motor
+  (salvo los ángulos de venta) y el compose legacy de Infoproducto también.
 - **Guía de estructura del paso 1**: `params.video_type` agrega al system prompt
   el documento que estructura la idea antes de escribir los prompts:
   `commercial_short` / `commercial_long` → `master-prompt-publicidad-adaptable.md`
