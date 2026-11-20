@@ -163,16 +163,18 @@ type recreateVideo struct {
 }
 
 type recreateInput struct {
-	Breakdown     json.RawMessage
-	Images        []recreateImage
-	Audios        []recreateAudio
-	Videos        []recreateVideo
-	Notes         string
-	AspectRatio   string
-	FPS           float64
-	TotalDuration float64
-	MaxDuration   int
-	TargetModel   string
+	Breakdown       json.RawMessage
+	Images          []recreateImage
+	Audios          []recreateAudio
+	Videos          []recreateVideo
+	Notes           string
+	Lighting        string
+	CameraMovements string
+	AspectRatio     string
+	FPS             float64
+	TotalDuration   float64
+	MaxDuration     int
+	TargetModel     string
 }
 
 type recreateShot struct {
@@ -361,6 +363,14 @@ func buildRecreateUserMessage(in recreateInput) (string, error) {
 	if notes := strings.TrimSpace(in.Notes); notes != "" {
 		b.WriteString("\n\nUSER_NOTES:\n")
 		b.WriteString(notes)
+	}
+	if lighting := strings.TrimSpace(in.Lighting); lighting != "" {
+		b.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n")
+		b.WriteString(lighting)
+	}
+	if camera := strings.TrimSpace(in.CameraMovements); camera != "" {
+		b.WriteString("\n\nCAMERA MOVEMENTS (respect the chosen order in every segment prompt):\n")
+		b.WriteString(camera)
 	}
 	ratio := strings.TrimSpace(in.AspectRatio)
 	if ratio == "" {

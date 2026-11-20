@@ -39,6 +39,10 @@ type CoreResolver func(c *gin.Context) (*agency.Core, bool)
 // FlowsResolver supplies the tenant-scoped agency flow store per request.
 type FlowsResolver func(c *gin.Context) (toolkit.FlowsAPI, bool)
 
+// assistantModel is the default brain of the global assistant: a multimodal
+// text model so it can answer anything the app does.
+const assistantModel = "google/gemini-3.8-flash"
+
 // chatRequest is the front-end payload for one agent chat turn.
 type chatRequest struct {
 	ConversationID string `json:"conversation_id"`
@@ -56,6 +60,9 @@ type chatRequest struct {
 	// Model overrides the LLM configured in admin/models (credential extra)
 	// for this single request — lets the agency flow pick the model per step.
 	Model string `json:"model,omitempty"`
+	// Context is the screen where the user is when talking to the global
+	// assistant (page title + route), so answers can point to that section.
+	Context string `json:"context,omitempty"`
 }
 
 // Module registers the /agent routes (tenant-scoped).
@@ -107,7 +114,7 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, _ gin.HandlerFu
 	g.Use(authMw, tenantMw)
 	{
 		g.POST("/chat", m.Chat)
-		for _, slug := range []string{"commercial", "real-estate", "cinema"} {
+		for _, slug := range []string{"commercial", "real-estate", "cinema", "assistant"} {
 			s := slug
 			g.POST("/chat/"+s, func(c *gin.Context) { m.ChatWorkflow(c, s) })
 		}
@@ -161,6 +168,16 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 	if forcedWorkflow != "" {
 		req.Workflow = forcedWorkflow
 	}
+	isAssistant := isAssistantWorkflow(req.Workflow)
+	if isAssistant {
+		// El asistente global no genera artefactos: si llega uno, se ignora
+		// y el turno sigue como chat de ayuda.
+		req.Workflow = workflowAssistant
+		req.Artifact = ""
+		if strings.TrimSpace(req.Model) == "" {
+			req.Model = assistantModel
+		}
+	}
 	if !credential.IsValidProvider(req.Provider) {
 		utils.BadRequest(c, fmt.Sprintf("invalid provider %q", req.Provider))
 		return
@@ -171,8 +188,24 @@ func (m *Module) chatTurn(c *gin.Context, forcedWorkflow string) {
 		utils.InternalError(c, err.Error())
 		return
 	}
+	if (cred == nil || cred.AuthKey() == "") && isAssistant {
+		// Preferencia por OpenRouter/Gemini; sin key, el asistente cae al
+		// otro proveedor con credencial en vez de quedar mudo.
+		if alt, aerr := hdl.Resolve(credential.ProviderAnthropic); aerr == nil && alt != nil && alt.AuthKey() != "" {
+			req.Provider = credential.ProviderAnthropic
+			req.Model = ""
+			cred = alt
+		}
+	}
 	if cred == nil || cred.AuthKey() == "" {
 		utils.BadRequest(c, fmt.Sprintf("no credentials stored for provider %q: save them in the flow panel first", req.Provider))
+		return
+	}
+
+	// El asistente global responde siempre en el back, sin agent-server ni
+	// tools del tenant: es ayuda, no un operador que genera o cobra.
+	if isAssistant {
+		m.directChat(c, req, hdl, cred, nil)
 		return
 	}
 
