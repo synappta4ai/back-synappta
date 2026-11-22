@@ -22,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"synapta/internal/looks"
 	"synapta/internal/modules/credential"
 	"synapta/internal/tenancy"
 	"synapta/internal/toolkit"
@@ -387,12 +388,34 @@ func artifactUserMessage(req chatRequest, spec artifactSpec) string {
 		}
 		sb.WriteString("\n\n")
 	}
-	if lighting := strField(decodePayload(req.Payload), "iluminacion"); lighting != "" {
+	payload := decodePayload(req.Payload)
+	if look := strField(payload, "look"); look != "" {
+		mode := looks.ModeVideo
+		if spec.Kind == "storyboard" {
+			mode = looks.ModeImage
+		}
+		source := strField(payload, "look_source")
+		if source == "" {
+			if mode == looks.ModeImage {
+				source = "@image1"
+			} else {
+				source = "@video1"
+			}
+		}
+		ref := strField(payload, "look_ref")
+		block, err := looks.Assemble(mode, look, looks.NormalizeLevel(strField(payload, "look_intensity")), source, ref)
+		if err != nil {
+			log.Printf("[looks] ERROR ensamblando el look %q: %v", look, err)
+		} else {
+			sb.WriteString(block)
+			sb.WriteString("\n\n")
+		}
+	} else if lighting := strField(payload, "iluminacion"); lighting != "" {
 		sb.WriteString("ILUMINACIÓN / DIRECCIÓN DE ARTE (aplicar de forma coherente en todos los planos, imágenes y videos):\n")
 		sb.WriteString(lighting)
 		sb.WriteString("\n\n")
 	}
-	if camera := strField(decodePayload(req.Payload), "movimiento_camara"); camera != "" {
+	if camera := strField(payload, "movimiento_camara"); camera != "" {
 		sb.WriteString("MOVIMIENTOS DE CÁMARA (respetar el orden elegido en cada toma):\n")
 		sb.WriteString(camera)
 		sb.WriteString("\n\n")

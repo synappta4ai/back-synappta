@@ -21,6 +21,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/looks"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
 	"synapta/internal/skills"
@@ -320,6 +321,10 @@ type chatParams struct {
 	MaxClipS       *float64 `json:"max_clip_s"`
 	FPS            *float64 `json:"fps"`
 	Look           string   `json:"look"`
+	LookID         string   `json:"look_id"`
+	LookIntensity  string   `json:"look_intensity"`
+	LookSource     string   `json:"look_source"`
+	LookRef        string   `json:"look_ref"`
 	AudioMode      string   `json:"audio_mode"`    // diegetic_only | with_dialogue | with_music_notes | silent
 	TargetModel    string   `json:"target_model"`  // video model the piece is written for
 	ResponseMode   string   `json:"response_mode"` // chat | prompt_only
@@ -527,7 +532,20 @@ func renderParams(p *chatParams) string {
 	if p.FPS != nil {
 		add("fps", strconv.FormatFloat(*p.FPS, 'f', -1, 64))
 	}
-	add("look", p.Look)
+	lookAssembled := false
+	if lookID := strings.TrimSpace(p.LookID); lookID != "" {
+		if block, err := looks.Assemble(looks.ModeVideo, lookID, looks.NormalizeLevel(p.LookIntensity), p.LookSource, p.LookRef); err == nil {
+			add("look", block)
+			lookAssembled = true
+		}
+	}
+	if look := strings.TrimSpace(p.Look); look != "" {
+		if lookAssembled {
+			add("look_description", look)
+		} else {
+			add("look", look)
+		}
+	}
 	add("audio_mode", p.AudioMode)
 	add("target_model", p.TargetModel)
 	add("response_mode", p.ResponseMode)
@@ -538,7 +556,9 @@ func renderParams(p *chatParams) string {
 		add("cuts_per_shot", strconv.Itoa(*p.CutsPerShot))
 	}
 	add("video_type", p.VideoType)
-	add("lighting", p.Lighting)
+	if !lookAssembled {
+		add("lighting", p.Lighting)
+	}
 	add("camera_movements", p.CameraMovements)
 	return strings.Join(lines, "\n")
 }

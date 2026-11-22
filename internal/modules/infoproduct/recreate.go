@@ -11,6 +11,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"synapta/internal/looks"
 )
 
 //go:embed "prompts/Synappta Skill actuacion Infoproducto.md"
@@ -169,6 +171,8 @@ type recreateInput struct {
 	Videos          []recreateVideo
 	Notes           string
 	Lighting        string
+	Look            string
+	LookIntensity   string
 	CameraMovements string
 	AspectRatio     string
 	FPS             float64
@@ -364,7 +368,14 @@ func buildRecreateUserMessage(in recreateInput) (string, error) {
 		b.WriteString("\n\nUSER_NOTES:\n")
 		b.WriteString(notes)
 	}
-	if lighting := strings.TrimSpace(in.Lighting); lighting != "" {
+	if look := strings.TrimSpace(in.Look); look != "" {
+		if block, err := looks.Assemble(looks.ModeVideo, look, looks.NormalizeLevel(in.LookIntensity), "@Image1", ""); err == nil {
+			b.WriteString("\n\n")
+			b.WriteString(block)
+		} else {
+			log.Printf("[looks] ERROR ensamblando el look %q: %v", look, err)
+		}
+	} else if lighting := strings.TrimSpace(in.Lighting); lighting != "" {
 		b.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n")
 		b.WriteString(lighting)
 	}

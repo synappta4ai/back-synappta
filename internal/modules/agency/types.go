@@ -44,6 +44,12 @@ type GenerateRequest struct {
 	GenerateAudio *bool         `json:"generate_audio"`
 	ImageMode     string        `json:"image_mode"`
 
+	// Look es el id del esquema de luz/color elegido en la UI (ej. "three-point")
+	// y LookIntensity su intensidad ("subtle" | "medium" | "strong"). El back
+	// ensambla el bloque final con internal/looks antes de llamar al proveedor.
+	Look          string `json:"look,omitempty"`
+	LookIntensity string `json:"look_intensity,omitempty"`
+
 	// Event tracking — obligatorio para registrar en logs y recuperar estado.
 	EventName        string `json:"event_name"`
 	UserName         string `json:"user_name"`

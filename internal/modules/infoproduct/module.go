@@ -27,6 +27,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"synapta/internal/looks"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
 	"synapta/internal/skills"
@@ -412,6 +413,10 @@ type composeRequest struct {
 	Notes string `json:"notes"`
 	// Lighting is the art-direction/lighting block chosen in the UI.
 	Lighting string `json:"lighting"`
+	// Look + LookIntensity are the structured look chosen in the UI; the back
+	// assembles the final block. Lighting stays as a legacy fallback.
+	Look          string `json:"look"`
+	LookIntensity string `json:"look_intensity"`
 	// CameraMovements is the ordered camera-movement block chosen in the UI.
 	CameraMovements string `json:"camera_movements"`
 }
@@ -506,7 +511,14 @@ func (m *Module) Compose(c *gin.Context) {
 	if notes := strings.TrimSpace(req.Notes); notes != "" {
 		legacy.WriteString("\n\nUSER NOTES:\n" + notes)
 	}
-	if lighting := strings.TrimSpace(req.Lighting); lighting != "" {
+	if look := strings.TrimSpace(req.Look); look != "" {
+		block, err := looks.Assemble(looks.ModeVideo, look, looks.NormalizeLevel(req.LookIntensity), "@Image1", "")
+		if err != nil {
+			log.Printf("[looks] ERROR ensamblando el look %q: %v", look, err)
+		} else {
+			legacy.WriteString("\n\n" + block)
+		}
+	} else if lighting := strings.TrimSpace(req.Lighting); lighting != "" {
 		legacy.WriteString("\n\nLIGHTING / ART DIRECTION (apply coherently in every segment prompt):\n" + lighting)
 	}
 	if camera := strings.TrimSpace(req.CameraMovements); camera != "" {
@@ -633,6 +645,8 @@ func (m *Module) Compose(c *gin.Context) {
 				Videos:          videos,
 				Notes:           req.Notes,
 				Lighting:        req.Lighting,
+				Look:            req.Look,
+				LookIntensity:   req.LookIntensity,
 				CameraMovements: req.CameraMovements,
 				AspectRatio:     firstNonEmpty(req.AspectRatio, ref.Ratio),
 				FPS:             req.FPS,
