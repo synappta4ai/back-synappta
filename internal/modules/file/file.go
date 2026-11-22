@@ -248,6 +248,18 @@ func (s *Store) LinkEvent(fileID, eventID string) error {
 	return err
 }
 
+// LinkGeneration records which generation produced a library resource. The
+// link lets the generation history resolve the project the resource was later
+// assigned to.
+func (s *Store) LinkGeneration(fileID, taskID string) error {
+	if strings.TrimSpace(fileID) == "" || strings.TrimSpace(taskID) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`INSERT INTO file_generations (file_id, task_id) VALUES ($1, $2)
+		ON CONFLICT DO NOTHING`, fileID, taskID)
+	return err
+}
+
 // UnlinkEvent removes a file's assignment to a project.
 func (s *Store) UnlinkEvent(fileID, eventID string) error {
 	_, err := s.db.Exec(`DELETE FROM event_files WHERE file_id = $1 AND event_id = $2`, fileID, eventID)
@@ -1144,6 +1156,11 @@ func (s *Service) ListFilesByEvent(eventID, category string) ([]File, error) {
 // LinkEvent assigns a file to a project.
 func (s *Service) LinkEvent(fileID, eventID string) error { return s.store.LinkEvent(fileID, eventID) }
 
+// LinkGeneration records the generation that produced a library resource.
+func (s *Service) LinkGeneration(fileID, taskID string) error {
+	return s.store.LinkGeneration(fileID, taskID)
+}
+
 // UnlinkEvent removes a file's project assignment.
 func (s *Service) UnlinkEvent(fileID, eventID string) error {
 	return s.store.UnlinkEvent(fileID, eventID)
@@ -1262,6 +1279,7 @@ func (h *Handler) DeleteIfTemp(id string) {
 //   - force     (optional): "true"/"1" stores a new copy even if an identical
 //     active file already exists (dedup bypass)
 //   - event_id  (optional): project (event) to assign the resource to
+//   - task_id   (optional): generation that produced the resource
 func (h *Handler) Upload(c *gin.Context) {
 	category := c.PostForm("category")
 	if category == "" {
@@ -1271,6 +1289,7 @@ func (h *Handler) Upload(c *gin.Context) {
 	storage := c.DefaultPostForm("storage", "persistent")
 	force := c.PostForm("force") == "true" || c.PostForm("force") == "1"
 	eventID := c.PostForm("event_id")
+	taskID := c.PostForm("task_id")
 
 	file, err := c.FormFile("file")
 	if err != nil {
@@ -1313,6 +1332,11 @@ func (h *Handler) Upload(c *gin.Context) {
 		if linkErr := h.svc.LinkEvent(result.ID, eventID); linkErr != nil {
 			utils.InternalError(c, "uploaded but failed to link to project: "+linkErr.Error())
 			return
+		}
+	}
+	if taskID != "" {
+		if linkErr := h.svc.LinkGeneration(result.ID, taskID); linkErr != nil {
+			log.Printf("[files] link generation %s to file %s: %v", taskID, result.ID, linkErr)
 		}
 	}
 	if result.Duplicate {
