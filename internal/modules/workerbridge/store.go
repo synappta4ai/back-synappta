@@ -47,14 +47,18 @@ var (
 
 // Worker es una GPU registrada (una fila por máquina emparejada).
 type Worker struct {
-	ID            string          `json:"id"`
-	TenantID      int64           `json:"-"`
-	Name          string          `json:"name"`
-	GPUName       string          `json:"gpu_name"`
-	OS            string          `json:"os"`
-	Version       string          `json:"version"`
-	VRAMTotalMB   int             `json:"vram_total_mb"`
-	VRAMFreeMB    int             `json:"vram_free_mb"`
+	ID          string `json:"id"`
+	TenantID    int64  `json:"-"`
+	Name        string `json:"name"`
+	GPUName     string `json:"gpu_name"`
+	OS          string `json:"os"`
+	Version     string `json:"version"`
+	VRAMTotalMB int    `json:"vram_total_mb"`
+	VRAMFreeMB  int    `json:"vram_free_mb"`
+	// DiskFreeMB es el espacio libre del disco donde viven los pesos. El panel
+	// lo usa para no ofrecer una descarga que no entra (0 = worker viejo que
+	// todavía no lo reporta).
+	DiskFreeMB    int64           `json:"disk_free_mb"`
 	JobsActive    int             `json:"jobs_active"`
 	Models        json.RawMessage `json:"models"`
 	LastHeartbeat time.Time       `json:"last_heartbeat"`
@@ -186,7 +190,7 @@ func (s *Store) ConsumePairingCode(ctx context.Context, code string) (tenantID i
 // duración. Devuelve el token en claro una sola vez; en la DB queda solo el
 // hash.
 func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
-	vramTotal, vramFree int, models json.RawMessage,
+	vramTotal, vramFree int, diskFree int64, models json.RawMessage,
 ) (worker *Worker, token string, err error) {
 	token, err = newToken()
 	if err != nil {
@@ -205,15 +209,15 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 	err = s.db.QueryRowContext(ctx, `
 		INSERT INTO worker_registry
 			(tenant_id, name, token_hash, gpu_name, os, version,
-			 vram_total_mb, vram_free_mb, models, last_heartbeat)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW())
+			 vram_total_mb, vram_free_mb, disk_free_mb, models, last_heartbeat)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW())
 		RETURNING id, tenant_id, name, gpu_name, os, version,
-		          vram_total_mb, vram_free_mb, jobs_active, models::text,
+		          vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
 		          last_heartbeat, created_at`,
 		tenantID, name, hashToken(token), gpu, goos, version,
-		vramTotal, vramFree, modelsText,
+		vramTotal, vramFree, diskFree, modelsText,
 	).Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
-		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &modelsJSON,
+		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
 		&w.LastHeartbeat, &w.CreatedAt)
 	if err != nil {
 		return nil, "", fmt.Errorf("register worker: %w", err)
@@ -271,7 +275,7 @@ func (s *Store) DeleteWorker(ctx context.Context, tenantID int64, workerID strin
 // cancelados desde la última consulta, para que el agente local aborte su
 // generación en curso.
 func (s *Store) Heartbeat(ctx context.Context, workerID string,
-	gpu, version string, vramFree, jobsActive int, models json.RawMessage,
+	gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage,
 ) ([]string, error) {
 	var modelsText string
 	if len(models) == 0 {
@@ -282,9 +286,10 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
 		SET last_heartbeat = NOW(), gpu_name = $2, version = $3,
-		    vram_free_mb = $4, jobs_active = $5, models = $6::jsonb
+		    vram_free_mb = $4, jobs_active = $5, disk_free_mb = $6,
+		    models = $7::jsonb
 		WHERE id = $1`,
-		workerID, gpu, version, vramFree, jobsActive, modelsText)
+		workerID, gpu, version, vramFree, jobsActive, diskFree, modelsText)
 	if err != nil {
 		return nil, err
 	}
@@ -664,7 +669,7 @@ func (s *Store) FailOrphans(ctx context.Context) (int64, error) {
 
 const workerSelect = `
 	SELECT id, tenant_id, name, gpu_name, os, version,
-	       vram_total_mb, vram_free_mb, jobs_active, models::text,
+	       vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
 	       last_heartbeat, created_at
 	FROM worker_registry `
 
@@ -687,7 +692,7 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 	w := &Worker{}
 	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
 	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
-		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.JobsActive, &modelsJSON,
+		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
 		&w.LastHeartbeat, &w.CreatedAt)
 	if err != nil {
 		return nil, err

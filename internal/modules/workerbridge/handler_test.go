@@ -25,12 +25,12 @@ import (
 // semánticas que el handler asume (consumo atómico de código, token→worker,
 // claim FIFO) sin tocar la DB.
 type fakeStore struct {
-	codes     map[string]codeRow // code hash → row
-	workers   map[string]*Worker // token → worker
-	jobs      []*Job
-	claimErr  error
-	claims    int
-	heartbeats []string // task ids devueltos como cancelación
+	codes      map[string]codeRow // code hash → row
+	workers    map[string]*Worker // token → worker
+	jobs       []*Job
+	claimErr   error
+	claims     int
+	heartbeats []string            // task ids devueltos como cancelación
 	requested  map[string][]string // workerID → descargas pedidas
 }
 
@@ -102,7 +102,7 @@ func (f *fakeStore) ConsumePairingCode(_ context.Context, code string) (int64, e
 }
 
 func (f *fakeStore) RegisterWorker(_ context.Context, tenantID int64, name, gpu, goos, version string,
-	vramTotal, vramFree int, models json.RawMessage,
+	vramTotal, vramFree int, diskFree int64, models json.RawMessage,
 ) (*Worker, string, error) {
 	token := "tok_" + name
 	if models == nil {
@@ -126,7 +126,7 @@ func (f *fakeStore) WorkerByToken(_ context.Context, token string) (*Worker, err
 }
 
 func (f *fakeStore) Heartbeat(_ context.Context, workerID string,
-	_ string, _ string, _, _ int, _ json.RawMessage,
+	_ string, _ string, _, _ int, _ int64, _ json.RawMessage,
 ) ([]string, error) {
 	return f.heartbeats, nil
 }
@@ -495,7 +495,7 @@ func TestArtifactUploadCompletesJob(t *testing.T) {
 func TestRevokeWorkerKillsToken(t *testing.T) {
 	f := newFakeStore()
 	r := testRouter(t, f)
-	wkr, token, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.1", 8000, 7000, nil)
+	wkr, token, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.1", 8000, 7000, 0, nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestAdminRequestDownloadQueuesAndDelivers(t *testing.T) {
 	f := newFakeStore()
 	r := testRouter(t, f)
 	ctx := context.Background()
-	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.1", 8000, 7000, nil)
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.1", 8000, 7000, 0, nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
