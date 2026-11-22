@@ -34,10 +34,10 @@ type BridgeStore interface {
 	AckDownloads(ctx context.Context, workerID string, keys []string) error
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
-		vramTotal, vramFree int, models json.RawMessage) (*Worker, string, error)
+		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
 	WorkerByToken(ctx context.Context, token string) (*Worker, error)
 	Heartbeat(ctx context.Context, workerID string,
-		gpu, version string, vramFree, jobsActive int, models json.RawMessage) ([]string, error)
+		gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage) ([]string, error)
 	Claim(ctx context.Context, workerID string, tenantID int64) (*Job, error)
 	ReportProgress(ctx context.Context, workerID, taskID, status string,
 		progress float64, streamStatus, errMsg string) error
@@ -188,6 +188,7 @@ type registerRequest struct {
 	Version     string `json:"version"`
 	VRAMTotalMB int    `json:"vram_total_mb"`
 	VRAMFreeMB  int    `json:"vram_free_mb"`
+	DiskFreeMB  int64  `json:"disk_free_mb"`
 	// RawMessage (y no []byte): el worker manda un array de objetos y
 	// []byte interpretaría JSON como base64 → 400 al emparejar.
 	Models json.RawMessage `json:"models"`
@@ -228,7 +229,7 @@ func (m *Module) WorkerRegister(c *gin.Context) {
 	}
 	w, token, err := m.store.RegisterWorker(c.Request.Context(), tenantID,
 		name, req.GPUName, req.OS, req.Version,
-		req.VRAMTotalMB, req.VRAMFreeMB, req.Models)
+		req.VRAMTotalMB, req.VRAMFreeMB, req.DiskFreeMB, req.Models)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
@@ -243,6 +244,7 @@ type heartbeatRequest struct {
 	GPUName    string          `json:"gpu_name"`
 	Version    string          `json:"version"`
 	VRAMFreeMB int             `json:"vram_free_mb"`
+	DiskFreeMB int64           `json:"disk_free_mb"`
 	JobsActive int             `json:"jobs_active"`
 	Models     json.RawMessage `json:"models"`
 	// Descargas que el agente ya tomó: el back las saca de la cola.
@@ -257,7 +259,7 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	var req heartbeatRequest
 	_ = c.ShouldBindJSON(&req) // body opcional
 	cancelIDs, err := m.store.Heartbeat(c.Request.Context(), w.ID,
-		req.GPUName, req.Version, req.VRAMFreeMB, req.JobsActive, req.Models)
+		req.GPUName, req.Version, req.VRAMFreeMB, req.JobsActive, req.DiskFreeMB, req.Models)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return

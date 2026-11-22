@@ -64,6 +64,10 @@ type GenerationLog struct {
 	EventName       string `json:"event_name"`
 	UserDisplayName string `json:"user_display_name"`
 	PieceName       string `json:"piece_name"`
+	// Project the generated resource was assigned to after saving it to the
+	// library (empty when it hasn't been assigned anywhere).
+	AssignedEventID   string `json:"assigned_event_id,omitempty"`
+	AssignedEventName string `json:"assigned_event_name,omitempty"`
 }
 
 // ListLogsFilter holds pagination and filter params for listing logs.
@@ -151,13 +155,25 @@ const genLogFullCols = `gl.id, gl.task_id, gl.model_name,
 		gl.created_at, gl.updated_at, gl.deleted_at`
 
 const genLogJoinCols = `COALESCE(ev.name, '') AS event_name,
+		COALESCE(ap.event_id::text, '') AS assigned_event_id,
+		COALESCE(ap.name, '') AS assigned_event_name,
 		COALESCE(u.name || ' ' || u.surname, '') AS user_display_name,
 		COALESCE(pc.name, '') AS piece_name`
 
 const genLogFromJoins = `FROM generation_logs gl
 		LEFT JOIN events ev ON ev.id = gl.event_id
 		LEFT JOIN pieces pc ON pc.id = gl.piece_id
-		LEFT JOIN users u ON u.id = gl.user_id`
+		LEFT JOIN users u ON u.id = gl.user_id
+		LEFT JOIN LATERAL (
+			SELECT ef.event_id, ev2.name
+			FROM file_generations fg
+			JOIN event_files ef ON ef.file_id = fg.file_id
+			JOIN events ev2 ON ev2.id = ef.event_id
+			WHERE fg.task_id = gl.task_id
+				AND ef.event_id IS DISTINCT FROM gl.event_id
+			ORDER BY ef.created_at, ef.id
+			LIMIT 1
+		) ap ON TRUE`
 
 // scanListRow scans a list query row (without request payload).
 func (s *GenerationLogStore) scanListRow(row *GenerationLog, scanner interface {
@@ -178,7 +194,8 @@ func (s *GenerationLogStore) scanListRow(row *GenerationLog, scanner interface {
 		&row.VideoSeed, &row.VideoFPS, &row.Progress,
 		&row.RatingGood, &row.RatingFinal,
 		&row.CreatedAt, &row.UpdatedAt,
-		&row.EventName, &row.UserDisplayName, &row.PieceName,
+		&row.EventName, &row.AssignedEventID, &row.AssignedEventName,
+		&row.UserDisplayName, &row.PieceName,
 	)
 	if err != nil {
 		return err
@@ -208,7 +225,8 @@ func (s *GenerationLogStore) scanDetailRow(row *GenerationLog, scanner interface
 		&row.VideoSeed, &row.VideoFPS, &row.Progress,
 		&row.RatingGood, &row.RatingFinal,
 		&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
-		&row.EventName, &row.UserDisplayName, &row.PieceName,
+		&row.EventName, &row.AssignedEventID, &row.AssignedEventName,
+		&row.UserDisplayName, &row.PieceName,
 	)
 	if err != nil {
 		return err
@@ -619,11 +637,12 @@ func (s *GenerationLogStore) ListTrash(page, limit int, resourceType string) ([]
 			&l.EstimatedCost, &l.CostSource,
 			&l.CostCredits, &l.ProviderTransactionID,
 			&l.UsageTokens, &l.UsageCompletionTokens,
-		&l.VideoDuration, &l.VideoResolution, &l.VideoRatio,
+			&l.VideoDuration, &l.VideoResolution, &l.VideoRatio,
 			&l.VideoSeed, &l.VideoFPS, &l.Progress,
 			&l.RatingGood, &l.RatingFinal,
 			&l.CreatedAt, &l.UpdatedAt, &l.DeletedAt,
-			&l.EventName, &l.UserDisplayName, &l.PieceName,
+			&l.EventName, &l.AssignedEventID, &l.AssignedEventName,
+			&l.UserDisplayName, &l.PieceName,
 		); err != nil {
 			return nil, 0, err
 		}
@@ -909,11 +928,11 @@ type ServerCommunication struct {
 	// List trims bodies to a preview: true when the full text must be
 	// fetched with GetByID (detail dialog). Estimate bodies are tiny and
 	// never trimmed, so the cost column keeps working from the list.
-	RequestTruncated  bool `json:"request_truncated,omitempty"`
-	ResponseTruncated bool `json:"response_truncated,omitempty"`
-	StatusCode      int       `json:"status_code"`
-	DurationMs      int64     `json:"duration_ms"`
-	ErrorMessage    string    `json:"error_message,omitempty"`
+	RequestTruncated  bool   `json:"request_truncated,omitempty"`
+	ResponseTruncated bool   `json:"response_truncated,omitempty"`
+	StatusCode        int    `json:"status_code"`
+	DurationMs        int64  `json:"duration_ms"`
+	ErrorMessage      string `json:"error_message,omitempty"`
 	// Audit: who triggered the call.
 	UserID     int64  `json:"user_id"`
 	Username   string `json:"username"`

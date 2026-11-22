@@ -517,3 +517,24 @@ func IsValidModality(s string) bool {
 	}
 	return false
 }
+
+// imageResolutionPreference is the order image generations try: 2K first
+// (video references need resolution), then the highest tier the model exposes.
+var imageResolutionPreference = []string{"2K", "4K", "1080p", "1K", "720p", "480p"}
+
+// PreferredImageResolution returns the best image resolution a model supports:
+// 2K when available, otherwise the highest declared tier. Empty when the model
+// does not expose resolution tiers (the provider decides).
+func PreferredImageResolution(supported []string) string {
+	for _, preferred := range imageResolutionPreference {
+		for _, tier := range supported {
+			if strings.EqualFold(strings.TrimSpace(tier), preferred) {
+				return tier
+			}
+		}
+	}
+	if len(supported) > 0 {
+		return supported[0]
+	}
+	return ""
+}
