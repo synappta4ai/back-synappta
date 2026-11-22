@@ -343,6 +343,12 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		}
 	}
 
+	// Images feed video generation: default to 2K (or the model's highest
+	// tier) when the client omits the resolution. Explicit choices are kept.
+	if m.Modality == model.ModalityImage && strings.TrimSpace(req.Resolution) == "" {
+		req.Resolution = model.PreferredImageResolution(m.Defaults.Resolutions)
+	}
+
 	// Resolve per-tenant credentials (API models only: downloaded models run
 	// on our own inference worker and need no external provider).
 	var creds *credential.Resolve
@@ -925,6 +931,9 @@ func (s *Core) PreviewPayload(req *GenerateRequest) (*PreviewPayloadResponse, er
 	m := s.lookupModel(req.Model, req.WorkerAddr)
 	if m == nil {
 		return nil, fmt.Errorf("model not found: %s", req.Model)
+	}
+	if m.Modality == model.ModalityImage && strings.TrimSpace(req.Resolution) == "" {
+		req.Resolution = model.PreferredImageResolution(m.Defaults.Resolutions)
 	}
 	var creds *credential.Resolve
 	if m.Type != model.TypeDownloaded {

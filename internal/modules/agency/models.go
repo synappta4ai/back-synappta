@@ -21,6 +21,9 @@ type modelEntry struct {
 	ReferenceEndpoint  string
 	GallerySync        bool
 	Type               model.ModelType
+	// Defaults mirrors the catalog's supported ratios/resolutions/durations.
+	// The image pipeline uses it to default the resolution (2K preferred).
+	Defaults model.Defaults
 }
 
 // LookupModel resolves a model from the read-only code catalog, falling back
@@ -41,6 +44,7 @@ func LookupModel(name string, workerAddr string) *modelEntry {
 			ReferenceEndpoint:  m.ReferenceEndpoint,
 			GallerySync:        m.GallerySync,
 			Type:               model.TypeAPI,
+			Defaults:           m.Defaults,
 		}
 	}
 
