@@ -398,8 +398,19 @@ func TestClaimDeliversQueuedJob(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("claim = %d body=%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "syn_99") {
-		t.Fatalf("claim should deliver the queued job: %s", w.Body.String())
+	// El contrato que lee el agente es data.job (igual que el `job: null` de
+	// la cola vacía). Si el job viaja pelado en `data`, el agente lo descarta
+	// sin error y el back lo deja 'running' para siempre.
+	var env struct {
+		Data struct {
+			Job *Job `json:"job"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("claim body no es JSON: %v (%s)", err, w.Body.String())
+	}
+	if env.Data.Job == nil || env.Data.Job.TaskID != "syn_99" {
+		t.Fatalf("claim debe entregar data.job con el trabajo: %s", w.Body.String())
 	}
 	if f.jobs[0].Status != "running" || f.jobs[0].WorkerID != "w1" {
 		t.Fatalf("claim must mark the job running for the worker: %+v", f.jobs[0])

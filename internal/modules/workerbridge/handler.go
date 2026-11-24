@@ -328,7 +328,11 @@ func (m *Module) WorkerClaim(c *gin.Context) {
 			return
 		}
 		if job != nil {
-			utils.Success(c, job)
+			// El contrato es `{"job": {...}}`, igual que la respuesta vacía
+			// (`{"job": null}`): el agente lee `data.job` y antes descartaba el
+			// job pelado en silencio — el back lo marcaba 'running' y nadie lo
+			// ejecutaba nunca.
+			utils.Success(c, gin.H{"job": job})
 			return
 		}
 		if time.Now().After(deadline) {
