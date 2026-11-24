@@ -42,6 +42,10 @@ type BridgeStore interface {
 	RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error
 	PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error)
 	AckUpdate(ctx context.Context, workerID, id string) error
+	StartUpdate(ctx context.Context, workerID, id string) error
+	FailUpdate(ctx context.Context, workerID, id, reason string) error
+	ExpireUpdates(ctx context.Context, tenantID int64, timeout time.Duration) (int64, error)
+	WorkerVersion(ctx context.Context, tenantID int64, workerID string) (string, error)
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
@@ -109,6 +113,14 @@ func (m *Module) AdminListWorkers(c *gin.Context) {
 	t, ok := tenancy.RequireTenant(c)
 	if !ok {
 		return
+	}
+	// Watchdog del reinicio: una actualización que el agente marcó como
+	// iniciada y cuyo worker no volvió no puede quedar «Actualizando…» para
+	// siempre. Se evalúa al listar porque una máquina caída no late.
+	if n, eerr := m.store.ExpireUpdates(c.Request.Context(), t.ID, updateRestartTimeout); eerr != nil {
+		log.Printf("[workerbridge] expirar actualizaciones de tenant %d: %v", t.ID, eerr)
+	} else if n > 0 {
+		log.Printf("[workerbridge] %d actualización(es) sin volver del reinicio", n)
 	}
 	workers, err := m.store.ListWorkers(c.Request.Context(), t.ID)
 	if err != nil {
@@ -279,6 +291,19 @@ type heartbeatRequest struct {
 	// Id de la actualización que el agente aplicó: viaja recién desde el
 	// proceso nuevo, así el panel no da por actualizado algo que no arrancó.
 	CompletedUpdate string `json:"completed_update"`
+	// Id de la actualización que este proceso empezó a aplicar (se manda justo
+	// antes de reiniciarse). Desde acá el back espera al worker nuevo sin
+	// confundir la espera con un fallo.
+	StartedUpdate string `json:"started_update"`
+	// Fallo explícito de la actualización: lo escribe el updater y el agente lo
+	// manda en el primer heartbeat que puede, con el motivo real.
+	FailedUpdate *failedUpdate `json:"failed_update"`
+}
+
+// failedUpdate es el fallo de una actualización reportado por el propio worker.
+type failedUpdate struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
@@ -316,6 +341,17 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	if id := strings.TrimSpace(req.CompletedUpdate); id != "" {
 		if aerr := m.store.AckUpdate(c.Request.Context(), w.ID, id); aerr != nil {
 			log.Printf("[workerbridge] ack update %s: %v", shortID(w.ID), aerr)
+		}
+	}
+	if id := strings.TrimSpace(req.StartedUpdate); id != "" {
+		if serr := m.store.StartUpdate(c.Request.Context(), w.ID, id); serr != nil {
+			log.Printf("[workerbridge] start update %s: %v", shortID(w.ID), serr)
+		}
+	}
+	if req.FailedUpdate != nil && strings.TrimSpace(req.FailedUpdate.ID) != "" {
+		if ferr := m.store.FailUpdate(c.Request.Context(), w.ID,
+			req.FailedUpdate.ID, req.FailedUpdate.Error); ferr != nil {
+			log.Printf("[workerbridge] fail update %s: %v", shortID(w.ID), ferr)
 		}
 	}
 	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
@@ -466,6 +502,28 @@ func (m *Module) AdminRequestUpdate(c *gin.Context) {
 			utils.BadRequest(c, "invalid payload url")
 			return
 		}
+	}
+	// Un worker anterior a minUpdateReportVersion ignora el pedido: encolarlo
+	// dejaba el panel en «Actualizando…» sin forma de saber que no pasó nada.
+	// Se le pide una pasada manual del instalador, que es la única salida real.
+	version, verr := m.store.WorkerVersion(c.Request.Context(), t.ID, id)
+	if verr != nil {
+		if errors.Is(verr, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, verr.Error())
+		return
+	}
+	if !versionAtLeast(version, minUpdateReportVersion) {
+		reported := version
+		if reported == "" {
+			reported = "sin versión reportada"
+		}
+		utils.Conflict(c, "el worker de esa GPU ("+reported+") no reporta el resultado de una "+
+			"actualización remota: ejecutá el instalador una vez en esa máquina y desde ahí se "+
+			"actualiza sola")
+		return
 	}
 	if err := m.store.RequestUpdate(c.Request.Context(), t.ID, id, payloadURL); err != nil {
 		if errors.Is(err, ErrWorkerAuth) {

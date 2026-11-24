@@ -492,6 +492,65 @@ func TestStorePendingUpdateRoundTrip(t *testing.T) {
 	}
 }
 
+// El resultado de la actualización también se persiste: el fallo reportado por
+// el worker saca el pedido de la cola, queda visible en la lista (con su
+// motivo) y lo borra el siguiente intento.
+func TestStoreUpdateOutcomeRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip"); err != nil {
+		t.Fatalf("request update: %v", err)
+	}
+	pending, err := st.PendingUpdate(ctx, w)
+	if err != nil || pending == nil {
+		t.Fatalf("pending = %+v (%v), want one", pending, err)
+	}
+	// El agente avisa que empezó a aplicarla: es la marca que usa el watchdog.
+	if err := st.StartUpdate(ctx, w, pending.ID); err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	started, _ := st.PendingUpdate(ctx, w)
+	if started == nil || started.StartedAt == nil {
+		t.Fatalf("pending after start = %+v, want started_at", started)
+	}
+
+	// Un fallo de otro pedido no toca el vigente.
+	if err := st.FailUpdate(ctx, w, "pedido-viejo", "no importa"); err != nil {
+		t.Fatalf("foreign fail: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again == nil {
+		t.Fatal("un fallo ajeno borró el pedido vigente")
+	}
+
+	if err := st.FailUpdate(ctx, w, pending.ID, "descarga falló: timeout"); err != nil {
+		t.Fatalf("fail update: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again != nil {
+		t.Fatalf("pending after fail = %+v, want none", again)
+	}
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].UpdateFailure == nil {
+		t.Fatalf("list workers = %+v (%v), want update_failure", workers, err)
+	}
+	if got := workers[0].UpdateFailure.Error; got != "descarga falló: timeout" {
+		t.Fatalf("failure error = %q", got)
+	}
+
+	// Reintentar borra el fallo anterior: el panel deja de mostrar el viejo.
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip"); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	workers, err = st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].RequestedUpdate == nil {
+		t.Fatalf("list after retry = %+v (%v)", workers, err)
+	}
+	if workers[0].UpdateFailure != nil {
+		t.Fatalf("el reintento debe borrar el fallo anterior: %+v", workers[0].UpdateFailure)
+	}
+}
+
 // Las dos colas son independientes: pedir una descarga no borra el borrado
 // pendiente del mismo modelo ni al revés (el agente decide el orden).
 func TestStoreDownloadAndDeletionQueuesAreIndependent(t *testing.T) {

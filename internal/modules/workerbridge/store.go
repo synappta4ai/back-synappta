@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,19 @@ const onlineWindow = 75 * time.Second
 // pairingCodeTTL: vida del código de emparejamiento (el usuario tarda
 // segundos en pegarlo en la app; 10 min es holgado).
 const pairingCodeTTL = 10 * time.Minute
+
+// updateRestartTimeout: cuánto se espera al worker después de que el agente
+// avisó que empezó a aplicarlo (started_at). A partir de ahí el proceso se
+// reinicia —deja de latir— y si no vuelve en este lapso se da por fallido. No
+// depende del momento del pedido: un job largo puede demorar la aplicación sin
+// que haya nada roto.
+const updateRestartTimeout = 10 * time.Minute
+
+// minUpdateReportVersion: primera versión del agente que reporta cómo terminó
+// la actualización (started_update / failed_update). Un worker anterior ignora
+// `requested_update`: se le encolaba el pedido y el panel quedaba en
+// «Actualizando…» para siempre, sin forma de saber que nunca pasó nada.
+const minUpdateReportVersion = "0.2.27"
 
 // Errors del store, comparables con errors.Is.
 var (
@@ -67,6 +81,10 @@ type Worker struct {
 	// hay ninguna pendiente). El panel la muestra como «Actualizando…» hasta
 	// que el worker reiniciado confirma con su versión nueva.
 	RequestedUpdate *UpdateRequest `json:"requested_update"`
+	// UpdateFailure es el último intento que falló, con el motivo que reportó
+	// el propio worker (o el watchdog si el reinicio no volvió). El panel lo
+	// muestra en lugar de deducir el fallo del reloj.
+	UpdateFailure *UpdateFailure `json:"update_failure"`
 	// Online se deriva del último heartbeat (nunca se persiste).
 	Online bool `json:"online"`
 }
@@ -78,6 +96,17 @@ type UpdateRequest struct {
 	ID          string    `json:"id"`
 	URL         string    `json:"url"`
 	RequestedAt time.Time `json:"requested_at"`
+	// StartedAt lo pone el back cuando el agente avisa que empezó a aplicarla:
+	// desde ese momento el worker se reinicia y el back puede esperar de verdad
+	// (sin rodear al job que estaba corriendo).
+	StartedAt *time.Time `json:"started_at,omitempty"`
+}
+
+// UpdateFailure es el resultado fallido de una actualización remota.
+type UpdateFailure struct {
+	ID    string    `json:"id"`
+	Error string    `json:"error"`
+	At    time.Time `json:"at"`
 }
 
 // Job es un trabajo encolado para los workers del tenant.
@@ -240,6 +269,19 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 	}
 	w.Online = true
 	return w, token, nil
+}
+
+// WorkerVersion devuelve la versión que reportó esa GPU del tenant ("" si
+// todavía no latió). ErrWorkerAuth si el worker no es de ese tenant.
+func (s *Store) WorkerVersion(ctx context.Context, tenantID int64, workerID string) (string, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT version FROM worker_registry WHERE id = $1 AND tenant_id = $2`,
+		workerID, tenantID).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrWorkerAuth
+	}
+	return version, err
 }
 
 // WorkerByToken resuelve el worker autenticado por su token. El hash es el
@@ -534,7 +576,7 @@ func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
-		SET requested_update = $3::jsonb, updated_at = NOW()
+		SET requested_update = $3::jsonb, update_failure = NULL, updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, string(raw))
 	if err != nil {
 		return err
@@ -573,9 +615,72 @@ func (s *Store) PendingUpdate(ctx context.Context, workerID string) (*UpdateRequ
 func (s *Store) AckUpdate(ctx context.Context, workerID, id string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
-		SET requested_update = NULL, updated_at = NOW()
+		SET requested_update = NULL, update_failure = NULL, updated_at = NOW()
 		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id)
 	return err
+}
+
+// StartUpdate marca que el agente empezó a aplicar la actualización. Desde acá
+// el worker se reinicia y deja de latir: es el único tramo en el que el back
+// puede esperar por reloj sin castigar a un job que todavía está corriendo.
+func (s *Store) StartUpdate(ctx context.Context, workerID, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = requested_update
+		        || jsonb_build_object('started_at', to_jsonb(NOW())),
+		    updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id)
+	return err
+}
+
+// FailUpdate registra el fallo que reportó el worker y saca el pedido de la
+// cola, así el panel muestra el motivo real en vez de seguir «Actualizando…».
+// Sólo aplica al pedido vigente: el de uno reemplazado se ignora.
+func (s *Store) FailUpdate(ctx context.Context, workerID, id, reason string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if runes := []rune(reason); len(runes) > 512 {
+		reason = string(runes[:512])
+	}
+	if reason == "" {
+		reason = "la actualización no se aplicó"
+	}
+	raw, err := json.Marshal(UpdateFailure{ID: id, Error: reason, At: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = NULL, update_failure = $3::jsonb, updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id, string(raw))
+	return err
+}
+
+// ExpireUpdates da por fallida la actualización cuyo reinicio nunca terminó: el
+// agente avisó que empezó y el worker no volvió. Se evalúa al listar (el panel
+// pollea) porque una máquina caída no late y nadie más se enteraría.
+func (s *Store) ExpireUpdates(ctx context.Context, tenantID int64, timeout time.Duration) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET update_failure = jsonb_build_object(
+		        'id', requested_update->>'id',
+		        'error', 'el worker no volvió después de reiniciarse; revisá la máquina',
+		        'at', to_jsonb(NOW())),
+		    requested_update = NULL, updated_at = NOW()
+		WHERE tenant_id = $1
+		  AND requested_update->>'started_at' IS NOT NULL
+		  AND (requested_update->>'started_at')::timestamptz < $2`, tenantID, time.Now().Add(-timeout))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ─── Cola de jobs ──────────────────────────────────────────────
@@ -891,7 +996,7 @@ func (s *Store) RequeueStale(ctx context.Context, stale time.Duration) (int64, e
 const workerSelect = `
 	SELECT id, tenant_id, name, gpu_name, os, version,
 	       vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
-	       last_heartbeat, created_at, requested_update::text
+	       last_heartbeat, created_at, requested_update::text, update_failure::text
 	FROM worker_registry `
 
 const jobColumns = `
@@ -913,9 +1018,10 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 	w := &Worker{}
 	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
 	var updateJSON *string
+	var failureJSON *string
 	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
 		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
-		&w.LastHeartbeat, &w.CreatedAt, &updateJSON)
+		&w.LastHeartbeat, &w.CreatedAt, &updateJSON, &failureJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -926,6 +1032,12 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 		var req UpdateRequest
 		if json.Unmarshal([]byte(*updateJSON), &req) == nil && req.ID != "" {
 			w.RequestedUpdate = &req
+		}
+	}
+	if failureJSON != nil && *failureJSON != "null" {
+		var failure UpdateFailure
+		if json.Unmarshal([]byte(*failureJSON), &failure) == nil && failure.ID != "" {
+			w.UpdateFailure = &failure
 		}
 	}
 	w.Online = time.Since(w.LastHeartbeat) < onlineWindow
@@ -959,6 +1071,39 @@ func nullableInt64(id int64) interface{} {
 		return nil
 	}
 	return id
+}
+
+// versionAtLeast compara versiones "x.y.z" numéricamente (no alfabéticamente:
+// 0.2.9 < 0.2.27). Un valor vacío o ilegible cuenta como anterior: no hay
+// garantía de que esa máquina soporte el protocolo.
+func versionAtLeast(current, min string) bool {
+	cur, ok := parseVersion(current)
+	if !ok {
+		return false
+	}
+	want, _ := parseVersion(min)
+	for i := 0; i < 3; i++ {
+		if cur[i] != want[i] {
+			return cur[i] > want[i]
+		}
+	}
+	return true
+}
+
+func parseVersion(raw string) ([3]int, bool) {
+	var out [3]int
+	parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(raw, "v")), ".")
+	if len(parts) < 2 {
+		return out, false
+	}
+	for i := 0; i < 3 && i < len(parts); i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
 }
 
 // uuidHasFormat sanity check para ids que llegan por URL.

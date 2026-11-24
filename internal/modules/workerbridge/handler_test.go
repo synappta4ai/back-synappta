@@ -35,6 +35,7 @@ type fakeStore struct {
 	cancels    map[string][]string       // workerID → cancelaciones de descarga pedidas
 	deletions  map[string][]string       // workerID → borrados pedidos
 	updates    map[string]*UpdateRequest // workerID → actualización pedida
+	failures   map[string]*UpdateFailure // workerID → último fallo reportado
 	vramTotal  int                       // último vram_total_mb recibido en el heartbeat
 }
 
@@ -55,7 +56,10 @@ func (f *fakeStore) ListWorkers(_ context.Context, tenantID int64) ([]Worker, er
 	out := []Worker{}
 	for _, w := range f.workers {
 		if w.TenantID == tenantID {
-			out = append(out, *w)
+			copy := *w
+			copy.RequestedUpdate = f.updates[w.ID]
+			copy.UpdateFailure = f.failures[w.ID]
+			out = append(out, copy)
 		}
 	}
 	return out, nil
@@ -296,8 +300,9 @@ func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u
 				f.updates = map[string]*UpdateRequest{}
 			}
 			// Re-encolar reemplaza el pedido: es el reintento del panel cuando
-			// la actualización anterior no se aplicó.
+			// la actualización anterior no se aplicó (y borra el fallo viejo).
 			f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, RequestedAt: time.Now()}
+			delete(f.failures, workerID)
 			return nil
 		}
 	}
@@ -311,8 +316,61 @@ func (f *fakeStore) PendingUpdate(_ context.Context, workerID string) (*UpdateRe
 func (f *fakeStore) AckUpdate(_ context.Context, workerID, id string) error {
 	if req := f.updates[workerID]; req != nil && req.ID == id {
 		delete(f.updates, workerID)
+		delete(f.failures, workerID)
 	}
 	return nil
+}
+
+func (f *fakeStore) StartUpdate(_ context.Context, workerID, id string) error {
+	if req := f.updates[workerID]; req != nil && req.ID == id {
+		now := time.Now()
+		req.StartedAt = &now
+	}
+	return nil
+}
+
+func (f *fakeStore) FailUpdate(_ context.Context, workerID, id, reason string) error {
+	req := f.updates[workerID]
+	if req == nil || req.ID != id {
+		return nil // pedido reemplazado: un fallo atrasado no pisa el nuevo
+	}
+	delete(f.updates, workerID)
+	if f.failures == nil {
+		f.failures = map[string]*UpdateFailure{}
+	}
+	f.failures[workerID] = &UpdateFailure{ID: id, Error: reason, At: time.Now()}
+	return nil
+}
+
+func (f *fakeStore) ExpireUpdates(_ context.Context, tenantID int64, timeout time.Duration) (int64, error) {
+	var n int64
+	for _, w := range f.workers {
+		if w.TenantID != tenantID {
+			continue
+		}
+		req := f.updates[w.ID]
+		if req == nil || req.StartedAt == nil || time.Since(*req.StartedAt) < timeout {
+			continue
+		}
+		delete(f.updates, w.ID)
+		if f.failures == nil {
+			f.failures = map[string]*UpdateFailure{}
+		}
+		f.failures[w.ID] = &UpdateFailure{
+			ID: req.ID, Error: "el worker no volvió después de reiniciarse", At: time.Now(),
+		}
+		n++
+	}
+	return n, nil
+}
+
+func (f *fakeStore) WorkerVersion(_ context.Context, tenantID int64, workerID string) (string, error) {
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			return w.Version, nil
+		}
+	}
+	return "", ErrWorkerAuth
 }
 
 func (f *fakeStore) Claim(_ context.Context, workerID string, tenantID int64) (*Job, error) {
@@ -804,7 +862,7 @@ func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
 	f := newFakeStore()
 	r := testRouter(t, f)
 	ctx := context.Background()
-	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.25", 8000, 7000, 0, nil)
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.27", 8000, 7000, 0, nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -850,10 +908,144 @@ func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
 	}
 }
 
+// El agente reporta el fallo con el motivo real: el panel lo muestra sin
+// deducirlo del reloj y el pedido sale de la cola.
+func TestHeartbeatReportsUpdateFailure(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.27", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/update"
+	if w := doJSON(t, r, http.MethodPost, path, "", gin.H{"url": "https://front/x.zip"}); w.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", w.Code, w.Body.String())
+	}
+	pending := f.updates[wkr.ID]
+	if pending == nil {
+		t.Fatal("no encoló la actualización")
+	}
+
+	// El proceso que vuelve (el nuevo, o el viejo relanzado por el updater)
+	// manda el motivo: la descarga, el hash, la extracción o el arranque.
+	w := doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"failed_update": gin.H{"id": pending.ID, "error": "descarga falló: timeout"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", w.Code, w.Body.String())
+	}
+	if f.updates[wkr.ID] != nil {
+		t.Fatalf("el fallo debe sacar el pedido de la cola: %+v", f.updates[wkr.ID])
+	}
+
+	// Y queda visible en la lista, que es lo que lee el panel.
+	w = doJSON(t, r, http.MethodGet, "/api/v1/gpu/workers", "", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "descarga falló: timeout") {
+		t.Fatalf("la lista debe traer el motivo del fallo: %s", w.Body.String())
+	}
+
+	// Un fallo atrasado del pedido reemplazado no pisa el vigente.
+	if w = doJSON(t, r, http.MethodPost, path, "", gin.H{"url": "https://front/x.zip"}); w.Code != http.StatusOK {
+		t.Fatalf("re-update = %d: %s", w.Code, w.Body.String())
+	}
+	if w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"failed_update": gin.H{"id": "pedido-viejo", "error": "otra cosa"}}); w.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", w.Code, w.Body.String())
+	}
+	if f.updates[wkr.ID] == nil {
+		t.Fatal("un fallo de otro pedido no debe borrar el vigente")
+	}
+}
+
+// El agente avisa que empezó a aplicar la actualización (el worker deja de
+// latir); si no vuelve en 10 min el back lo marca fallido, sin confundir la
+// espera de un job largo (que ocurre ANTES de empezar) con un fallo.
+func TestListExpiresUpdateThatNeverCameBack(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.27", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if w := doJSON(t, r, http.MethodPost, "/api/v1/gpu/workers/"+wkr.ID+"/update", "",
+		gin.H{"url": "https://front/x.zip"}); w.Code != http.StatusOK {
+		t.Fatalf("update = %d: %s", w.Code, w.Body.String())
+	}
+	pending := f.updates[wkr.ID]
+	if pending == nil {
+		t.Fatal("no encoló la actualización")
+	}
+	if w := doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"started_update": pending.ID}); w.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", w.Code, w.Body.String())
+	}
+	if f.updates[wkr.ID] == nil || f.updates[wkr.ID].StartedAt == nil {
+		t.Fatalf("el heartbeat debe marcar el inicio: %+v", f.updates[wkr.ID])
+	}
+
+	// Reinicio en curso: listar no la da por fallida.
+	if w := doJSON(t, r, http.MethodGet, "/api/v1/gpu/workers", "", nil); strings.Contains(w.Body.String(), "no volvió") {
+		t.Fatalf("no debe fallar antes del timeout: %s", w.Body.String())
+	}
+
+	// Pasado el timeout, la máquina que no volvió se reporta como fallo.
+	old := time.Now().Add(-updateRestartTimeout - time.Minute)
+	f.updates[wkr.ID].StartedAt = &old
+	w := doJSON(t, r, http.MethodGet, "/api/v1/gpu/workers", "", nil)
+	if !strings.Contains(w.Body.String(), "no volvió") {
+		t.Fatalf("la lista debe reportar el reinicio que no volvió: %s", w.Body.String())
+	}
+	if f.updates[wkr.ID] != nil {
+		t.Fatalf("el pedido debe salir de la cola: %+v", f.updates[wkr.ID])
+	}
+}
+
+// Un worker que ignora `requested_update` (versión vieja) no puede quedarse con
+// el pedido encolado: se le pide la pasada manual del instalador.
+func TestAdminRequestUpdateRejectsWorkerThatCannotReport(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.26", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	w := doJSON(t, r, http.MethodPost, "/api/v1/gpu/workers/"+wkr.ID+"/update", "",
+		gin.H{"url": "https://front/x.zip"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("worker viejo = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	if f.updates[wkr.ID] != nil {
+		t.Fatalf("no debe encolar un pedido que la máquina va a ignorar: %+v", f.updates[wkr.ID])
+	}
+}
+
+func TestVersionAtLeast(t *testing.T) {
+	cases := []struct {
+		cur, min string
+		want     bool
+	}{
+		{"0.2.27", "0.2.27", true},
+		{"0.2.9", "0.2.27", false}, // numérico, no alfabético
+		{"0.2.26", "0.2.27", false},
+		{"0.3.0", "0.2.27", true},
+		{"1.0.0", "0.2.27", true},
+		{"v0.2.27", "0.2.27", true},
+		{"0.2", "0.2.27", false},
+		{"", "0.2.27", false},
+		{"desconocida", "0.2.27", false},
+	}
+	for _, tc := range cases {
+		if got := versionAtLeast(tc.cur, tc.min); got != tc.want {
+			t.Fatalf("versionAtLeast(%q, %q) = %v, want %v", tc.cur, tc.min, got, tc.want)
+		}
+	}
+}
+
 func TestAdminRequestUpdateRejectsForeignURL(t *testing.T) {
 	f := newFakeStore()
 	r := testRouter(t, f)
-	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.25", 0, 0, 0, nil)
+	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.27", 0, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
