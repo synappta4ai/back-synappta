@@ -901,6 +901,12 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 				break
 			}
 		}
+		// Por dónde salió el job: el generator de modelos descargados lo
+		// publica en raw (bridge = GPU del tenant, central = BM_WORKER_ADDR).
+		// Se copia al nivel superior para que el front no abra raw.
+		if d, exists := rawMap["dispatch"].(string); exists {
+			resp.Dispatch = d
+		}
 	}
 	return resp, nil
 }

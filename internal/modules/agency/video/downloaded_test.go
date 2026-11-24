@@ -404,7 +404,7 @@ func TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact(t *testing.T) {
 	t.Setenv("BM_WORKER_ARTIFACT_BASE", srv.URL)
 
 	store := newDownloadedTaskStore()
-	store.init("syn_lock", "SD-Tiny-Test", "")
+	store.init("syn_lock", "SD-Tiny-Test", "", DispatchCentral)
 	go store.complete("syn_lock", filepath.Join(t.TempDir(), "syn_lock.png"))
 
 	// Mientras la descarga sigue colgada, el status tiene que responder y
@@ -473,4 +473,62 @@ func TestArtifactBaseResolution(t *testing.T) {
 			}
 		})
 	}
+}
+
+// El estado de la tarea publica por dónde salió el job: el despacho se decide
+// una sola vez en Generate (no se vuelve a llamar a useBridgeFor sólo para el
+// log) y queda en el task, así cada poll lo devuelve sin tocar el bridge.
+func TestDownloadedStatusReportsDispatch(t *testing.T) {
+	t.Run("bridge", func(t *testing.T) {
+		g := bridgeGenerator(t, fakeBridgeQueue{online: true, models: []workerbridge.WorkerModel{
+			{Key: "SD-Tiny-Test", Mode: "image", Available: true, WorkerID: "worker-a"},
+		}})
+		req := genRequest("SD-Tiny-Test")
+		req.Modality = model.ModalityImage
+		res, err := g.Generate(req)
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		if raw, _ := res.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("generate dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+		st, err := g.GetStatus(res.TaskID, "", "", "")
+		if err != nil {
+			t.Fatalf("GetStatus: %v", err)
+		}
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("status dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+	})
+
+	t.Run("central", func(t *testing.T) {
+		// Sin bridge configurado el job sale por gRPC al worker central: la
+		// respuesta lo dice aunque el stream todavía no haya fallado.
+		g := NewDownloadedGenerator(worker.NewClient(), "127.0.0.1:1", t.TempDir())
+		res, err := g.Generate(genRequest("SD-Tiny-Test"))
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		if raw, _ := res.Raw.(map[string]interface{}); raw["dispatch"] != DispatchCentral {
+			t.Fatalf("generate dispatch = %v, want %q", raw["dispatch"], DispatchCentral)
+		}
+		st, err := g.GetStatus(res.TaskID, "", "", "")
+		if err != nil {
+			t.Fatalf("GetStatus: %v", err)
+		}
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchCentral {
+			t.Fatalf("status dispatch = %v, want %q", raw["dispatch"], DispatchCentral)
+		}
+	})
+
+	t.Run("worker_jobs", func(t *testing.T) {
+		// Un job leído de worker_jobs es, por definición, del camino bridge.
+		g := bridgeGenerator(t, fakeBridgeQueue{})
+		st := g.bridgeStatusFromJob(&workerbridge.Job{
+			Status: "running", StreamStatus: "GENERATING", Progress: 42,
+		}, "syn_job")
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("job status dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+	})
 }

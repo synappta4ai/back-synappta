@@ -90,7 +90,11 @@ type GenerateResponse struct {
 
 // StatusResponse is returned by GET /agency/*/status/:taskId.
 type StatusResponse struct {
-	Status   string           `json:"status"`
+	Status string `json:"status"`
+	// Dispatch: por dónde salió el job ("bridge" = GPU propia del tenant,
+	// "central" = gRPC a BM_WORKER_ADDR, "unknown" = sin registro). Vacío en
+	// los modelos de API, que no pasan por el worker de inferencia.
+	Dispatch string           `json:"dispatch,omitempty"`
 	Outputs  []OutputResource `json:"outputs,omitempty"`
 	Error    string           `json:"error,omitempty"`
 	Raw      interface{}      `json:"raw,omitempty"`
