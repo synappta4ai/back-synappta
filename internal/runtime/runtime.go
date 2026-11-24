@@ -119,6 +119,52 @@ func (m *Manager) SetModelMasterPrefs(store *model.MasterPrefsStore) {
 	m.modelMaster = store
 }
 
+// ─── Alertas de salud de GPUs (monitor del workerbridge) ──────
+
+// NotifyTenantChannels postea a los canales externos del tenant (Slack,
+// Telegram, Discord…). Lo usa el monitor de GPUs: sus avisos no nacen de un
+// request, así que no hay usuario al que atribuirlos.
+func (m *Manager) NotifyTenantChannels(tenantID int64, title, body string, data map[string]string) {
+	pool, err := m.poolByTenantID(tenantID)
+	if err != nil {
+		log.Printf("[runtime] canales del tenant %d: %v", tenantID, err)
+		return
+	}
+	notify.NewService(notify.NewStore(pool, m.cfg.EncryptionKey)).SendToUser(0, title, body, data)
+}
+
+// NotifyTenantAdmin deja el aviso en la campanita del admin y lo pushea al
+// navegador. Respeta el opt-in de notificaciones del usuario.
+func (m *Manager) NotifyTenantAdmin(tenantID, userID int64, ntype, title, body string) {
+	if m.notificationsChecker != nil && !m.notificationsChecker(userID) {
+		return
+	}
+	pool, err := m.poolByTenantID(tenantID)
+	if err != nil {
+		log.Printf("[runtime] push del tenant %d: %v", tenantID, err)
+		return
+	}
+	if err := push.NewCenterService(pool).Record(userID, ntype, title, body, ""); err != nil {
+		log.Printf("[runtime] campanita tenant %d user %d: %v", tenantID, userID, err)
+	}
+	push.NewService(push.NewStore(pool), m.cfg.PushVapidPublicKey,
+		m.cfg.PushVapidPrivateKey, m.cfg.PushVapidSubject).
+		WithUserKeys(push.NewUserKeysStore(pool, m.cfg.EncryptionKey)).
+		SendToUser(userID, title, body, map[string]string{"type": ntype})
+}
+
+// poolByTenantID resuelve el pool de un tenant por id (avisos sin request).
+func (m *Manager) poolByTenantID(tenantID int64) (*sql.DB, error) {
+	t, err := m.tenantByID(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil || !t.Active {
+		return nil, fmt.Errorf("tenant %d unavailable", tenantID)
+	}
+	return m.reg.Pool(t.Slug)
+}
+
 // TenantPoolFor returns the tenant-schema pool for the request's tenant.
 // False means no tenant context, so per-tenant prefs are skipped.
 func (m *Manager) TenantPoolFor(c *gin.Context) (*sql.DB, bool) {
