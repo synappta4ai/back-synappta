@@ -438,8 +438,8 @@ func TestStorePendingDownloadCancelsRoundTrip(t *testing.T) {
 }
 
 // La actualización remota se guarda como un pedido con id: el panel ve el
-// pendiente en la lista, un ack atrasado no borra un pedido nuevo y el que
-// confirma el worker reiniciado sí lo limpia.
+// pendiente en la lista, re-encolar lo reemplaza (reintento), un ack atrasado
+// no borra un pedido nuevo y el que confirma el worker reiniciado sí lo limpia.
 func TestStorePendingUpdateRoundTrip(t *testing.T) {
 	st, tenant := testStore(t)
 	w := addWorker(t, st, tenant, "PC-Casa", 0)
@@ -449,16 +449,23 @@ func TestStorePendingUpdateRoundTrip(t *testing.T) {
 	if err := st.RequestUpdate(ctx, tenant, w, first); err != nil {
 		t.Fatalf("request update: %v", err)
 	}
-	// Re-pedirla no reemplaza la URL ni genera otro reinicio.
-	if err := st.RequestUpdate(ctx, tenant, w, "https://otro.example/x.zip"); err != nil {
+	original, err := st.PendingUpdate(ctx, w)
+	if err != nil || original == nil || original.ID == "" || original.URL != first {
+		t.Fatalf("pending = %+v (%v), want the first request", original, err)
+	}
+
+	// Re-encolar es el reintento del panel: reemplaza el pedido pendiente (id y
+	// URL nuevos) para que un pedido que no se aplicó nunca lo deje trabado.
+	retry := "https://otro.example/x.zip"
+	if err := st.RequestUpdate(ctx, tenant, w, retry); err != nil {
 		t.Fatalf("re-request update: %v", err)
 	}
 	pending, err := st.PendingUpdate(ctx, w)
 	if err != nil || pending == nil {
 		t.Fatalf("pending = %+v (%v), want one", pending, err)
 	}
-	if pending.URL != first || pending.ID == "" {
-		t.Fatalf("pending = %+v, want the first url and an id", pending)
+	if pending.URL != retry || pending.ID == original.ID {
+		t.Fatalf("pending = %+v, want the retried url and a new id", pending)
 	}
 
 	// El panel lo ve como «Actualizando…» en GET /gpu/workers.
@@ -470,8 +477,8 @@ func TestStorePendingUpdateRoundTrip(t *testing.T) {
 		t.Fatalf("listed update id = %q, want %q", workers[0].RequestedUpdate.ID, pending.ID)
 	}
 
-	// Un ack con otro id (pedido viejo) no borra el actual.
-	if err := st.AckUpdate(ctx, w, "pedido-viejo"); err != nil {
+	// Un ack con otro id (pedido reemplazado) no borra el actual.
+	if err := st.AckUpdate(ctx, w, original.ID); err != nil {
 		t.Fatalf("stale ack: %v", err)
 	}
 	if again, _ := st.PendingUpdate(ctx, w); again == nil {

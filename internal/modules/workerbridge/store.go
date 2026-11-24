@@ -517,8 +517,11 @@ func (s *Store) AckDownloadCancels(ctx context.Context, workerID string, keys []
 // guarda el id del pedido —para que un ack viejo no borre uno nuevo— y la URL
 // del payload que eligió el panel (el mismo .zip que sirve su front).
 
-// RequestUpdate encola la actualización del worker. Idempotente: si ya hay una
-// pendiente se conserva (el agente puede estar reiniciándose con ella).
+// RequestUpdate encola la actualización del worker. Re-encolar REEMPLAZA el
+// pedido pendiente: es el camino de reintento del panel cuando el anterior no
+// se aplicó (el worker no volvió, el updater falló, la máquina es vieja y
+// ignora el pedido). El agente confirma por id, así que el ack del pedido
+// reemplazado no borra el nuevo.
 func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error {
 	req := UpdateRequest{
 		ID:          uuid.NewString(),
@@ -531,8 +534,7 @@ func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
-		SET requested_update = COALESCE(requested_update, $3::jsonb),
-		    updated_at = NOW()
+		SET requested_update = $3::jsonb, updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, string(raw))
 	if err != nil {
 		return err

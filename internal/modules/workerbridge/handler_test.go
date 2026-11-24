@@ -295,11 +295,9 @@ func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u
 			if f.updates == nil {
 				f.updates = map[string]*UpdateRequest{}
 			}
-			// Idempotente: una actualización pendiente se conserva (el agente
-			// puede estar reiniciándose con ella).
-			if f.updates[workerID] == nil {
-				f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, RequestedAt: time.Now()}
-			}
+			// Re-encolar reemplaza el pedido: es el reintento del panel cuando
+			// la actualización anterior no se aplicó.
+			f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, RequestedAt: time.Now()}
 			return nil
 		}
 	}
@@ -800,7 +798,8 @@ func TestHeartbeatCarriesVRAMTotal(t *testing.T) {
 }
 
 // Actualización remota: el panel la encola con la URL del payload, el
-// heartbeat la entrega y el ack (con el id del pedido) la saca de la cola.
+// heartbeat la entrega, re-encolarla reemplaza el pedido (reintento) y el ack
+// del pedido vigente la saca de la cola.
 func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
 	f := newFakeStore()
 	r := testRouter(t, f)
@@ -816,31 +815,37 @@ func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("update = %d, want 200: %s", w.Code, w.Body.String())
 	}
-	// Idempotente: dos clicks no encolan dos reinicios.
-	if w = doJSON(t, r, http.MethodPost, path, "", gin.H{"url": payload}); w.Code != http.StatusOK {
-		t.Fatalf("re-update = %d, want 200", w.Code)
+	first := f.updates[wkr.ID]
+	if first == nil || first.ID == "" {
+		t.Fatalf("pending update = %+v, want an id", first)
 	}
 
+	// Re-encolar (reintento del panel) reemplaza el pedido y el heartbeat
+	// entrega el nuevo, no el viejo.
+	retry := "https://front.example/assets/worker/synapta-worker-retry.zip"
+	if w = doJSON(t, r, http.MethodPost, path, "", gin.H{"url": retry}); w.Code != http.StatusOK {
+		t.Fatalf("re-update = %d, want 200", w.Code)
+	}
 	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
 		gin.H{"completed_update": ""})
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), payload) {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), retry) {
 		t.Fatalf("heartbeat should deliver requested_update: %s", w.Body.String())
 	}
 	pending := f.updates[wkr.ID]
-	if pending == nil || pending.ID == "" {
-		t.Fatalf("pending update = %+v, want an id", pending)
+	if pending == nil || pending.ID == "" || pending.ID == first.ID {
+		t.Fatalf("pending update = %+v, want a new id", pending)
 	}
 
-	// Un ack con otro id (pedido viejo) no borra el pendiente.
+	// Un ack con el id reemplazado no borra el pendiente.
 	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
-		gin.H{"completed_update": uuid.NewString()})
-	if !strings.Contains(w.Body.String(), payload) {
+		gin.H{"completed_update": first.ID})
+	if !strings.Contains(w.Body.String(), retry) {
 		t.Fatalf("stale ack must keep the update: %s", w.Body.String())
 	}
 	// El ack del proceso nuevo la saca de la cola.
 	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
 		gin.H{"completed_update": pending.ID})
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), payload) {
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), retry) {
 		t.Fatalf("ack must clear the update: %s", w.Body.String())
 	}
 }
