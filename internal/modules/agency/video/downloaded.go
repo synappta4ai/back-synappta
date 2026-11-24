@@ -508,6 +508,12 @@ func (g *DownloadedGenerator) bridgeStatusFromJob(job *workerbridge.Job, taskID 
 			"dispatch":      DispatchBridge,
 			"stream_status": job.StreamStatus,
 			"progress":      job.Progress,
+			// Diagnóstico de la cola: a qué GPU está fijado el job y en qué
+			// estado está la fila. Un job fijado a una máquina que ya no
+			// reclama (o una fila que quedó 'running' sin ejecutor) se ve acá
+			// sin acceso a la DB del back.
+			"job_status":    job.Status,
+			"worker_pinned": shortWorker(job.WorkerID),
 		},
 	}
 	switch job.Status {
