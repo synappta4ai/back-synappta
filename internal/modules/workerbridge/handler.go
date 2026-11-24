@@ -435,6 +435,10 @@ func (m *Module) WorkerArtifact(c *gin.Context) {
 // channel del shutdown.
 func ReconcileLoop(store *Store, stop <-chan struct{}) {
 	ticker := time.NewTicker(2 * time.Minute)
+	// Gracia para dar por perdido un claim: un job en ejecución reporta su
+	// primer evento en segundos, y el worker publica jobs_active en el
+	// heartbeat (RequeueStale no toca filas de una máquina ocupada).
+	const unclaimedGrace = 2 * time.Minute
 	defer ticker.Stop()
 	for {
 		select {
@@ -443,12 +447,19 @@ func ReconcileLoop(store *Store, stop <-chan struct{}) {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			n, err := store.FailOrphans(ctx)
-			cancel()
 			if err != nil {
 				log.Printf("[workerbridge] reconcile: %v", err)
 			} else if n > 0 {
 				log.Printf("[workerbridge] reconcile: %d orphaned job(s) marked failed", n)
 			}
+			// Reclamos cuya respuesta se perdió: la fila quedó 'running' sin
+			// ejecutor y sin esto no la recupera nadie.
+			if r, rerr := store.RequeueStale(ctx, unclaimedGrace); rerr != nil {
+				log.Printf("[workerbridge] reconcile requeue: %v", rerr)
+			} else if r > 0 {
+				log.Printf("[workerbridge] reconcile: %d claimed-but-unstarted job(s) requeued", r)
+			}
+			cancel()
 		}
 	}
 }

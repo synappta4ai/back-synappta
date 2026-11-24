@@ -337,3 +337,56 @@ func TestStorePendingDownloadsRoundTrip(t *testing.T) {
 		t.Fatalf("pending after ack = %v, want none", pending)
 	}
 }
+
+// Un job reclamado por un worker al que se le perdió la respuesta (corte de
+// red, deploy del back a mitad del long-poll) queda 'running' sin ejecutor: ni
+// Claim ni FailOrphans lo tocaban y la toma se quedaba en 0 % para siempre. La
+// reconciliación lo devuelve a la cola y el mismo worker puede reclamarlo.
+func TestStoreRequeueStaleClaimedJob(t *testing.T) {
+	st, tenant := testStore(t)
+	worker := addWorker(t, st, tenant, "PC-Casa", 0)
+	enqueue(t, st, tenant, "task-lost", worker)
+
+	claimed, err := st.Claim(context.Background(), worker, tenant)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: job=%v err=%v", claimed, err)
+	}
+	// Recién reclamado: la gracia lo protege (el worker puede estar cargando
+	// los pesos y todavía no mandó el primer evento).
+	if n, err := st.RequeueStale(context.Background(), 2*time.Minute); err != nil || n != 0 {
+		t.Fatalf("requeue recién reclamado: n=%d err=%v (want 0)", n, err)
+	}
+	backdateJob(t, st, "task-lost", 3*time.Minute)
+	n, err := st.RequeueStale(context.Background(), 2*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("requeue vencido: n=%d err=%v (want 1)", n, err)
+	}
+	job := jobStatus(t, st, tenant, "task-lost")
+	if job.Status != "queued" || job.WorkerID != "" {
+		t.Fatalf("job después del requeue: status=%q worker=%q, want queued sin pin", job.Status, job.WorkerID)
+	}
+	if again, err := st.Claim(context.Background(), worker, tenant); err != nil || again == nil {
+		t.Fatalf("re-claim: job=%v err=%v", again, err)
+	}
+}
+
+// Con la máquina ocupada (jobs_active > 0) la fila no se toca: puede ser un
+// job en curso cuyo primer evento todavía no llegó.
+func TestStoreRequeueSkipsBusyWorker(t *testing.T) {
+	st, tenant := testStore(t)
+	worker := addWorker(t, st, tenant, "PC-Casa", 0)
+	enqueue(t, st, tenant, "task-busy", worker)
+	if claimed, err := st.Claim(context.Background(), worker, tenant); err != nil || claimed == nil {
+		t.Fatalf("claim: job=%v err=%v", claimed, err)
+	}
+	backdateJob(t, st, "task-busy", 5*time.Minute)
+	if _, err := st.db.Exec(`UPDATE worker_registry SET jobs_active = 1 WHERE id = $1`, worker); err != nil {
+		t.Fatalf("marcar worker ocupado: %v", err)
+	}
+	if n, err := st.RequeueStale(context.Background(), 2*time.Minute); err != nil || n != 0 {
+		t.Fatalf("requeue con worker ocupado: n=%d err=%v (want 0)", n, err)
+	}
+	if job := jobStatus(t, st, tenant, "task-busy"); job.Status != "running" {
+		t.Fatalf("status = %q, want running (no se toca)", job.Status)
+	}
+}

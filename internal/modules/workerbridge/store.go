@@ -665,6 +665,42 @@ func (s *Store) FailOrphans(ctx context.Context) (int64, error) {
 	return total + n, nil
 }
 
+// RequeueStale devuelve a la cola los jobs que un worker reclamó y nunca
+// empezó a ejecutar.
+//
+// Claim marca la fila 'running' en la misma sentencia que la entrega: si la
+// respuesta se pierde en el camino (corte de red, deploy del back a mitad del
+// long-poll, timeout del cliente), el job queda 'running' sin nadie que lo
+// ejecute. Claim ya no lo mira (exige 'queued') y FailOrphans tampoco (el
+// worker sigue online), así que la toma se queda en 0 % para siempre.
+//
+// La ventana es segura: un job que sí se está ejecutando cambia
+// stream_status/progress en cada evento —y eso actualiza updated_at—, y el
+// dueño publica jobs_active en su heartbeat: con la máquina ocupada no se
+// re-encola nada.
+func (s *Store) RequeueStale(ctx context.Context, stale time.Duration) (int64, error) {
+	secs := int64(stale.Seconds())
+	if secs <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_jobs SET status = 'queued', worker_id = NULL,
+		       stream_status = 'SUBMITTED', cancel_requested = FALSE,
+		       updated_at = NOW()
+		WHERE status = 'running'
+		  AND stream_status = 'SUBMITTED'
+		  AND progress = 0
+		  AND updated_at < NOW() - ($1 * INTERVAL '1 second')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM worker_registry w
+		      WHERE w.id = worker_jobs.worker_id AND w.jobs_active > 0)`, secs)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ─── Scan helpers ──────────────────────────────────────────────
 
 const workerSelect = `
