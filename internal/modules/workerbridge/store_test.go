@@ -446,18 +446,22 @@ func TestStorePendingUpdateRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	first := "https://front.example/assets/worker/synapta-worker.zip"
-	if err := st.RequestUpdate(ctx, tenant, w, first); err != nil {
+	hash := strings.Repeat("ab", 32)
+	if err := st.RequestUpdate(ctx, tenant, w, first, hash); err != nil {
 		t.Fatalf("request update: %v", err)
 	}
 	original, err := st.PendingUpdate(ctx, w)
 	if err != nil || original == nil || original.ID == "" || original.URL != first {
 		t.Fatalf("pending = %+v (%v), want the first request", original, err)
 	}
+	if original.SHA256 != hash {
+		t.Fatalf("pending sha256 = %q, want %q", original.SHA256, hash)
+	}
 
 	// Re-encolar es el reintento del panel: reemplaza el pedido pendiente (id y
 	// URL nuevos) para que un pedido que no se aplicó nunca lo deje trabado.
 	retry := "https://otro.example/x.zip"
-	if err := st.RequestUpdate(ctx, tenant, w, retry); err != nil {
+	if err := st.RequestUpdate(ctx, tenant, w, retry, ""); err != nil {
 		t.Fatalf("re-request update: %v", err)
 	}
 	pending, err := st.PendingUpdate(ctx, w)
@@ -500,7 +504,7 @@ func TestStoreUpdateOutcomeRoundTrip(t *testing.T) {
 	w := addWorker(t, st, tenant, "PC-Casa", 0)
 	ctx := context.Background()
 
-	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip"); err != nil {
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip", ""); err != nil {
 		t.Fatalf("request update: %v", err)
 	}
 	pending, err := st.PendingUpdate(ctx, w)
@@ -539,7 +543,7 @@ func TestStoreUpdateOutcomeRoundTrip(t *testing.T) {
 	}
 
 	// Reintentar borra el fallo anterior: el panel deja de mostrar el viejo.
-	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip"); err != nil {
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip", ""); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	workers, err = st.ListWorkers(ctx, tenant)

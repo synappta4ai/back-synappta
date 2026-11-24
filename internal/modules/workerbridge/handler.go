@@ -41,7 +41,7 @@ type BridgeStore interface {
 	RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error)
 	AckDownloadCancels(ctx context.Context, workerID string, keys []string) error
-	RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error
+	RequestUpdate(ctx context.Context, tenantID int64, workerID, url, sha256 string) error
 	PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error)
 	AckUpdate(ctx context.Context, workerID, id string) error
 	StartUpdate(ctx context.Context, workerID, id string) error
@@ -559,7 +559,8 @@ func (m *Module) AdminRequestUpdate(c *gin.Context) {
 		return
 	}
 	var req struct {
-		URL string `json:"url"`
+		URL    string `json:"url"`
+		SHA256 string `json:"sha256"`
 	}
 	_ = c.ShouldBindJSON(&req) // body opcional: sin URL se usa la publicada
 	payloadURL := strings.TrimSpace(req.URL)
@@ -573,6 +574,18 @@ func (m *Module) AdminRequestUpdate(c *gin.Context) {
 			utils.BadRequest(c, "invalid payload url")
 			return
 		}
+	}
+	// El hash viaja con la URL: el agente verifica lo que bajó antes de detener
+	// el worker, así un .zip truncado o cambiado no deja la máquina sin código.
+	// Sin URL no hay hash (el agente usa su payload publicado, que no conocemos).
+	payloadSHA := strings.ToLower(strings.TrimSpace(req.SHA256))
+	if payloadSHA != "" && !isSHA256Hex(payloadSHA) {
+		utils.BadRequest(c, "invalid payload sha256")
+		return
+	}
+	if payloadSHA != "" && payloadURL == "" {
+		utils.BadRequest(c, "sha256 requires a payload url")
+		return
 	}
 	// Un worker anterior a minUpdateReportVersion ignora el pedido: encolarlo
 	// dejaba el panel en «Actualizando…» sin forma de saber que no pasó nada.
@@ -596,7 +609,7 @@ func (m *Module) AdminRequestUpdate(c *gin.Context) {
 			"actualiza sola")
 		return
 	}
-	if err := m.store.RequestUpdate(c.Request.Context(), t.ID, id, payloadURL); err != nil {
+	if err := m.store.RequestUpdate(c.Request.Context(), t.ID, id, payloadURL, payloadSHA); err != nil {
 		if errors.Is(err, ErrWorkerAuth) {
 			utils.NotFound(c, "worker not found")
 			return

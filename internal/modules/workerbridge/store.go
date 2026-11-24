@@ -91,6 +91,11 @@ type Worker struct {
 	// Paused (drenaje): no reclama jobs nuevos, pero sigue latiendo y termina el
 	// que tenga en curso. Se reanuda desde el panel sin desemparejar.
 	Paused bool `json:"paused"`
+	// SelfUpdate dice si esa versión sabe aplicar una actualización remota
+	// (derivado de Version, nunca se persiste). Un agente anterior a
+	// minUpdateReportVersion ignora `requested_update`: el panel lo marca y sólo
+	// le ofrece el instalador, en vez de encolar algo que nunca va a pasar.
+	SelfUpdate bool `json:"self_update"`
 	// Online se deriva del último heartbeat (nunca se persiste).
 	Online bool `json:"online"`
 }
@@ -99,8 +104,12 @@ type Worker struct {
 // agente baja el payload, se reinicia y confirma con el id en su primer
 // heartbeat desde la versión nueva.
 type UpdateRequest struct {
-	ID          string    `json:"id"`
-	URL         string    `json:"url"`
+	ID  string `json:"id"`
+	URL string `json:"url"`
+	// SHA256 es el hash del .zip que sirve esa URL. Lo manda el panel y el
+	// agente lo verifica después de bajar el payload, antes de detener nada: un
+	// zip truncado o cambiado en el camino ya no deja la máquina sin worker.
+	SHA256      string    `json:"sha256,omitempty"`
 	RequestedAt time.Time `json:"requested_at"`
 	// StartedAt lo pone el back cuando el agente avisa que empezó a aplicarla:
 	// desde ese momento el worker se reinicia y el back puede esperar de verdad
@@ -274,6 +283,7 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 		w.Models = json.RawMessage(*modelsJSON)
 	}
 	w.Online = true
+	w.SelfUpdate = versionAtLeast(w.Version, minUpdateReportVersion)
 	return w, token, nil
 }
 
@@ -592,10 +602,11 @@ func (s *Store) AckDownloadCancels(ctx context.Context, workerID string, keys []
 // se aplicó (el worker no volvió, el updater falló, la máquina es vieja y
 // ignora el pedido). El agente confirma por id, así que el ack del pedido
 // reemplazado no borra el nuevo.
-func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error {
+func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url, sha256 string) error {
 	req := UpdateRequest{
 		ID:          uuid.NewString(),
 		URL:         strings.TrimSpace(url),
+		SHA256:      strings.ToLower(strings.TrimSpace(sha256)),
 		RequestedAt: time.Now().UTC(),
 	}
 	raw, err := json.Marshal(req)
@@ -1073,6 +1084,8 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 		}
 	}
 	w.Online = time.Since(w.LastHeartbeat) < onlineWindow
+	// Derivado: el panel no tiene que conocer el corte de versiones.
+	w.SelfUpdate = versionAtLeast(w.Version, minUpdateReportVersion)
 	return w, nil
 }
 
@@ -1103,6 +1116,20 @@ func nullableInt64(id int64) interface{} {
 		return nil
 	}
 	return id
+}
+
+// isSHA256Hex valida un hash SHA-256 en hex minúsculas (64 caracteres), el
+// formato con el que el panel manda el hash de su payload.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // versionAtLeast compara versiones "x.y.z" numéricamente (no alfabéticamente:

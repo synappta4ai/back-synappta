@@ -140,6 +140,7 @@ func (f *fakeStore) RegisterWorker(_ context.Context, tenantID int64, name, gpu,
 		ID: uuid.NewString(), TenantID: tenantID, Name: name, GPUName: gpu,
 		OS: goos, Version: version, VRAMTotalMB: vramTotal, VRAMFreeMB: vramFree,
 		Models: models, LastHeartbeat: time.Now(), CreatedAt: time.Now(), Online: true,
+		SelfUpdate: versionAtLeast(version, minUpdateReportVersion),
 	}
 	f.workers[token] = w
 	return w, token, nil
@@ -313,7 +314,7 @@ func (f *fakeStore) AckDownloadCancels(_ context.Context, workerID string, keys 
 	return nil
 }
 
-func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u string) error {
+func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u, sha string) error {
 	for _, w := range f.workers {
 		if w.ID == workerID && w.TenantID == tenantID {
 			if f.updates == nil {
@@ -321,7 +322,8 @@ func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u
 			}
 			// Re-encolar reemplaza el pedido: es el reintento del panel cuando
 			// la actualización anterior no se aplicó (y borra el fallo viejo).
-			f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, RequestedAt: time.Now()}
+			f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, SHA256: sha,
+				RequestedAt: time.Now()}
 			delete(f.failures, workerID)
 			return nil
 		}
@@ -895,13 +897,24 @@ func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
 
 	path := "/api/v1/gpu/workers/" + wkr.ID + "/update"
 	payload := "https://front.example/assets/worker/synapta-worker.zip"
-	w := doJSON(t, r, http.MethodPost, path, "", gin.H{"url": payload})
+	hash := strings.Repeat("ab", 32)
+	w := doJSON(t, r, http.MethodPost, path, "", gin.H{"url": payload, "sha256": hash})
 	if w.Code != http.StatusOK {
 		t.Fatalf("update = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	first := f.updates[wkr.ID]
 	if first == nil || first.ID == "" {
 		t.Fatalf("pending update = %+v, want an id", first)
+	}
+	if first.SHA256 != hash {
+		t.Fatalf("pending update sha256 = %q, want %q", first.SHA256, hash)
+	}
+	// El hash viaja al agente en el mismo pedido: sin él no puede verificar lo
+	// que bajó antes de detener el worker.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_update": ""})
+	if !strings.Contains(w.Body.String(), hash) {
+		t.Fatalf("heartbeat should deliver the payload sha256: %s", w.Body.String())
 	}
 
 	// Re-encolar (reintento del panel) reemplaza el pedido y el heartbeat
@@ -1024,6 +1037,52 @@ func TestListExpiresUpdateThatNeverCameBack(t *testing.T) {
 	}
 	if f.updates[wkr.ID] != nil {
 		t.Fatalf("el pedido debe salir de la cola: %+v", f.updates[wkr.ID])
+	}
+}
+
+// El hash es del payload de esa URL: sin URL no hay hash, y un valor que no es
+// SHA-256 se rechaza en vez de llegarle al agente como si fuera válido.
+func TestAdminRequestUpdateValidatesHash(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.27", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/update"
+	if w := doJSON(t, r, http.MethodPost, path, "",
+		gin.H{"url": "https://front/x.zip", "sha256": "no-es-un-hash"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("hash inválido = %d, want 400", w.Code)
+	}
+	if w := doJSON(t, r, http.MethodPost, path, "",
+		gin.H{"sha256": strings.Repeat("a", 64)}); w.Code != http.StatusBadRequest {
+		t.Fatalf("hash sin url = %d, want 400", w.Code)
+	}
+	if f.updates[wkr.ID] != nil {
+		t.Fatalf("se encoló una actualización con hash inválido: %+v", f.updates[wkr.ID])
+	}
+}
+
+// La lista marca qué GPU puede actualizarse sola: el panel usa ese dato para
+// mostrar «sólo instalador» en vez de encolar un pedido que el agente viejo
+// ignora (y que terminaba pareciendo un fallo).
+func TestListWorkersFlagsSelfUpdate(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	if _, _, err := f.RegisterWorker(ctx, 1, "vieja", "GPU", "win", "0.2.9", 0, 0, 0, nil); err != nil {
+		t.Fatalf("register vieja: %v", err)
+	}
+	if _, _, err := f.RegisterWorker(ctx, 1, "nueva", "GPU", "win", minUpdateReportVersion, 0, 0, 0, nil); err != nil {
+		t.Fatalf("register nueva: %v", err)
+	}
+	w := doJSON(t, r, http.MethodGet, "/api/v1/gpu/workers", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"self_update":false`) || !strings.Contains(body, `"self_update":true`) {
+		t.Fatalf("list should flag both kinds of worker: %s", body)
 	}
 }
 
