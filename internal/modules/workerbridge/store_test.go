@@ -338,6 +338,63 @@ func TestStorePendingDownloadsRoundTrip(t *testing.T) {
 	}
 }
 
+// El borrado de pesos recorre el mismo camino que la descarga: el admin lo
+// encola, el heartbeat lo entrega y el agente lo confirma al ejecutarlo. Sin
+// esta cola una máquina emparejada no podía liberar disco desde el panel.
+func TestStorePendingDeletionsRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDeletion(ctx, tenant, w, "SDXL-Turbo"); err != nil {
+		t.Fatalf("request deletion: %v", err)
+	}
+	if err := st.RequestDeletion(ctx, tenant, w, "SDXL-Turbo"); err != nil {
+		t.Fatalf("re-request deletion: %v", err)
+	}
+	pending, err := st.PendingDeletions(ctx, w)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "SDXL-Turbo" {
+		t.Fatalf("pending = %v, want one SDXL-Turbo", pending)
+	}
+	if err := st.AckDeletions(ctx, w, pending); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if pending, _ := st.PendingDeletions(ctx, w); len(pending) != 0 {
+		t.Fatalf("pending after ack = %v, want none", pending)
+	}
+}
+
+// Las dos colas son independientes: pedir una descarga no borra el borrado
+// pendiente del mismo modelo ni al revés (el agente decide el orden).
+func TestStoreDownloadAndDeletionQueuesAreIndependent(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDownload(ctx, tenant, w, "SD-1.5"); err != nil {
+		t.Fatalf("request download: %v", err)
+	}
+	if err := st.RequestDeletion(ctx, tenant, w, "SD-1.5"); err != nil {
+		t.Fatalf("request deletion: %v", err)
+	}
+
+	downloads, _ := st.PendingDownloads(ctx, w)
+	deletions, _ := st.PendingDeletions(ctx, w)
+	if len(downloads) != 1 || len(deletions) != 1 {
+		t.Fatalf("downloads=%v deletions=%v, want one each", downloads, deletions)
+	}
+	// Confirmar el borrado no toca la descarga pendiente.
+	if err := st.AckDeletions(ctx, w, deletions); err != nil {
+		t.Fatalf("ack deletions: %v", err)
+	}
+	if downloads, _ := st.PendingDownloads(ctx, w); len(downloads) != 1 {
+		t.Fatalf("downloads after deletion ack = %v, want one", downloads)
+	}
+}
+
 // Un job reclamado por un worker al que se le perdió la respuesta (corte de
 // red, deploy del back a mitad del long-poll) queda 'running' sin ejecutor: ni
 // Claim ni FailOrphans lo tocaban y la toma se quedaba en 0 % para siempre. La

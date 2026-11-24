@@ -32,6 +32,9 @@ type BridgeStore interface {
 	RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDownloads(ctx context.Context, workerID string) ([]string, error)
 	AckDownloads(ctx context.Context, workerID string, keys []string) error
+	RequestDeletion(ctx context.Context, tenantID int64, workerID, key string) error
+	PendingDeletions(ctx context.Context, workerID string) ([]string, error)
+	AckDeletions(ctx context.Context, workerID string, keys []string) error
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
@@ -67,6 +70,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		admin.POST("/pairing-code", m.AdminPairingCode)
 		admin.DELETE("/workers/:id", m.AdminRevokeWorker)
 		admin.POST("/workers/:id/models/:key/download", m.AdminRequestDownload)
+		// Borrar los pesos de una GPU emparejada: sin esto el disco de esa
+		// máquina nunca se liberaba desde el panel.
+		admin.DELETE("/workers/:id/models/:key", m.AdminRequestDeletion)
 	}
 
 	w := rg.Group("/internal/workers")
@@ -249,6 +255,8 @@ type heartbeatRequest struct {
 	Models     json.RawMessage `json:"models"`
 	// Descargas que el agente ya tomó: el back las saca de la cola.
 	CompletedDownloads []string `json:"completed_downloads"`
+	// Borrados que el agente ya ejecutó (liberó el disco).
+	CompletedDeletions []string `json:"completed_deletions"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
@@ -272,12 +280,26 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 			log.Printf("[workerbridge] ack downloads %s: %v", shortID(w.ID), aerr)
 		}
 	}
+	if len(req.CompletedDeletions) > 0 {
+		if aerr := m.store.AckDeletions(c.Request.Context(), w.ID, req.CompletedDeletions); aerr != nil {
+			log.Printf("[workerbridge] ack deletions %s: %v", shortID(w.ID), aerr)
+		}
+	}
 	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
 	if perr != nil {
 		log.Printf("[workerbridge] pending downloads %s: %v", shortID(w.ID), perr)
 		pending = []string{}
 	}
-	utils.Success(c, gin.H{"cancel_task_ids": cancelIDs, "requested_models": pending})
+	pendingDeletes, derr := m.store.PendingDeletions(c.Request.Context(), w.ID)
+	if derr != nil {
+		log.Printf("[workerbridge] pending deletions %s: %v", shortID(w.ID), derr)
+		pendingDeletes = []string{}
+	}
+	utils.Success(c, gin.H{
+		"cancel_task_ids":    cancelIDs,
+		"requested_models":   pending,
+		"requested_deletions": pendingDeletes,
+	})
 }
 
 // AdminRequestDownload handles POST /api/v1/gpu/workers/:id/models/:key/download —
@@ -307,6 +329,36 @@ func (m *Module) AdminRequestDownload(c *gin.Context) {
 		return
 	}
 	utils.Created(c, gin.H{"worker_id": id, "model_key": key})
+}
+
+// AdminRequestDeletion handles DELETE /api/v1/gpu/workers/:id/models/:key —
+// el admin pide liberar el disco de esa GPU borrando los pesos del modelo. El
+// agente lo ejecuta en el próximo heartbeat y lo confirma con
+// completed_deletions; el snapshot siguiente ya lo muestra sin pesos.
+func (m *Module) AdminRequestDeletion(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" || len(key) > 128 {
+		utils.BadRequest(c, "invalid model key")
+		return
+	}
+	if err := m.store.RequestDeletion(c.Request.Context(), t.ID, id, key); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "model_key": key, "status": "queued"})
 }
 
 // WorkerClaim handles POST /api/v1/internal/workers/claim — long-poll de la

@@ -312,26 +312,38 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	return ids, rows.Err()
 }
 
-// ─── Descargas de modelos (panel → worker) ─────────────────────
+// ─── Gestión de pesos (panel → worker) ─────────────────────────
+//
+// Dos colas con el mismo mecanismo: el admin encola pedidos por clave, el
+// agente los recoge en el heartbeat y los confirma cuando ya los tomó.
+//   requested_downloads / completed_downloads → bajar pesos
+//   requested_deletions / completed_deletions → liberar disco
 
-// RequestDownload encola la descarga de un modelo para el worker: el admin
-// la pide y el agente la recoge en el próximo heartbeat. Idempotente por
-// clave (re-pedir no duplica) y siempre con scope de tenant.
-func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error {
+// Columnas válidas de las colas de pesos. Whitelist explícita: el nombre de la
+// columna se interpola en el SQL (Postgres no parametriza identificadores) y
+// nunca puede venir de un request.
+const (
+	colRequestedDownloads = "requested_downloads"
+	colRequestedDeletions = "requested_deletions"
+)
+
+// enqueueKey agrega una clave a la cola JSONB del worker. Idempotente: re-pedir
+// la misma clave no duplica la entrada.
+func (s *Store) enqueueKey(ctx context.Context, tenantID int64, workerID, key, column string) error {
 	key = strings.TrimSpace(key)
 	if key == "" || len(key) > 128 {
 		return fmt.Errorf("invalid model key %q", key)
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE worker_registry
-		SET requested_downloads = (
+		SET %[1]s = (
 			SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb)
 			FROM (
-				SELECT jsonb_array_elements_text(requested_downloads) AS v
+				SELECT jsonb_array_elements_text(%[1]s) AS v
 				UNION SELECT $3
 			) s
 		), updated_at = NOW()
-		WHERE id = $1 AND tenant_id = $2`,
+		WHERE id = $1 AND tenant_id = $2`, column),
 		workerID, tenantID, key)
 	if err != nil {
 		return err
@@ -342,11 +354,11 @@ func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, k
 	return nil
 }
 
-// PendingDownloads lista las descargas pedidas aún no confirmadas.
-func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string, error) {
+// pendingKeys lista los pedidos aún no confirmados del worker.
+func (s *Store) pendingKeys(ctx context.Context, workerID, column string) ([]string, error) {
 	var raw string
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(requested_downloads, '[]'::jsonb)::text FROM worker_registry WHERE id = $1`,
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COALESCE(%s, '[]'::jsonb)::text FROM worker_registry WHERE id = $1`, column),
 		workerID).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return []string{}, nil
@@ -360,8 +372,8 @@ func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string
 	return out, nil
 }
 
-// AckDownloads saca de la cola las descargas que el worker ya tomó.
-func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string) error {
+// ackKeys saca de la cola los pedidos que el worker ya tomó.
+func (s *Store) ackKeys(ctx context.Context, workerID string, keys []string, column string) error {
 	clean := []string{}
 	seen := map[string]bool{}
 	for _, k := range keys {
@@ -384,13 +396,51 @@ func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string
 	}
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE worker_registry
-		SET requested_downloads = (
+		SET %[1]s = (
 			SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
-			FROM jsonb_array_elements_text(requested_downloads) AS v
-			WHERE v NOT IN (%s)
+			FROM jsonb_array_elements_text(%[1]s) AS v
+			WHERE v NOT IN (%[2]s)
 		), updated_at = NOW()
-		WHERE id = $1`, strings.Join(holders, ",")), args...)
+		WHERE id = $1`, column, strings.Join(holders, ",")), args...)
 	return err
+}
+
+// RequestDownload encola la descarga de un modelo para el worker: el admin
+// la pide y el agente la recoge en el próximo heartbeat. Idempotente por
+// clave (re-pedir no duplica) y siempre con scope de tenant.
+func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error {
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDownloads)
+}
+
+// RequestDeletion encola el BORRADO de los pesos de un modelo en esa GPU: el
+// agente lo ejecuta en el próximo heartbeat y libera el disco. Antes sólo se
+// podía pedir una descarga, así que una máquina emparejada nunca liberaba
+// espacio: el disco se llenaba y las descargas siguientes fallaban.
+//
+// Idempotente por clave y con scope de tenant, igual que la descarga.
+func (s *Store) RequestDeletion(ctx context.Context, tenantID int64, workerID, key string) error {
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDeletions)
+}
+
+// PendingDownloads lista las descargas pedidas aún no confirmadas.
+func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDownloads)
+}
+
+// PendingDeletions lista los borrados pedidos aún no confirmados.
+func (s *Store) PendingDeletions(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDeletions)
+}
+
+// AckDownloads saca de la cola las descargas que el worker ya tomó.
+func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDownloads)
+}
+
+// AckDeletions saca de la cola los borrados que el worker ya ejecutó (o que ya
+// no tenían nada que borrar).
+func (s *Store) AckDeletions(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDeletions)
 }
 
 // ─── Cola de jobs ──────────────────────────────────────────────

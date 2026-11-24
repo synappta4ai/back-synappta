@@ -32,6 +32,7 @@ type fakeStore struct {
 	claims     int
 	heartbeats []string            // task ids devueltos como cancelación
 	requested  map[string][]string // workerID → descargas pedidas
+	deletions  map[string][]string // workerID → borrados pedidos
 }
 
 type codeRow struct {
@@ -177,6 +178,50 @@ func (f *fakeStore) AckDownloads(_ context.Context, workerID string, keys []stri
 		f.requested = map[string][]string{}
 	}
 	f.requested[workerID] = keep
+	return nil
+}
+
+func (f *fakeStore) RequestDeletion(_ context.Context, tenantID int64, workerID, key string) error {
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			if f.deletions == nil {
+				f.deletions = map[string][]string{}
+			}
+			for _, k := range f.deletions[workerID] {
+				if k == key {
+					return nil // idempotente
+				}
+			}
+			f.deletions[workerID] = append(f.deletions[workerID], key)
+			return nil
+		}
+	}
+	return ErrWorkerAuth
+}
+
+func (f *fakeStore) PendingDeletions(_ context.Context, workerID string) ([]string, error) {
+	out := append([]string{}, f.deletions[workerID]...)
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AckDeletions(_ context.Context, workerID string, keys []string) error {
+	drop := map[string]bool{}
+	for _, k := range keys {
+		drop[k] = true
+	}
+	if f.deletions == nil {
+		f.deletions = map[string][]string{}
+	}
+	keep := []string{}
+	for _, k := range f.deletions[workerID] {
+		if !drop[k] {
+			keep = append(keep, k)
+		}
+	}
+	f.deletions[workerID] = keep
 	return nil
 }
 
@@ -561,6 +606,57 @@ func TestAdminRequestDownloadQueuesAndDelivers(t *testing.T) {
 		gin.H{"completed_downloads": []string{"Wan2.1-T2V-1.3B"}})
 	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "Wan2.1-T2V-1.3B") {
 		t.Fatalf("ack must clear the queue: %s", w.Body.String())
+	}
+}
+
+func TestAdminRequestDeletionQueuesAndDelivers(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.21", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/models/SDXL-Turbo"
+	w := doJSON(t, r, http.MethodDelete, path, "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	// Idempotente: dos pedidos, una sola entrada en la cola.
+	if w = doJSON(t, r, http.MethodDelete, path, "", nil); w.Code != http.StatusOK {
+		t.Fatalf("re-delete = %d, want 200", w.Code)
+	}
+
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_deletions": []string{}})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "\"requested_deletions\":[\"SDXL-Turbo\"]") {
+		t.Fatalf("heartbeat should deliver requested_deletions: %s", w.Body.String())
+	}
+	// El ack la saca de la cola.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_deletions": []string{"SDXL-Turbo"}})
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "SDXL-Turbo") {
+		t.Fatalf("ack must clear the deletion queue: %s", w.Body.String())
+	}
+}
+
+func TestAdminRequestDeletionUnknownWorker(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	// Worker inexistente del tenant: 404, no 500.
+	w := doJSON(t, r, http.MethodDelete,
+		"/api/v1/gpu/workers/"+uuid.NewString()+"/models/SD-1.5", "", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker = %d, want 404: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminRequestDeletionInvalidID(t *testing.T) {
+	r := testRouter(t, newFakeStore())
+	w := doJSON(t, r, http.MethodDelete, "/api/v1/gpu/workers/not-a-uuid/models/SD-1.5", "", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id = %d, want 400", w.Code)
 	}
 }
 
