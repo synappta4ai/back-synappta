@@ -35,6 +35,9 @@ type BridgeStore interface {
 	RequestDeletion(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDeletions(ctx context.Context, workerID string) ([]string, error)
 	AckDeletions(ctx context.Context, workerID string, keys []string) error
+	RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error
+	PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error)
+	AckDownloadCancels(ctx context.Context, workerID string, keys []string) error
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
@@ -70,6 +73,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		admin.POST("/pairing-code", m.AdminPairingCode)
 		admin.DELETE("/workers/:id", m.AdminRevokeWorker)
 		admin.POST("/workers/:id/models/:key/download", m.AdminRequestDownload)
+		// Parar una descarga en curso (o todavía en cola) en esa GPU: sin esto,
+		// elegir el modelo equivocado obligaba a esperar la descarga entera.
+		admin.DELETE("/workers/:id/models/:key/download", m.AdminCancelDownload)
 		// Borrar los pesos de una GPU emparejada: sin esto el disco de esa
 		// máquina nunca se liberaba desde el panel.
 		admin.DELETE("/workers/:id/models/:key", m.AdminRequestDeletion)
@@ -257,6 +263,8 @@ type heartbeatRequest struct {
 	CompletedDownloads []string `json:"completed_downloads"`
 	// Borrados que el agente ya ejecutó (liberó el disco).
 	CompletedDeletions []string `json:"completed_deletions"`
+	// Cancelaciones de descarga que el agente ya aplicó (abortó o no había nada).
+	CompletedDownloadCancels []string `json:"completed_download_cancels"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
@@ -285,6 +293,11 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 			log.Printf("[workerbridge] ack deletions %s: %v", shortID(w.ID), aerr)
 		}
 	}
+	if len(req.CompletedDownloadCancels) > 0 {
+		if aerr := m.store.AckDownloadCancels(c.Request.Context(), w.ID, req.CompletedDownloadCancels); aerr != nil {
+			log.Printf("[workerbridge] ack download cancels %s: %v", shortID(w.ID), aerr)
+		}
+	}
 	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
 	if perr != nil {
 		log.Printf("[workerbridge] pending downloads %s: %v", shortID(w.ID), perr)
@@ -295,10 +308,16 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 		log.Printf("[workerbridge] pending deletions %s: %v", shortID(w.ID), derr)
 		pendingDeletes = []string{}
 	}
+	pendingCancels, cerr := m.store.PendingDownloadCancels(c.Request.Context(), w.ID)
+	if cerr != nil {
+		log.Printf("[workerbridge] pending download cancels %s: %v", shortID(w.ID), cerr)
+		pendingCancels = []string{}
+	}
 	utils.Success(c, gin.H{
-		"cancel_task_ids":    cancelIDs,
-		"requested_models":   pending,
-		"requested_deletions": pendingDeletes,
+		"cancel_task_ids":            cancelIDs,
+		"requested_models":           pending,
+		"requested_deletions":        pendingDeletes,
+		"requested_download_cancels": pendingCancels,
 	})
 }
 
@@ -351,6 +370,37 @@ func (m *Module) AdminRequestDeletion(c *gin.Context) {
 		return
 	}
 	if err := m.store.RequestDeletion(c.Request.Context(), t.ID, id, key); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "model_key": key, "status": "queued"})
+}
+
+// AdminCancelDownload handles DELETE /api/v1/gpu/workers/:id/models/:key/download —
+// el admin pide parar la descarga de un modelo en esa GPU. Si el pedido todavía
+// estaba en la cola de descargas se saca (nunca arranca) y, si ya estaba
+// bajando, el agente aborta la transferencia en el próximo heartbeat y la
+// confirma con completed_download_cancels.
+func (m *Module) AdminCancelDownload(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" || len(key) > 128 {
+		utils.BadRequest(c, "invalid model key")
+		return
+	}
+	if err := m.store.RequestDownloadCancel(c.Request.Context(), t.ID, id, key); err != nil {
 		if errors.Is(err, ErrWorkerAuth) {
 			utils.NotFound(c, "worker not found")
 			return

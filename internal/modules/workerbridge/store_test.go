@@ -367,6 +367,43 @@ func TestStorePendingDeletionsRoundTrip(t *testing.T) {
 	}
 }
 
+// Cancelar una descarga usa el mismo mecanismo: el admin lo encola, el
+// heartbeat lo entrega y el agente confirma. Además saca el pedido de la cola
+// de descargas: cancelar antes del heartbeat no debe arrancar la descarga.
+func TestStorePendingDownloadCancelsRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDownload(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("request download: %v", err)
+	}
+	if err := st.RequestDownloadCancel(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("request cancel: %v", err)
+	}
+	if err := st.RequestDownloadCancel(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("re-request cancel: %v", err)
+	}
+
+	downloads, _ := st.PendingDownloads(ctx, w)
+	if len(downloads) != 0 {
+		t.Fatalf("pending downloads = %v, want none after cancel", downloads)
+	}
+	pending, err := st.PendingDownloadCancels(ctx, w)
+	if err != nil {
+		t.Fatalf("pending cancels: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "FLUX.1-dev" {
+		t.Fatalf("pending cancels = %v, want one FLUX.1-dev", pending)
+	}
+	if err := st.AckDownloadCancels(ctx, w, pending); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if pending, _ := st.PendingDownloadCancels(ctx, w); len(pending) != 0 {
+		t.Fatalf("pending cancels after ack = %v, want none", pending)
+	}
+}
+
 // Las dos colas son independientes: pedir una descarga no borra el borrado
 // pendiente del mismo modelo ni al revés (el agente decide el orden).
 func TestStoreDownloadAndDeletionQueuesAreIndependent(t *testing.T) {

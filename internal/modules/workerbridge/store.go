@@ -317,14 +317,16 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 // Dos colas con el mismo mecanismo: el admin encola pedidos por clave, el
 // agente los recoge en el heartbeat y los confirma cuando ya los tomó.
 //   requested_downloads / completed_downloads → bajar pesos
+//   requested_download_cancels / completed_download_cancels → parar una descarga
 //   requested_deletions / completed_deletions → liberar disco
 
 // Columnas válidas de las colas de pesos. Whitelist explícita: el nombre de la
 // columna se interpola en el SQL (Postgres no parametriza identificadores) y
 // nunca puede venir de un request.
 const (
-	colRequestedDownloads = "requested_downloads"
-	colRequestedDeletions = "requested_deletions"
+	colRequestedDownloads       = "requested_downloads"
+	colRequestedDownloadCancels = "requested_download_cancels"
+	colRequestedDeletions       = "requested_deletions"
 )
 
 // enqueueKey agrega una clave a la cola JSONB del worker. Idempotente: re-pedir
@@ -342,6 +344,28 @@ func (s *Store) enqueueKey(ctx context.Context, tenantID int64, workerID, key, c
 				SELECT jsonb_array_elements_text(%[1]s) AS v
 				UNION SELECT $3
 			) s
+		), updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, column),
+		workerID, tenantID, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
+// removeKey saca una clave de la cola JSONB del worker (scope de tenant).
+// Se usa al cancelar una descarga: si el pedido todavía no se había entregado,
+// sacarlo evita que el agente arranque justo lo que el usuario canceló.
+func (s *Store) removeKey(ctx context.Context, tenantID int64, workerID, key, column string) error {
+	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE worker_registry
+		SET %[1]s = (
+			SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
+			FROM jsonb_array_elements_text(%[1]s) AS v
+			WHERE v <> $3
 		), updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2`, column),
 		workerID, tenantID, key)
@@ -441,6 +465,29 @@ func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string
 // no tenían nada que borrar).
 func (s *Store) AckDeletions(ctx context.Context, workerID string, keys []string) error {
 	return s.ackKeys(ctx, workerID, keys, colRequestedDeletions)
+}
+
+// RequestDownloadCancel encola la CANCELACIÓN de la descarga de un modelo en
+// esa GPU: el agente aborta la transferencia en el próximo heartbeat y descarta
+// los bytes parciales. Además saca la clave de la cola de descargas si todavía
+// no se había entregado — son dos pedidos contradictorios y lo que el usuario
+// pidió al final es parar.
+func (s *Store) RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error {
+	if err := s.removeKey(ctx, tenantID, workerID, key, colRequestedDownloads); err != nil {
+		return err
+	}
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDownloadCancels)
+}
+
+// PendingDownloadCancels lista las cancelaciones pedidas aún no confirmadas.
+func (s *Store) PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDownloadCancels)
+}
+
+// AckDownloadCancels saca de la cola las cancelaciones que el agente ya ejecutó
+// (o que no tenían nada que abortar).
+func (s *Store) AckDownloadCancels(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDownloadCancels)
 }
 
 // ─── Cola de jobs ──────────────────────────────────────────────

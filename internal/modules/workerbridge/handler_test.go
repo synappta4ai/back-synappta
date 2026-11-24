@@ -32,6 +32,7 @@ type fakeStore struct {
 	claims     int
 	heartbeats []string            // task ids devueltos como cancelación
 	requested  map[string][]string // workerID → descargas pedidas
+	cancels    map[string][]string // workerID → cancelaciones de descarga pedidas
 	deletions  map[string][]string // workerID → borrados pedidos
 }
 
@@ -222,6 +223,66 @@ func (f *fakeStore) AckDeletions(_ context.Context, workerID string, keys []stri
 		}
 	}
 	f.deletions[workerID] = keep
+	return nil
+}
+
+func (f *fakeStore) RequestDownloadCancel(_ context.Context, tenantID int64, workerID, key string) error {
+	found := false
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrWorkerAuth
+	}
+	// Pedido contradictorio: la descarga que todavía no arrancó no debe arrancar.
+	if f.requested == nil {
+		f.requested = map[string][]string{}
+	}
+	keep := []string{}
+	for _, k := range f.requested[workerID] {
+		if k != key {
+			keep = append(keep, k)
+		}
+	}
+	f.requested[workerID] = keep
+	if f.cancels == nil {
+		f.cancels = map[string][]string{}
+	}
+	for _, k := range f.cancels[workerID] {
+		if k == key {
+			return nil // idempotente
+		}
+	}
+	f.cancels[workerID] = append(f.cancels[workerID], key)
+	return nil
+}
+
+func (f *fakeStore) PendingDownloadCancels(_ context.Context, workerID string) ([]string, error) {
+	out := append([]string{}, f.cancels[workerID]...)
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) AckDownloadCancels(_ context.Context, workerID string, keys []string) error {
+	drop := map[string]bool{}
+	for _, k := range keys {
+		drop[k] = true
+	}
+	if f.cancels == nil {
+		f.cancels = map[string][]string{}
+	}
+	keep := []string{}
+	for _, k := range f.cancels[workerID] {
+		if !drop[k] {
+			keep = append(keep, k)
+		}
+	}
+	f.cancels[workerID] = keep
 	return nil
 }
 
@@ -638,6 +699,61 @@ func TestAdminRequestDeletionQueuesAndDelivers(t *testing.T) {
 		gin.H{"completed_deletions": []string{"SDXL-Turbo"}})
 	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "SDXL-Turbo") {
 		t.Fatalf("ack must clear the deletion queue: %s", w.Body.String())
+	}
+}
+
+func TestAdminCancelDownloadQueuesAndDropsPendingDownload(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.23", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// El panel pide el modelo, se arrepiente y lo cancela antes del heartbeat.
+	if w := doJSON(t, r, http.MethodPost,
+		"/api/v1/gpu/workers/"+wkr.ID+"/models/SDXL-Turbo/download", "", nil); w.Code != http.StatusCreated {
+		t.Fatalf("download = %d, want 201", w.Code)
+	}
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/models/SDXL-Turbo/download"
+	w := doJSON(t, r, http.MethodDelete, path, "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cancel = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	// Idempotente: dos pedidos, una sola entrada en la cola de cancelaciones.
+	if w = doJSON(t, r, http.MethodDelete, path, "", nil); w.Code != http.StatusOK {
+		t.Fatalf("re-cancel = %d, want 200", w.Code)
+	}
+
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_download_cancels": []string{}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "\"requested_download_cancels\":[\"SDXL-Turbo\"]") {
+		t.Fatalf("heartbeat should deliver requested_download_cancels: %s", body)
+	}
+	// La descarga pendiente ya no viaja: cancelar antes del heartbeat no la arranca.
+	if !strings.Contains(body, "\"requested_models\":[]") {
+		t.Fatalf("cancel must drop the pending download: %s", body)
+	}
+	// El ack la saca de la cola.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_download_cancels": []string{"SDXL-Turbo"}})
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "\"requested_download_cancels\":[\"SDXL-Turbo\"]") {
+		t.Fatalf("ack must clear the cancel queue: %s", w.Body.String())
+	}
+}
+
+func TestAdminCancelDownloadUnknownWorker(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	w := doJSON(t, r, http.MethodDelete,
+		"/api/v1/gpu/workers/"+uuid.NewString()+"/models/SD-1.5/download", "", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker = %d, want 404: %s", w.Code, w.Body.String())
 	}
 }
 
