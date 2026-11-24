@@ -83,6 +83,26 @@ func (f *fakeStore) CreatePairingCode(_ context.Context, tenantID, _ int64) (str
 	return code, expires, nil
 }
 
+func (f *fakeStore) UpdateWorkerSettings(_ context.Context, tenantID int64, workerID string,
+	name, label *string, paused *bool,
+) error {
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			if name != nil {
+				w.Name = *name
+			}
+			if label != nil {
+				w.Label = *label
+			}
+			if paused != nil {
+				w.Paused = *paused
+			}
+			return nil
+		}
+	}
+	return ErrWorkerAuth
+}
+
 func (f *fakeStore) DeleteWorker(_ context.Context, tenantID int64, workerID string) error {
 	for token, w := range f.workers {
 		if w.ID == workerID && w.TenantID == tenantID {
@@ -376,6 +396,12 @@ func (f *fakeStore) WorkerVersion(_ context.Context, tenantID int64, workerID st
 func (f *fakeStore) Claim(_ context.Context, workerID string, tenantID int64) (*Job, error) {
 	if f.claimErr != nil {
 		return nil, f.claimErr
+	}
+	// En pausa no se reclama nada (drenaje).
+	for _, w := range f.workers {
+		if w.ID == workerID && w.Paused {
+			return nil, nil
+		}
 	}
 	f.claims++
 	for _, j := range f.jobs {
@@ -1039,6 +1065,84 @@ func TestVersionAtLeast(t *testing.T) {
 		if got := versionAtLeast(tc.cur, tc.min); got != tc.want {
 			t.Fatalf("versionAtLeast(%q, %q) = %v, want %v", tc.cur, tc.min, got, tc.want)
 		}
+	}
+}
+
+// Pausar deja la GPU en drenaje sin revocarla: sigue emparejada y latiendo,
+// pero no reclama jobs nuevos; al reanudarla vuelve a tomarlos. El nombre y la
+// etiqueta se editan desde el mismo PATCH.
+func TestAdminUpdateWorkerPausesAndRenames(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.27", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Un job esperando en la cola abierta para cualquier GPU.
+	f.jobs = append(f.jobs, &Job{ID: uuid.NewString(), TenantID: 1, TaskID: "t-1",
+		Status: "queued"})
+	path := "/api/v1/gpu/workers/" + wkr.ID
+
+	w := doJSON(t, r, http.MethodPatch, path, "",
+		gin.H{"paused": true, "name": "PC-Ana", "label": "Sala 2"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch = %d: %s", w.Code, w.Body.String())
+	}
+	var got *Worker
+	for _, wk := range f.workers {
+		if wk.ID == wkr.ID {
+			got = wk
+		}
+	}
+	if got == nil || !got.Paused || got.Name != "PC-Ana" || got.Label != "Sala 2" {
+		t.Fatalf("worker = %+v, want pausado y renombrado", got)
+	}
+
+	// En pausa el claim no entrega nada y el job sigue en la cola.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/claim?wait=1", token, nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "\"job\":null") {
+		t.Fatalf("claim en pausa = %d: %s", w.Code, w.Body.String())
+	}
+	if f.jobs[0].Status != "queued" {
+		t.Fatalf("el job se reclamó en pausa: %+v", f.jobs[0])
+	}
+
+	// Reanudar vuelve a habilitar el claim.
+	if w = doJSON(t, r, http.MethodPatch, path, "", gin.H{"paused": false}); w.Code != http.StatusOK {
+		t.Fatalf("resume = %d: %s", w.Code, w.Body.String())
+	}
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/claim?wait=1", token, nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "t-1") {
+		t.Fatalf("claim al reanudar = %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminUpdateWorkerValidates(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.27", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	path := "/api/v1/gpu/workers/" + wkr.ID
+	if w := doJSON(t, r, http.MethodPatch, path, "", gin.H{}); w.Code != http.StatusBadRequest {
+		t.Fatalf("patch vacío = %d, want 400", w.Code)
+	}
+	if w := doJSON(t, r, http.MethodPatch, path, "", gin.H{"name": "   "}); w.Code != http.StatusBadRequest {
+		t.Fatalf("nombre vacío = %d, want 400", w.Code)
+	}
+	if w := doJSON(t, r, http.MethodPatch, path, "",
+		gin.H{"label": strings.Repeat("x", 64)}); w.Code != http.StatusBadRequest {
+		t.Fatalf("etiqueta larga = %d, want 400", w.Code)
+	}
+	if w := doJSON(t, r, http.MethodPatch, "/api/v1/gpu/workers/not-a-uuid", "",
+		gin.H{"paused": true}); w.Code != http.StatusBadRequest {
+		t.Fatalf("id inválido = %d, want 400", w.Code)
+	}
+	if w := doJSON(t, r, http.MethodPatch, "/api/v1/gpu/workers/"+uuid.NewString(), "",
+		gin.H{"paused": true}); w.Code != http.StatusNotFound {
+		t.Fatalf("worker inexistente = %d, want 404", w.Code)
 	}
 }
 

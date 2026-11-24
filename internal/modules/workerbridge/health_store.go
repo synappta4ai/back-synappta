@@ -60,7 +60,7 @@ func (s *Store) AlertCandidates(ctx context.Context, tenantID int64) ([]WorkerHe
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT w.id, w.name, COALESCE(w.gpu_name, ''), COALESCE(w.version, ''),
 		       w.last_heartbeat, COALESCE(w.disk_free_mb, 0),
-		       w.update_failure::text,
+		       w.update_failure::text, w.paused,
 		       COALESCE((
 		           SELECT COUNT(*) = $2 AND bool_and(j.status = 'failed')
 		           FROM (SELECT status FROM worker_jobs
@@ -86,7 +86,7 @@ func (s *Store) AlertCandidates(ctx context.Context, tenantID int64) ([]WorkerHe
 		var heartbeat sql.NullTime
 		var failureJSON *string
 		if err := rows.Scan(&w.ID, &w.Name, &w.GPUName, &w.Version, &heartbeat,
-			&w.DiskFreeMB, &failureJSON, &w.FailedStreak, &w.LastJobError); err != nil {
+			&w.DiskFreeMB, &failureJSON, &w.Paused, &w.FailedStreak, &w.LastJobError); err != nil {
 			return nil, err
 		}
 		if heartbeat.Valid {

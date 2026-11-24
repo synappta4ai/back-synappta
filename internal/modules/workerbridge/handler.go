@@ -30,6 +30,8 @@ type BridgeStore interface {
 	ListWorkers(ctx context.Context, tenantID int64) ([]Worker, error)
 	CreatePairingCode(ctx context.Context, tenantID, createdBy int64) (string, time.Time, error)
 	DeleteWorker(ctx context.Context, tenantID int64, workerID string) error
+	UpdateWorkerSettings(ctx context.Context, tenantID int64, workerID string,
+		name, label *string, paused *bool) error
 	RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDownloads(ctx context.Context, workerID string) ([]string, error)
 	AckDownloads(ctx context.Context, workerID string, keys []string) error
@@ -79,6 +81,10 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 	{
 		admin.GET("/workers", m.AdminListWorkers)
 		admin.POST("/pairing-code", m.AdminPairingCode)
+		// Nombre/etiqueta editables y pausa (drenaje) sin desemparejar: antes,
+		// sacar una máquina de servicio obligaba a revocarla y repetir el
+		// emparejamiento en esa máquina.
+		admin.PATCH("/workers/:id", m.AdminUpdateWorker)
 		admin.DELETE("/workers/:id", m.AdminRevokeWorker)
 		admin.POST("/workers/:id/models/:key/download", m.AdminRequestDownload)
 		// Parar una descarga en curso (o todavía en cola) en esa GPU: sin esto,
@@ -382,6 +388,71 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	})
 }
 
+// adminWorkerPatch es el PATCH parcial de una GPU: los campos ausentes no se
+// tocan (el panel manda sólo lo que cambió).
+type adminWorkerPatch struct {
+	Name   *string `json:"name"`
+	Label  *string `json:"label"`
+	Paused *bool   `json:"paused"`
+}
+
+// AdminUpdateWorker handles PATCH /api/v1/gpu/workers/:id — nombre y etiqueta
+// editables, y pausa/drenaje: la GPU termina el job en curso y no reclama
+// nuevos hasta reanudarla, sin perder el emparejamiento.
+func (m *Module) AdminUpdateWorker(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	var req adminWorkerPatch
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "invalid body")
+		return
+	}
+	if req.Name == nil && req.Label == nil && req.Paused == nil {
+		utils.BadRequest(c, "nothing to update")
+		return
+	}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			utils.BadRequest(c, "worker name is required")
+			return
+		}
+		if len([]rune(name)) > 127 {
+			utils.BadRequest(c, "worker name is too long")
+			return
+		}
+		req.Name = &name
+	}
+	if req.Label != nil {
+		label := strings.TrimSpace(*req.Label)
+		if len([]rune(label)) > 63 {
+			utils.BadRequest(c, "worker label is too long")
+			return
+		}
+		req.Label = &label
+	}
+	if err := m.store.UpdateWorkerSettings(c.Request.Context(), t.ID, id,
+		req.Name, req.Label, req.Paused); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if req.Paused != nil {
+		log.Printf("[workerbridge] worker %s paused=%v", shortID(id), *req.Paused)
+	}
+	utils.Success(c, gin.H{"worker_id": id})
+}
+
 // AdminRequestDownload handles POST /api/v1/gpu/workers/:id/models/:key/download —
 // el admin encola la descarga de un modelo en esa GPU; el agente la recoge
 // en el próximo heartbeat y reporta el progreso en su snapshot.
@@ -546,6 +617,17 @@ func (m *Module) WorkerClaim(c *gin.Context) {
 		if secs, err := strconv.Atoi(s); err == nil && secs > 0 && secs <= 60 {
 			wait = time.Duration(secs) * time.Second
 		}
+	}
+	// Drenaje: una GPU en pausa termina el job en curso y no reclama nuevos. Se
+	// espera el long-poll igual que sin trabajo, así el agente no golpetea el
+	// back en bucle; al reanudarla vuelve a reclamar en el latido siguiente.
+	if w.Paused {
+		select {
+		case <-c.Request.Context().Done():
+		case <-time.After(wait):
+			utils.Success(c, gin.H{"job": nil, "paused": true})
+		}
+		return
 	}
 	deadline := time.Now().Add(wait)
 	for {

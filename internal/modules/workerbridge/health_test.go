@@ -196,6 +196,33 @@ func TestHealthMonitorSkipsStaleDataWhenOffline(t *testing.T) {
 	}
 }
 
+// En pausa no se avisa de conexión, disco ni jobs: la máquina puede estar
+// apagada a propósito durante el mantenimiento. Un fallo de actualización sí
+// se sigue reportando (la GPU quedó con el código viejo).
+func TestHealthMonitorSkipsAlertsWhilePaused(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	src := newFakeHealthSource()
+	src.tenants = []int64{1}
+	src.workers[1] = []WorkerHealth{{
+		ID: "w-1", Name: "PC-Casa", LastHeartbeat: now.Add(-3 * time.Hour),
+		DiskFreeMB: 500, FailedStreak: true, Paused: true,
+	}}
+	notif := &fakeNotifier{}
+	h := healthMonitorAt(src, notif, now)
+
+	h.evaluate(context.Background())
+	if len(notif.channels) != 0 {
+		t.Fatalf("canales = %v, want ninguno para una GPU en pausa", notif.channels)
+	}
+
+	src.workers[1][0].UpdateFailure = &UpdateFailure{ID: "u-1",
+		Error: "descarga falló: timeout", At: now}
+	h.evaluate(context.Background())
+	if len(notif.channels) != 1 || !strings.Contains(notif.channels[0], "descarga falló") {
+		t.Fatalf("canales = %v, want el fallo de la actualización", notif.channels)
+	}
+}
+
 // Disco bajo y racha de jobs fallidos avisan con el detalle que necesita el
 // admin para actuar, y también una sola vez por episodio.
 func TestHealthMonitorAlertsLowDiskAndFailingJobs(t *testing.T) {

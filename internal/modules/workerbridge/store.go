@@ -64,7 +64,10 @@ type Worker struct {
 	ID          string `json:"id"`
 	TenantID    int64  `json:"-"`
 	Name        string `json:"name"`
-	GPUName     string `json:"gpu_name"`
+	// Label es el nombre libre que pone el admin en el panel («PC de Ana»,
+	// «Sala 2»); Name es el de la máquina, que ahora también se edita desde ahí.
+	Label   string `json:"label"`
+	GPUName string `json:"gpu_name"`
 	OS          string `json:"os"`
 	Version     string `json:"version"`
 	VRAMTotalMB int    `json:"vram_total_mb"`
@@ -85,6 +88,9 @@ type Worker struct {
 	// el propio worker (o el watchdog si el reinicio no volvió). El panel lo
 	// muestra en lugar de deducir el fallo del reloj.
 	UpdateFailure *UpdateFailure `json:"update_failure"`
+	// Paused (drenaje): no reclama jobs nuevos, pero sigue latiendo y termina el
+	// que tenga en curso. Se reanuda desde el panel sin desemparejar.
+	Paused bool `json:"paused"`
 	// Online se deriva del último heartbeat (nunca se persiste).
 	Online bool `json:"online"`
 }
@@ -309,6 +315,28 @@ func (s *Store) ListWorkers(ctx context.Context, tenantID int64) ([]Worker, erro
 		out = append(out, *w)
 	}
 	return out, rows.Err()
+}
+
+// UpdateWorkerSettings cambia lo que el admin administra de una GPU sin
+// desemparejarla: nombre, etiqueta y pausa. Un puntero nil deja el valor como
+// está, así el panel manda sólo lo que cambió.
+func (s *Store) UpdateWorkerSettings(ctx context.Context, tenantID int64, workerID string,
+	name, label *string, paused *bool,
+) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET name = COALESCE($3, name),
+		    label = COALESCE($4, label),
+		    paused = COALESCE($5, paused),
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, name, label, paused)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
 }
 
 // DeleteWorker revoca la GPU (borra el registry row; la cola de jobs del
@@ -719,6 +747,9 @@ func (s *Store) Claim(ctx context.Context, workerID string, tenantID int64) (*Jo
 			SELECT id FROM worker_jobs
 			WHERE tenant_id = $2 AND status = 'queued'
 			  AND (worker_id IS NULL OR worker_id = $1::uuid)
+			  -- En pausa no se reclama nada: el drenaje termina el job en curso.
+			  AND NOT EXISTS (SELECT 1 FROM worker_registry p
+			                  WHERE p.id = $1::uuid AND p.paused)
 			ORDER BY created_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -994,9 +1025,10 @@ func (s *Store) RequeueStale(ctx context.Context, stale time.Duration) (int64, e
 // ─── Scan helpers ──────────────────────────────────────────────
 
 const workerSelect = `
-	SELECT id, tenant_id, name, gpu_name, os, version,
+	SELECT id, tenant_id, name, label, gpu_name, os, version,
 	       vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
-	       last_heartbeat, created_at, requested_update::text, update_failure::text
+	       last_heartbeat, created_at, requested_update::text, update_failure::text,
+	       paused
 	FROM worker_registry `
 
 const jobColumns = `
@@ -1019,9 +1051,9 @@ func scanWorkerRow(row rowScanner) (*Worker, error) {
 	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
 	var updateJSON *string
 	var failureJSON *string
-	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
+	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.Label, &w.GPUName, &w.OS, &w.Version,
 		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
-		&w.LastHeartbeat, &w.CreatedAt, &updateJSON, &failureJSON)
+		&w.LastHeartbeat, &w.CreatedAt, &updateJSON, &failureJSON, &w.Paused)
 	if err != nil {
 		return nil, err
 	}

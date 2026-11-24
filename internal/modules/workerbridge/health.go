@@ -67,6 +67,8 @@ type WorkerHealth struct {
 	// FailedStreak: los últimos `failedJobStreak` jobs terminados fallaron.
 	FailedStreak bool
 	LastJobError string
+	// Paused: la GPU está en mantenimiento a propósito (no reclama trabajos).
+	Paused bool
 }
 
 // healthSource es lo que el monitor necesita del store. Interface propia para
@@ -185,24 +187,11 @@ func (h *HealthMonitor) evaluateWorker(ctx context.Context, tenantID int64, w Wo
 // alerts traduce el estado de una GPU a los avisos que corresponden.
 func (h *HealthMonitor) alerts(w WorkerHealth) []alertText {
 	label := workerLabel(w)
-	online := !w.LastHeartbeat.IsZero() && h.now().Sub(w.LastHeartbeat) <= offlineAlertAfter
+	offline := w.LastHeartbeat.IsZero() || h.now().Sub(w.LastHeartbeat) > offlineAlertAfter
 	var out []alertText
 
-	if !online {
-		body := fmt.Sprintf("%s se emparejó pero nunca respondió.", label)
-		if !w.LastHeartbeat.IsZero() {
-			body = fmt.Sprintf("%s dejó de responder hace %s; los trabajos que le toquen van a esperar a que vuelva.",
-				label, humanDuration(h.now().Sub(w.LastHeartbeat)))
-		}
-		out = append(out, alertText{
-			kind:  alertOffline,
-			title: "GPU sin conexión: " + label,
-			body:  body,
-		})
-	}
-
-	// El fallo de actualización se avisa aunque la máquina esté caída: es
-	// justamente el caso "se reinició y no volvió".
+	// El fallo de actualización se avisa aunque la máquina esté caída o en
+	// pausa: es justamente el caso "se reinició y no volvió".
 	if w.UpdateFailure != nil {
 		reason := strings.TrimSpace(w.UpdateFailure.Error)
 		if reason == "" {
@@ -216,9 +205,29 @@ func (h *HealthMonitor) alerts(w WorkerHealth) []alertText {
 		})
 	}
 
+	// En pausa la máquina puede estar apagada a propósito (mantenimiento): no
+	// tiene sentido avisar que no late, ni de su disco ni de trabajos que por
+	// definición no está tomando.
+	if w.Paused {
+		return out
+	}
+
+	if offline {
+		body := fmt.Sprintf("%s se emparejó pero nunca respondió.", label)
+		if !w.LastHeartbeat.IsZero() {
+			body = fmt.Sprintf("%s dejó de responder hace %s; los trabajos que le toquen van a esperar a que vuelva.",
+				label, humanDuration(h.now().Sub(w.LastHeartbeat)))
+		}
+		out = append(out, alertText{
+			kind:  alertOffline,
+			title: "GPU sin conexión: " + label,
+			body:  body,
+		})
+	}
+
 	// Disco y jobs son datos del último heartbeat: con la máquina caída están
 	// viejos y sólo agregarían ruido.
-	if !online {
+	if offline {
 		return out
 	}
 	if w.DiskFreeMB > 0 && w.DiskFreeMB < lowDiskAlertMB {
