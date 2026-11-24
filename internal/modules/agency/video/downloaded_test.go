@@ -385,7 +385,7 @@ func TestDownloadedGenerateBridgeLeavesJobOpenWithoutWorkerIdentity(t *testing.T
 func TestStoreArtifactRemoteFallback(t *testing.T) {
 	t.Setenv("BM_WORKER_ARTIFACT_BASE", "")
 	// No shared disk + no artifact base → "" (task fails, never fake success).
-	if got := storeArtifact(filepath.Join(t.TempDir(), "missing.mp4"), "job1"); got != "" {
+	if got := storeArtifact(filepath.Join(t.TempDir(), "missing.mp4"), "job1", ""); got != "" {
 		t.Fatalf("storeArtifact = %q, want \"\"", got)
 	}
 }
@@ -446,4 +446,31 @@ func TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("el job quedó en running tras liberar la descarga del artefacto")
+}
+
+// TestArtifactBaseResolution fija de dónde baja el back el artefacto de un
+// worker remoto: BM_WORKER_ARTIFACT_BASE si está configurada y, si no, el
+// artifact server estándar (50052) del mismo host del worker. Sin ninguno de
+// los dos la toma termina en error explícito en vez de quedarse en 100 %.
+func TestArtifactBaseResolution(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    string
+		addr   string
+		expect string
+	}{
+		{"env manda", "http://worker.interno:9999", "10.0.0.5:50051", "http://worker.interno:9999"},
+		{"env con barra final", "http://worker.interno:9999/", "10.0.0.5:50051", "http://worker.interno:9999"},
+		{"deriva del addr", "", "10.0.0.5:50051", "http://10.0.0.5:50052"},
+		{"addr con tls://", "", "tls://worker.example.com:8443", "http://worker.example.com:50052"},
+		{"sin nada", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BM_WORKER_ARTIFACT_BASE", tc.env)
+			if got := artifactBase(tc.addr); got != tc.expect {
+				t.Fatalf("artifactBase(%q) = %q, want %q", tc.addr, got, tc.expect)
+			}
+		})
+	}
 }

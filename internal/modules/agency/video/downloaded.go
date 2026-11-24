@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -328,6 +329,15 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		}, nil
 	}
 
+	// El camino elegido queda en el log con el motivo: con un worker central
+	// configurado es imposible distinguir "fue al central" de "se encoló y
+	// nadie lo reclamó" mirando sólo la DB del job.
+	if !g.useBridgeFor(req.Model) {
+		log.Printf("[downloaded] job %s dispatch=grpc addr=%q (bridge=%t): la GPU del tenant no "+
+			"tiene %q disponible ahora, va al worker central",
+			jobID, addr, g.bridge != nil, req.Model)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	g.store.attachCancel(jobID, cancel)
 	go func() {
@@ -622,9 +632,10 @@ func (s *downloadedTaskStore) complete(jobID, artifactPath string) {
 	}
 	t.StreamStatus = "COMPLETED"
 	t.Percent = 100
+	workerAddr := t.WorkerAddr
 	s.mu.Unlock()
 
-	local := storeArtifact(artifactPath, jobID)
+	local := storeArtifact(artifactPath, jobID, workerAddr)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -686,9 +697,15 @@ func (s *downloadedTaskStore) get(jobID string) (downloadedTask, bool) {
 
 // storeArtifact re-hosts the worker-side artifact under Synapta's outputs.
 // The COMPLETED event reports the worker's local path; retrieval paths:
-//  1. shared disk (local dev): direct file copy,
-//  2. remote worker: the artifact server URL (BM_WORKER_ARTIFACT_BASE).
-func storeArtifact(workerPath, jobID string) string {
+//  1. shared disk (back y worker en el mismo host / volumen montado): copia
+//     directa si la ruta reportada es absoluta y visible desde el back,
+//  2. worker remoto: el artifact server del worker, en
+//     BM_WORKER_ARTIFACT_BASE/artifacts/<nombre> o, si esa variable no está
+//     configurada, en el puerto estándar 50052 del mismo host del worker.
+//
+// En el camino bridge esto no se usa: el worker sube el archivo al back
+// (POST /api/v1/internal/workers/artifacts) y el back es el dueño del output.
+func storeArtifact(workerPath, jobID, workerAddr string) string {
 	if workerPath == "" {
 		return ""
 	}
@@ -699,16 +716,33 @@ func storeArtifact(workerPath, jobID string) string {
 			return local
 		}
 	}
-	if base := strings.TrimRight(os.Getenv("BM_WORKER_ARTIFACT_BASE"), "/"); base != "" {
+	if base := artifactBase(workerAddr); base != "" {
 		if local, err := utils.SaveURLOutput(base+"/artifacts/"+name, name); err == nil {
 			log.Printf("[downloaded] job %s artifact downloaded from artifact server: %s", jobID, local)
 			return local
 		} else {
-			log.Printf("[downloaded] job %s artifact download failed: %v", jobID, err)
+			log.Printf("[downloaded] job %s artifact download failed from %s: %v", jobID, base, err)
 		}
 	}
-	log.Printf("[downloaded] job %s artifact %q not retrievable (no shared disk, no BM_WORKER_ARTIFACT_BASE)", jobID, name)
+	log.Printf("[downloaded] job %s artifact %q not retrievable (no shared disk, no artifact server: "+
+		"definí BM_WORKER_ARTIFACT_BASE o usá el camino bridge)", jobID, name)
 	return ""
+}
+
+// artifactBase resuelve la base del artifact server del worker remoto.
+// BM_WORKER_ARTIFACT_BASE manda cuando está configurada; si no, se asume el
+// puerto estándar del artifact server (50052) en el mismo host del worker:
+// así el camino gRPC directo cierra en success sin configurar nada extra.
+func artifactBase(workerAddr string) string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("BM_WORKER_ARTIFACT_BASE")), "/"); base != "" {
+		return base
+	}
+	addr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(workerAddr), "tls://"))
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, "50052")
 }
 
 // clampInt keeps v inside [lo, hi].
