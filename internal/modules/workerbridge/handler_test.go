@@ -34,6 +34,7 @@ type fakeStore struct {
 	requested  map[string][]string // workerID → descargas pedidas
 	cancels    map[string][]string // workerID → cancelaciones de descarga pedidas
 	deletions  map[string][]string // workerID → borrados pedidos
+	vramTotal  int                 // último vram_total_mb recibido en el heartbeat
 }
 
 type codeRow struct {
@@ -128,8 +129,9 @@ func (f *fakeStore) WorkerByToken(_ context.Context, token string) (*Worker, err
 }
 
 func (f *fakeStore) Heartbeat(_ context.Context, workerID string,
-	_ string, _ string, _, _ int, _ int64, _ json.RawMessage,
+	_ string, _ string, vramTotal, _, _ int, _ int64, _ json.RawMessage,
 ) ([]string, error) {
+	f.vramTotal = vramTotal
 	return f.heartbeats, nil
 }
 
@@ -744,6 +746,27 @@ func TestAdminCancelDownloadQueuesAndDropsPendingDownload(t *testing.T) {
 		gin.H{"completed_download_cancels": []string{"SDXL-Turbo"}})
 	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "\"requested_download_cancels\":[\"SDXL-Turbo\"]") {
 		t.Fatalf("ack must clear the cancel queue: %s", w.Body.String())
+	}
+}
+
+// El heartbeat tiene que llevar la VRAM total: es el único dato con el que el
+// panel dibuja «Memoria» y la columna «En tu GPU». Sin esto el registro se
+// quedaba en 0 y el panel mostraba «—» en toda la columna.
+func TestHeartbeatCarriesVRAMTotal(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	_, token, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.25", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	w := doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"vram_total_mb": 24576, "vram_free_mb": 20000})
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d: %s", w.Code, w.Body.String())
+	}
+	if f.vramTotal != 24576 {
+		t.Fatalf("store received vram_total_mb = %d, want 24576", f.vramTotal)
 	}
 }
 

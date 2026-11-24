@@ -274,8 +274,14 @@ func (s *Store) DeleteWorker(ctx context.Context, tenantID int64, workerID strin
 // Heartbeat actualiza el estado vivo del worker y devuelve los ids de jobs
 // cancelados desde la última consulta, para que el agente local aborte su
 // generación en curso.
+//
+// La VRAM total viaja en cada latido: es lo que el panel usa para «Memoria» y
+// para la columna «En tu GPU». Antes sólo se guardaba al emparejar, así que un
+// worker cuyo registro no la traía dejaba el panel en «—» para siempre. Un 0
+// (telemetría ilegible: CPU, driver caído) conserva el último valor conocido
+// en vez de borrar el dato de la GPU.
 func (s *Store) Heartbeat(ctx context.Context, workerID string,
-	gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage,
+	gpu, version string, vramTotal, vramFree, jobsActive int, diskFree int64, models json.RawMessage,
 ) ([]string, error) {
 	var modelsText string
 	if len(models) == 0 {
@@ -286,10 +292,11 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
 		SET last_heartbeat = NOW(), gpu_name = $2, version = $3,
-		    vram_free_mb = $4, jobs_active = $5, disk_free_mb = $6,
-		    models = $7::jsonb
+		    vram_total_mb = CASE WHEN $4 > 0 THEN $4 ELSE vram_total_mb END,
+		    vram_free_mb = $5, jobs_active = $6, disk_free_mb = $7,
+		    models = $8::jsonb
 		WHERE id = $1`,
-		workerID, gpu, version, vramFree, jobsActive, diskFree, modelsText)
+		workerID, gpu, version, vramTotal, vramFree, jobsActive, diskFree, modelsText)
 	if err != nil {
 		return nil, err
 	}

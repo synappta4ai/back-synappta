@@ -43,7 +43,7 @@ type BridgeStore interface {
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
 	WorkerByToken(ctx context.Context, token string) (*Worker, error)
 	Heartbeat(ctx context.Context, workerID string,
-		gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage) ([]string, error)
+		gpu, version string, vramTotal, vramFree, jobsActive int, diskFree int64, models json.RawMessage) ([]string, error)
 	Claim(ctx context.Context, workerID string, tenantID int64) (*Job, error)
 	ReportProgress(ctx context.Context, workerID, taskID, status string,
 		progress float64, streamStatus, errMsg string) error
@@ -253,12 +253,16 @@ func (m *Module) WorkerRegister(c *gin.Context) {
 
 // heartbeatRequest mantiene vivo el estado del worker.
 type heartbeatRequest struct {
-	GPUName    string          `json:"gpu_name"`
-	Version    string          `json:"version"`
-	VRAMFreeMB int             `json:"vram_free_mb"`
-	DiskFreeMB int64           `json:"disk_free_mb"`
-	JobsActive int             `json:"jobs_active"`
-	Models     json.RawMessage `json:"models"`
+	GPUName string `json:"gpu_name"`
+	Version string `json:"version"`
+	// VRAMTotalMB es la VRAM de la placa. Antes sólo se mandaba al emparejar y
+	// el panel quedaba en «Memoria —» / «En tu GPU —» cuando ese registro no la
+	// traía (o la GPU se emparejó con una versión vieja del agente).
+	VRAMTotalMB int             `json:"vram_total_mb"`
+	VRAMFreeMB  int             `json:"vram_free_mb"`
+	DiskFreeMB  int64           `json:"disk_free_mb"`
+	JobsActive  int             `json:"jobs_active"`
+	Models      json.RawMessage `json:"models"`
 	// Descargas que el agente ya tomó: el back las saca de la cola.
 	CompletedDownloads []string `json:"completed_downloads"`
 	// Borrados que el agente ya ejecutó (liberó el disco).
@@ -275,7 +279,8 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	var req heartbeatRequest
 	_ = c.ShouldBindJSON(&req) // body opcional
 	cancelIDs, err := m.store.Heartbeat(c.Request.Context(), w.ID,
-		req.GPUName, req.Version, req.VRAMFreeMB, req.JobsActive, req.DiskFreeMB, req.Models)
+		req.GPUName, req.Version, req.VRAMTotalMB, req.VRAMFreeMB, req.JobsActive,
+		req.DiskFreeMB, req.Models)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return

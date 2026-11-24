@@ -367,6 +367,39 @@ func TestStorePendingDeletionsRoundTrip(t *testing.T) {
 	}
 }
 
+// La VRAM total tiene que persistirse en cada heartbeat: el panel la usa para
+// «Memoria» y para la columna «En tu GPU», y antes sólo se guardaba al
+// emparejar, así que el registro quedaba en 0 y toda la columna salía «—».
+func TestStoreHeartbeatPersistsVRAMTotal(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if _, err := st.Heartbeat(ctx, w, "RTX 4090", "0.2.25", 24576, 20000, 0, 90_000, nil); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 {
+		t.Fatalf("list workers = %d (%v), want 1", len(workers), err)
+	}
+	if workers[0].VRAMTotalMB != 24576 {
+		t.Fatalf("vram_total_mb = %d, want 24576", workers[0].VRAMTotalMB)
+	}
+
+	// Un worker sin telemetría legible manda 0: se conserva el último valor
+	// conocido en vez de dejar la GPU sin memoria reportada otra vez.
+	if _, err := st.Heartbeat(ctx, w, "RTX 4090", "0.2.25", 0, 19000, 0, 89_000, nil); err != nil {
+		t.Fatalf("heartbeat sin total: %v", err)
+	}
+	workers, err = st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 {
+		t.Fatalf("list workers = %d (%v), want 1", len(workers), err)
+	}
+	if workers[0].VRAMTotalMB != 24576 {
+		t.Fatalf("un 0 borró la vram total: %d, want 24576", workers[0].VRAMTotalMB)
+	}
+}
+
 // Cancelar una descarga usa el mismo mecanismo: el admin lo encola, el
 // heartbeat lo entrega y el agente confirma. Además saca el pedido de la cola
 // de descargas: cancelar antes del heartbeat no debe arrancar la descarga.
