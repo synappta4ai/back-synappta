@@ -30,11 +30,12 @@ type fakeStore struct {
 	jobs       []*Job
 	claimErr   error
 	claims     int
-	heartbeats []string            // task ids devueltos como cancelación
-	requested  map[string][]string // workerID → descargas pedidas
-	cancels    map[string][]string // workerID → cancelaciones de descarga pedidas
-	deletions  map[string][]string // workerID → borrados pedidos
-	vramTotal  int                 // último vram_total_mb recibido en el heartbeat
+	heartbeats []string                  // task ids devueltos como cancelación
+	requested  map[string][]string       // workerID → descargas pedidas
+	cancels    map[string][]string       // workerID → cancelaciones de descarga pedidas
+	deletions  map[string][]string       // workerID → borrados pedidos
+	updates    map[string]*UpdateRequest // workerID → actualización pedida
+	vramTotal  int                       // último vram_total_mb recibido en el heartbeat
 }
 
 type codeRow struct {
@@ -285,6 +286,34 @@ func (f *fakeStore) AckDownloadCancels(_ context.Context, workerID string, keys 
 		}
 	}
 	f.cancels[workerID] = keep
+	return nil
+}
+
+func (f *fakeStore) RequestUpdate(_ context.Context, tenantID int64, workerID, u string) error {
+	for _, w := range f.workers {
+		if w.ID == workerID && w.TenantID == tenantID {
+			if f.updates == nil {
+				f.updates = map[string]*UpdateRequest{}
+			}
+			// Idempotente: una actualización pendiente se conserva (el agente
+			// puede estar reiniciándose con ella).
+			if f.updates[workerID] == nil {
+				f.updates[workerID] = &UpdateRequest{ID: uuid.NewString(), URL: u, RequestedAt: time.Now()}
+			}
+			return nil
+		}
+	}
+	return ErrWorkerAuth
+}
+
+func (f *fakeStore) PendingUpdate(_ context.Context, workerID string) (*UpdateRequest, error) {
+	return f.updates[workerID], nil
+}
+
+func (f *fakeStore) AckUpdate(_ context.Context, workerID, id string) error {
+	if req := f.updates[workerID]; req != nil && req.ID == id {
+		delete(f.updates, workerID)
+	}
 	return nil
 }
 
@@ -767,6 +796,70 @@ func TestHeartbeatCarriesVRAMTotal(t *testing.T) {
 	}
 	if f.vramTotal != 24576 {
 		t.Fatalf("store received vram_total_mb = %d, want 24576", f.vramTotal)
+	}
+}
+
+// Actualización remota: el panel la encola con la URL del payload, el
+// heartbeat la entrega y el ack (con el id del pedido) la saca de la cola.
+func TestAdminRequestUpdateQueuesAndDelivers(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	ctx := context.Background()
+	wkr, token, err := f.RegisterWorker(ctx, 1, "pc", "GPU", "win", "0.2.25", 8000, 7000, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	path := "/api/v1/gpu/workers/" + wkr.ID + "/update"
+	payload := "https://front.example/assets/worker/synapta-worker.zip"
+	w := doJSON(t, r, http.MethodPost, path, "", gin.H{"url": payload})
+	if w.Code != http.StatusOK {
+		t.Fatalf("update = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	// Idempotente: dos clicks no encolan dos reinicios.
+	if w = doJSON(t, r, http.MethodPost, path, "", gin.H{"url": payload}); w.Code != http.StatusOK {
+		t.Fatalf("re-update = %d, want 200", w.Code)
+	}
+
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_update": ""})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), payload) {
+		t.Fatalf("heartbeat should deliver requested_update: %s", w.Body.String())
+	}
+	pending := f.updates[wkr.ID]
+	if pending == nil || pending.ID == "" {
+		t.Fatalf("pending update = %+v, want an id", pending)
+	}
+
+	// Un ack con otro id (pedido viejo) no borra el pendiente.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_update": uuid.NewString()})
+	if !strings.Contains(w.Body.String(), payload) {
+		t.Fatalf("stale ack must keep the update: %s", w.Body.String())
+	}
+	// El ack del proceso nuevo la saca de la cola.
+	w = doJSON(t, r, http.MethodPost, "/api/v1/internal/workers/heartbeat", token,
+		gin.H{"completed_update": pending.ID})
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), payload) {
+		t.Fatalf("ack must clear the update: %s", w.Body.String())
+	}
+}
+
+func TestAdminRequestUpdateRejectsForeignURL(t *testing.T) {
+	f := newFakeStore()
+	r := testRouter(t, f)
+	wkr, _, err := f.RegisterWorker(context.Background(), 1, "pc", "GPU", "win", "0.2.25", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	w := doJSON(t, r, http.MethodPost, "/api/v1/gpu/workers/"+wkr.ID+"/update", "",
+		gin.H{"url": "file:///etc/passwd"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("file url = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	w = doJSON(t, r, http.MethodPost, "/api/v1/gpu/workers/"+uuid.NewString()+"/update", "", nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown worker = %d, want 404: %s", w.Code, w.Body.String())
 	}
 }
 

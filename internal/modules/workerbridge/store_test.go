@@ -437,6 +437,54 @@ func TestStorePendingDownloadCancelsRoundTrip(t *testing.T) {
 	}
 }
 
+// La actualización remota se guarda como un pedido con id: el panel ve el
+// pendiente en la lista, un ack atrasado no borra un pedido nuevo y el que
+// confirma el worker reiniciado sí lo limpia.
+func TestStorePendingUpdateRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	first := "https://front.example/assets/worker/synapta-worker.zip"
+	if err := st.RequestUpdate(ctx, tenant, w, first); err != nil {
+		t.Fatalf("request update: %v", err)
+	}
+	// Re-pedirla no reemplaza la URL ni genera otro reinicio.
+	if err := st.RequestUpdate(ctx, tenant, w, "https://otro.example/x.zip"); err != nil {
+		t.Fatalf("re-request update: %v", err)
+	}
+	pending, err := st.PendingUpdate(ctx, w)
+	if err != nil || pending == nil {
+		t.Fatalf("pending = %+v (%v), want one", pending, err)
+	}
+	if pending.URL != first || pending.ID == "" {
+		t.Fatalf("pending = %+v, want the first url and an id", pending)
+	}
+
+	// El panel lo ve como «Actualizando…» en GET /gpu/workers.
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].RequestedUpdate == nil {
+		t.Fatalf("list workers = %+v (%v), want requested_update", workers, err)
+	}
+	if workers[0].RequestedUpdate.ID != pending.ID {
+		t.Fatalf("listed update id = %q, want %q", workers[0].RequestedUpdate.ID, pending.ID)
+	}
+
+	// Un ack con otro id (pedido viejo) no borra el actual.
+	if err := st.AckUpdate(ctx, w, "pedido-viejo"); err != nil {
+		t.Fatalf("stale ack: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again == nil {
+		t.Fatalf("stale ack cleared the pending update")
+	}
+	if err := st.AckUpdate(ctx, w, pending.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again != nil {
+		t.Fatalf("pending after ack = %+v, want none", again)
+	}
+}
+
 // Las dos colas son independientes: pedir una descarga no borra el borrado
 // pendiente del mismo modelo ni al revés (el agente decide el orden).
 func TestStoreDownloadAndDeletionQueuesAreIndependent(t *testing.T) {

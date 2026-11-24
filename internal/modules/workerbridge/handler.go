@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,9 @@ type BridgeStore interface {
 	RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error)
 	AckDownloadCancels(ctx context.Context, workerID string, keys []string) error
+	RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error
+	PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error)
+	AckUpdate(ctx context.Context, workerID, id string) error
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
@@ -79,6 +83,9 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 		// Borrar los pesos de una GPU emparejada: sin esto el disco de esa
 		// máquina nunca se liberaba desde el panel.
 		admin.DELETE("/workers/:id/models/:key", m.AdminRequestDeletion)
+		// Actualizar el worker de esa máquina: el agente baja el payload, se
+		// reinicia y vuelve solo, sin que el usuario abra su instalador.
+		admin.POST("/workers/:id/update", m.AdminRequestUpdate)
 	}
 
 	w := rg.Group("/internal/workers")
@@ -269,6 +276,9 @@ type heartbeatRequest struct {
 	CompletedDeletions []string `json:"completed_deletions"`
 	// Cancelaciones de descarga que el agente ya aplicó (abortó o no había nada).
 	CompletedDownloadCancels []string `json:"completed_download_cancels"`
+	// Id de la actualización que el agente aplicó: viaja recién desde el
+	// proceso nuevo, así el panel no da por actualizado algo que no arrancó.
+	CompletedUpdate string `json:"completed_update"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
@@ -303,6 +313,11 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 			log.Printf("[workerbridge] ack download cancels %s: %v", shortID(w.ID), aerr)
 		}
 	}
+	if id := strings.TrimSpace(req.CompletedUpdate); id != "" {
+		if aerr := m.store.AckUpdate(c.Request.Context(), w.ID, id); aerr != nil {
+			log.Printf("[workerbridge] ack update %s: %v", shortID(w.ID), aerr)
+		}
+	}
 	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
 	if perr != nil {
 		log.Printf("[workerbridge] pending downloads %s: %v", shortID(w.ID), perr)
@@ -318,11 +333,16 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 		log.Printf("[workerbridge] pending download cancels %s: %v", shortID(w.ID), cerr)
 		pendingCancels = []string{}
 	}
+	pendingUpdate, uerr := m.store.PendingUpdate(c.Request.Context(), w.ID)
+	if uerr != nil {
+		log.Printf("[workerbridge] pending update %s: %v", shortID(w.ID), uerr)
+	}
 	utils.Success(c, gin.H{
 		"cancel_task_ids":            cancelIDs,
 		"requested_models":           pending,
 		"requested_deletions":        pendingDeletes,
 		"requested_download_cancels": pendingCancels,
+		"requested_update":           pendingUpdate,
 	})
 }
 
@@ -414,6 +434,48 @@ func (m *Module) AdminCancelDownload(c *gin.Context) {
 		return
 	}
 	utils.Success(c, gin.H{"worker_id": id, "model_key": key, "status": "queued"})
+}
+
+// AdminRequestUpdate handles POST /api/v1/gpu/workers/:id/update — el admin
+// encola la actualización del worker de esa GPU. El body puede traer `url`
+// (el payload .zip que sirve el front); sin URL el agente usa el publicado por
+// defecto. El agente baja el payload, se reinicia y confirma con
+// completed_update en su primer heartbeat desde la versión nueva.
+func (m *Module) AdminRequestUpdate(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	var req struct {
+		URL string `json:"url"`
+	}
+	_ = c.ShouldBindJSON(&req) // body opcional: sin URL se usa la publicada
+	payloadURL := strings.TrimSpace(req.URL)
+	if len(payloadURL) > 2048 {
+		utils.BadRequest(c, "invalid payload url")
+		return
+	}
+	if payloadURL != "" {
+		parsed, err := url.Parse(payloadURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			utils.BadRequest(c, "invalid payload url")
+			return
+		}
+	}
+	if err := m.store.RequestUpdate(c.Request.Context(), t.ID, id, payloadURL); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "status": "queued"})
 }
 
 // WorkerClaim handles POST /api/v1/internal/workers/claim — long-poll de la

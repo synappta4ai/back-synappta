@@ -63,8 +63,21 @@ type Worker struct {
 	Models        json.RawMessage `json:"models"`
 	LastHeartbeat time.Time       `json:"last_heartbeat"`
 	CreatedAt     time.Time       `json:"created_at"`
+	// RequestedUpdate es la actualización encolada desde el panel (nil si no
+	// hay ninguna pendiente). El panel la muestra como «Actualizando…» hasta
+	// que el worker reiniciado confirma con su versión nueva.
+	RequestedUpdate *UpdateRequest `json:"requested_update"`
 	// Online se deriva del último heartbeat (nunca se persiste).
 	Online bool `json:"online"`
+}
+
+// UpdateRequest es una actualización del worker encolada desde el panel: el
+// agente baja el payload, se reinicia y confirma con el id en su primer
+// heartbeat desde la versión nueva.
+type UpdateRequest struct {
+	ID          string    `json:"id"`
+	URL         string    `json:"url"`
+	RequestedAt time.Time `json:"requested_at"`
 }
 
 // Job es un trabajo encolado para los workers del tenant.
@@ -497,6 +510,72 @@ func (s *Store) AckDownloadCancels(ctx context.Context, workerID string, keys []
 	return s.ackKeys(ctx, workerID, keys, colRequestedDownloadCancels)
 }
 
+// ─── Actualización remota (panel → worker) ─────────────────────
+//
+// Una sola actualización pendiente por worker: no es una cola por clave como
+// las de pesos (reemplazar el código dos veces no tiene sentido). El objeto
+// guarda el id del pedido —para que un ack viejo no borre uno nuevo— y la URL
+// del payload que eligió el panel (el mismo .zip que sirve su front).
+
+// RequestUpdate encola la actualización del worker. Idempotente: si ya hay una
+// pendiente se conserva (el agente puede estar reiniciándose con ella).
+func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url string) error {
+	req := UpdateRequest{
+		ID:          uuid.NewString(),
+		URL:         strings.TrimSpace(url),
+		RequestedAt: time.Now().UTC(),
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = COALESCE(requested_update, $3::jsonb),
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, string(raw))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
+// PendingUpdate devuelve la actualización pedida aún no confirmada (nil si no
+// hay ninguna). Una columna corrupta no bloquea el heartbeat.
+func (s *Store) PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error) {
+	var raw *string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT requested_update::text FROM worker_registry WHERE id = $1`,
+		workerID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil || *raw == "" || *raw == "null" {
+		return nil, nil
+	}
+	var req UpdateRequest
+	if err := json.Unmarshal([]byte(*raw), &req); err != nil || req.ID == "" {
+		return nil, nil
+	}
+	return &req, nil
+}
+
+// AckUpdate limpia la actualización cuando el worker ya arrancó con la versión
+// nueva. El id evita que un ack atrasado borre un pedido posterior.
+func (s *Store) AckUpdate(ctx context.Context, workerID, id string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = NULL, updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id)
+	return err
+}
+
 // ─── Cola de jobs ──────────────────────────────────────────────
 
 // Enqueue agrega un trabajo a la cola del tenant. task_id es el id del
@@ -810,7 +889,7 @@ func (s *Store) RequeueStale(ctx context.Context, stale time.Duration) (int64, e
 const workerSelect = `
 	SELECT id, tenant_id, name, gpu_name, os, version,
 	       vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
-	       last_heartbeat, created_at
+	       last_heartbeat, created_at, requested_update::text
 	FROM worker_registry `
 
 const jobColumns = `
@@ -831,14 +910,21 @@ func (s *Store) scanWorker(row rowScanner) (*Worker, error) {
 func scanWorkerRow(row rowScanner) (*Worker, error) {
 	w := &Worker{}
 	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
+	var updateJSON *string
 	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
 		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
-		&w.LastHeartbeat, &w.CreatedAt)
+		&w.LastHeartbeat, &w.CreatedAt, &updateJSON)
 	if err != nil {
 		return nil, err
 	}
 	if modelsJSON != nil {
 		w.Models = json.RawMessage(*modelsJSON)
+	}
+	if updateJSON != nil && *updateJSON != "null" {
+		var req UpdateRequest
+		if json.Unmarshal([]byte(*updateJSON), &req) == nil && req.ID != "" {
+			w.RequestedUpdate = &req
+		}
 	}
 	w.Online = time.Since(w.LastHeartbeat) < onlineWindow
 	return w, nil
