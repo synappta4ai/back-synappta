@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -386,4 +388,62 @@ func TestStoreArtifactRemoteFallback(t *testing.T) {
 	if got := storeArtifact(filepath.Join(t.TempDir(), "missing.mp4"), "job1"); got != "" {
 		t.Fatalf("storeArtifact = %q, want \"\"", got)
 	}
+}
+
+// TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact cubre el cuelgue
+// de la toma en 100 %: recuperar el artefacto es I/O (copia de disco o HTTP con
+// timeout de 120 s). Con el mutex tomado durante esa espera, cada GET /status
+// del front queda esperando y la UI se congela en "Generando 100 %".
+func TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release // simula un worker lento/inaccesible
+		_, _ = w.Write([]byte("png"))
+	}))
+	defer srv.Close()
+	t.Setenv("BM_WORKER_ARTIFACT_BASE", srv.URL)
+
+	store := newDownloadedTaskStore()
+	store.init("syn_lock", "SD-Tiny-Test", "")
+	go store.complete("syn_lock", filepath.Join(t.TempDir(), "syn_lock.png"))
+
+	// Mientras la descarga sigue colgada, el status tiene que responder y
+	// complete ya tiene que haber publicado 100 %/COMPLETED.
+	deadline := time.Now().Add(2 * time.Second)
+	var task downloadedTask
+	for {
+		read := make(chan downloadedTask, 1)
+		go func() {
+			if tk, ok := store.get("syn_lock"); ok {
+				read <- tk
+			}
+		}()
+		select {
+		case task = <-read:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("GetStatus quedó bloqueado por la descarga del artefacto (mutex tomado durante I/O)")
+		}
+		if task.Percent == 100 && task.StreamStatus == "COMPLETED" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("complete no publicó 100/COMPLETED antes de bajar el artefacto: %v/%q",
+				task.Percent, task.StreamStatus)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if task.Status != config.STATUS_RUNNING {
+		t.Fatalf("el job no debería estar terminado antes del artefacto: %q", task.Status)
+	}
+
+	close(release) // la descarga termina: el job sale del estado intermedio
+
+	final := time.Now().Add(3 * time.Second)
+	for time.Now().Before(final) {
+		if tk, ok := store.get("syn_lock"); ok && tk.Status != config.STATUS_RUNNING {
+			return // success o failed explícito, nunca colgado en 100 %
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("el job quedó en running tras liberar la descarga del artefacto")
 }

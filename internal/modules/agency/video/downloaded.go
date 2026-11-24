@@ -607,17 +607,33 @@ func (s *downloadedTaskStore) progress(jobID string, pct float64, streamStatus s
 
 // complete marks success and stores the artifact; a failed store keeps the
 // task failed with an explanatory message (never silently successful).
+//
+// La recuperación del artefacto es I/O (copia de disco o descarga HTTP con
+// timeout de 120 s), así que corre FUERA del mutex: con el lock tomado cada
+// GET /status del front esperaba a que terminara la descarga y la toma se
+// quedaba clavada en 100 % sin responder (el front encuesta cada 3 s y no
+// vuelve a preguntar hasta que la anterior responde).
 func (s *downloadedTaskStore) complete(jobID, artifactPath string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	t, ok := s.tasks[jobID]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	t.StreamStatus = "COMPLETED"
 	t.Percent = 100
-	t.LocalURL = storeArtifact(artifactPath, jobID)
-	if t.LocalURL == "" {
+	s.mu.Unlock()
+
+	local := storeArtifact(artifactPath, jobID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok = s.tasks[jobID]
+	if !ok { // el job desapareció mientras se bajaba el artefacto
+		return
+	}
+	t.LocalURL = local
+	if local == "" {
 		t.Status = config.STATUS_FAILED
 		t.ErrMsg = fmt.Sprintf("artifact %q could not be retrieved from the worker", filepath.Base(artifactPath))
 		return
