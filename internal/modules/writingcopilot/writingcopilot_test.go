@@ -409,3 +409,14 @@ func TestFormatSeconds(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeSplitsFencedShotPack(t *testing.T) {
+	text := "Intro." + "\n\n```" + "\nPROMPT 1 de 2 | 4 s | A\nTITULO: UNO\nActuacion: uno." + "\n\nPROMPT 2 de 2 | 4 s | B\nTITULO: DOS\nActuacion: dos.\n```"
+	got := normalizePromptFences(text)
+	if n := strings.Count(got, "```"); n != 4 {
+		t.Fatalf("vallas = %d, want 4 (dos bloques): %q", n, got)
+	}
+	if prompts := extractPrompts(got); len(prompts) != 2 {
+		t.Fatalf("bloques = %d, want 2", len(prompts))
+	}
+}

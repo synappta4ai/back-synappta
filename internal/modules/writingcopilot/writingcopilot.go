@@ -665,24 +665,37 @@ var shotMarker = regexp.MustCompile(`(?mi)^(PROMPT\s+\d+\s+de\s+\d+|PLANO\s+\d+)
 // (15 shots) sometimes come back as plain text; the front splits the answer by
 // fences, so without this the shots are not detected.
 func normalizePromptFences(text string) string {
-	if strings.Contains(text, "```") {
+	lines := strings.Split(text, "\n")
+	headers := 0
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			continue
+		}
+		if shotMarker.MatchString(line) {
+			headers++
+		}
+		clean = append(clean, line)
+	}
+	if headers < 2 {
 		return text
 	}
-	starts := shotMarker.FindAllStringIndex(text, -1)
+	plain := strings.Join(clean, "\n")
+	starts := shotMarker.FindAllStringIndex(plain, -1)
 	if len(starts) < 2 {
 		return text
 	}
 	var sb strings.Builder
-	if head := strings.TrimSpace(text[:starts[0][0]]); head != "" {
+	if head := strings.TrimSpace(plain[:starts[0][0]]); head != "" {
 		sb.WriteString(head)
 		sb.WriteString("\n\n")
 	}
 	for i, start := range starts {
-		end := len(text)
+		end := len(plain)
 		if i+1 < len(starts) {
 			end = starts[i+1][0]
 		}
-		block := strings.TrimSpace(text[start[0]:end])
+		block := strings.TrimSpace(plain[start[0]:end])
 		if block == "" {
 			continue
 		}
