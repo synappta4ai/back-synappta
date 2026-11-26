@@ -200,7 +200,7 @@ func parseAnswer(raw []byte, anthropic bool) (string, usage, error) {
 			return "", usage{}, errors.New(parsed.Error.Message)
 		}
 		if parsed.StopReason == "max_tokens" {
-			return "", usage{}, errors.New("el cerebro corto la respuesta por el limite de tokens: pedi una version mas corta")
+			return "", usage{}, errors.New("el cerebro corto la respuesta por el limite de tokens: reduci el numero de tomas o pedi una version mas corta")
 		}
 		var sb strings.Builder
 		for _, block := range parsed.Content {
@@ -237,7 +237,7 @@ func parseAnswer(raw []byte, anthropic bool) (string, usage, error) {
 		return "", usage{}, errors.New("el cerebro devolvio una respuesta vacia")
 	}
 	if parsed.Choices[0].FinishReason == "length" {
-		return "", usage{}, errors.New("el cerebro corto la respuesta por el limite de tokens: pedi una version mas corta")
+		return "", usage{}, errors.New("el cerebro corto la respuesta por el limite de tokens: reduci el numero de tomas o pedi una version mas corta")
 	}
 	u := usage{
 		PromptTokens:     parsed.Usage.PromptTokens,

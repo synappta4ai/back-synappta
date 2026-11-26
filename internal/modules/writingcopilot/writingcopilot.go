@@ -58,11 +58,18 @@ const (
 	envEnabled     = "WRITING_COPILOT_ENABLED"
 	envModel       = "LLM_MODEL_WRITING_COPILOT"
 	envTemperature = "WRITING_COPILOT_TEMPERATURE"
+	envMaxTokens   = "WRITING_COPILOT_MAX_TOKENS"
 
 	// defaultTemperature is the sampling temperature of the agent.
 	defaultTemperature = 0.7
-	maxTokens          = 8000
 	callTimeout        = 6 * time.Minute
+
+	// Completion budget: a pack of N shots needs roughly N*perShot tokens, so
+	// the cap grows with the shot count instead of a fixed 8k that truncated
+	// 15-shot packs. maxShotsPerPiece is the product limit.
+	maxTokensBase    = 8000
+	maxTokensPerShot = 2000
+	maxShotsPerPiece = 15
 
 	maxHistoryMessages = 20
 	maxMessageChars    = 12000
@@ -289,6 +296,56 @@ func getenvModel() string {
 	return strings.TrimSpace(os.Getenv(envModel))
 }
 
+// getenvMaxTokens returns WRITING_COPILOT_MAX_TOKENS (0 = auto per model).
+func getenvMaxTokens() int {
+	raw := strings.TrimSpace(os.Getenv(envMaxTokens))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 1024 {
+		log.Printf("[writingcopilot] %s=%q invalido: se calcula por modelo", envMaxTokens, raw)
+		return 0
+	}
+	return v
+}
+
+// maxTokensFor returns the completion budget for a request. A pack of N shots
+// needs roughly N*maxTokensPerShot tokens; the budget grows with the shot
+// count, capped by the model's output limit and by the env override.
+func maxTokensFor(model string, shots int) int {
+	limit := outputLimitFor(model)
+	if env := getenvMaxTokens(); env > 0 && env < limit {
+		limit = env
+	}
+	need := maxTokensBase + shots*maxTokensPerShot
+	if need > limit {
+		need = limit
+	}
+	if need < maxTokensBase {
+		need = maxTokensBase
+	}
+	return need
+}
+
+// outputLimitFor is the max output tokens published by the provider for the
+// text models the copilot can use.
+func outputLimitFor(model string) int {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "gemini"):
+		return 65000
+	case strings.Contains(m, "claude"):
+		return 64000
+	case strings.Contains(m, "gpt-4o-mini"), strings.Contains(m, "gpt-4o"):
+		return 16000
+	case strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"), strings.HasPrefix(m, "o4"):
+		return 100000
+	default:
+		return 16000
+	}
+}
+
 // copilotTemperature reads WRITING_COPILOT_TEMPERATURE (default 0.7, 0..2).
 func copilotTemperature() float64 {
 	raw := strings.TrimSpace(os.Getenv(envTemperature))
@@ -426,8 +483,19 @@ func (m *Module) Chat(c *gin.Context) {
 		return
 	}
 	videoType := ""
+	shots := 0
 	if req.Params != nil {
 		videoType = strings.TrimSpace(req.Params.VideoType)
+		if req.Params.ShotCount != nil {
+			shots = *req.Params.ShotCount
+			if shots < 0 {
+				shots = 0
+			}
+			if shots > maxShotsPerPiece {
+				shots = maxShotsPerPiece
+				req.Params.ShotCount = &shots
+			}
+		}
 	}
 	if !ValidVideoType(videoType) {
 		utils.BadRequest(c, "video_type invalido: usa commercial_short, commercial_long, story_short o story_long")
@@ -448,8 +516,8 @@ func (m *Module) Chat(c *gin.Context) {
 		return
 	}
 	started := time.Now()
-	log.Printf("[writingcopilot] chat provider=%s model=%s video_type=%q system_bytes=%d history=%d message_chars=%d",
-		provider, model, videoType, len(system), len(req.History), len(req.Message))
+	log.Printf("[writingcopilot] chat provider=%s model=%s video_type=%q shots=%d system_bytes=%d history=%d message_chars=%d",
+		provider, model, videoType, shots, len(system), len(req.History), len(req.Message))
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), callTimeout)
 	defer cancel()
@@ -457,10 +525,17 @@ func (m *Module) Chat(c *gin.Context) {
 	if len(images) > 0 {
 		log.Printf("[writingcopilot] %d imagen(es) de referencia enviadas al cerebro", len(images))
 	}
-	text, u, err := m.brain.chat(ctx, provider, cred, model, system, buildUserMessage(req, images), copilotTemperature(), maxTokens)
+	budget := maxTokensFor(model, shots)
+	log.Printf("[writingcopilot] completion budget=%d tokens (model=%s shots=%d)", budget, model, shots)
+	text, u, err := m.brain.chat(ctx, provider, cred, model, system, buildUserMessage(req, images), copilotTemperature(), budget)
 	if err != nil {
 		utils.Error(c, http.StatusBadGateway, err.Error())
 		return
+	}
+	rawChars := len(text)
+	text = normalizePromptFences(text)
+	if len(text) != rawChars {
+		log.Printf("[writingcopilot] respuesta sin vallas: se normalizaron los bloques de tomas")
 	}
 	prompts := extractPrompts(text)
 	log.Printf("[writingcopilot] chat listo en %s: %d chars, %d bloques, tokens_in=%d tokens_out=%d",
@@ -555,6 +630,15 @@ func renderParams(p *chatParams) string {
 	if p.CutsPerShot != nil && *p.CutsPerShot > 0 {
 		add("cuts_per_shot", strconv.Itoa(*p.CutsPerShot))
 	}
+	// Tomas = clips: cada toma dura total/shots y los cortes se reparten dentro
+	// de ese clip, para que el cerebro no confunda duración total con clip.
+	if p.ShotCount != nil && *p.ShotCount > 0 && p.TotalDurationS != nil && *p.TotalDurationS > 0 {
+		perShot := *p.TotalDurationS / float64(*p.ShotCount)
+		add("shot_duration_s", formatSeconds(perShot))
+		if p.CutsPerShot != nil && *p.CutsPerShot > 0 {
+			add("cut_interval_s", formatSeconds(perShot/float64(*p.CutsPerShot)))
+		}
+	}
 	add("video_type", p.VideoType)
 	if !lookAssembled {
 		add("lighting", p.Lighting)
@@ -564,6 +648,50 @@ func renderParams(p *chatParams) string {
 }
 
 var promptBlock = regexp.MustCompile("(?s)```[a-zA-Z0-9_+-]*\n?(.*?)```")
+
+// formatSeconds trims a duration to at most two decimals ("5", "2.5", "2.33").
+func formatSeconds(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 2, 64)
+	s = strings.TrimRight(s, "0")
+	return strings.TrimSuffix(s, ".")
+}
+
+// shotMarker finds the start of each shot in a shot-pack answer (the skill
+// asks for `PROMPT n de N` headers, older runs may use `PLANO n`).
+var shotMarker = regexp.MustCompile(`(?mi)^(PROMPT\s+\d+\s+de\s+\d+|PLANO\s+\d+)\b.*$`)
+
+// normalizePromptFences wraps every shot of an unwrapped shot pack in its own
+// code fence. The skill asks the model for fenced blocks, but long answers
+// (15 shots) sometimes come back as plain text; the front splits the answer by
+// fences, so without this the shots are not detected.
+func normalizePromptFences(text string) string {
+	if strings.Contains(text, "```") {
+		return text
+	}
+	starts := shotMarker.FindAllStringIndex(text, -1)
+	if len(starts) < 2 {
+		return text
+	}
+	var sb strings.Builder
+	if head := strings.TrimSpace(text[:starts[0][0]]); head != "" {
+		sb.WriteString(head)
+		sb.WriteString("\n\n")
+	}
+	for i, start := range starts {
+		end := len(text)
+		if i+1 < len(starts) {
+			end = starts[i+1][0]
+		}
+		block := strings.TrimSpace(text[start[0]:end])
+		if block == "" {
+			continue
+		}
+		sb.WriteString("```\n")
+		sb.WriteString(block)
+		sb.WriteString("\n```\n\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
 
 // extractPrompts returns the body of every fenced code block, in order.
 func extractPrompts(text string) []string {
