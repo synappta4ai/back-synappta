@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,15 +296,24 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 	// Dirección del worker para este job: per-request (Option B) o global.
 	addr := g.effectiveAddr(req.WorkerAddr)
 
+	// El despacho se decide UNA vez por job: la misma decisión se guarda en el
+	// task (para cada poll de status) y se loguea, sin volver a consultar la
+	// DB del bridge para explicar por dónde salió.
+	useBridge := g.useBridgeFor(req.Model)
+	dispatch := DispatchCentral
+	if useBridge {
+		dispatch = DispatchBridge
+	}
+
 	// Registro el task ANTES de arrancar cualquier goroutine/encolado: un
 	// poll inmediato no debe ver el estado "unknown".
-	g.store.init(jobID, req.Model, addr)
+	g.store.init(jobID, req.Model, addr, dispatch)
 
 	// ── Camino bridge (GPU propia del tenant): el trabajo queda en la DB y
 	// la máquina del usuario lo reclama por HTTP. El estado vive en
 	// worker_jobs, no en memoria. Local-first: si la GPU del tenant tiene
 	// los pesos, se usa aunque haya central configurado (multi-usuario).
-	if g.useBridgeFor(req.Model) {
+	if useBridge {
 		payload, err := protojson.Marshal(gReq)
 		if err != nil {
 			g.store.fail(jobID, fmt.Sprintf("marshal job payload: %v", err))
@@ -316,17 +326,25 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 			g.store.fail(jobID, fmt.Sprintf("enqueue: %v", err))
 			return nil, fmt.Errorf("enqueue job for GPU worker: %w", err)
 		}
-		log.Printf("[downloaded] job %s enqueued for bridge (model=%s tenant=%d worker=%s)",
-			jobID, req.Model, g.tenantID, shortWorker(target))
+		log.Printf("[downloaded] job %s dispatch=%s enqueued for bridge (model=%s tenant=%d worker=%s)",
+			jobID, dispatch, req.Model, g.tenantID, shortWorker(target))
 		return &agency.GeneratorResult{
 			TaskID: jobID,
 			Model:  req.Model,
 			Status: config.STATUS_RUNNING,
 			Raw: map[string]interface{}{
 				"job_id": jobID, "engine": "inference-worker-bridge", "model": req.Model,
+				"dispatch": dispatch,
 			},
 		}, nil
 	}
+
+	// Con un worker central configurado es imposible distinguir "fue al
+	// central" de "se encoló y nadie lo reclamó" sin este motivo: queda en el
+	// log y en la respuesta de status de cada poll.
+	log.Printf("[downloaded] job %s dispatch=%s addr=%q (bridge=%t): la GPU del tenant no "+
+		"tiene %q disponible ahora, va al worker central",
+		jobID, dispatch, addr, g.bridge != nil, req.Model)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g.store.attachCancel(jobID, cancel)
@@ -345,7 +363,10 @@ func (g *DownloadedGenerator) Generate(req *agency.GeneratorRequest) (*agency.Ge
 		TaskID: jobID,
 		Model:  req.Model,
 		Status: config.STATUS_RUNNING,
-		Raw:    map[string]interface{}{"job_id": jobID, "engine": "inference-worker", "model": req.Model},
+		Raw: map[string]interface{}{
+			"job_id": jobID, "engine": "inference-worker", "model": req.Model,
+			"dispatch": dispatch,
+		},
 	}, nil
 }
 
@@ -436,7 +457,9 @@ func (g *DownloadedGenerator) GetStatus(taskID, apiKey, baseURL, endpoint string
 		// gone, so a worker-side check would be needed to conclude failure.
 		return &agency.GeneratorResult{
 			TaskID: taskID, Status: config.STATUS_RUNNING,
-			Raw: map[string]interface{}{"job_id": taskID, "engine": "inference-worker"},
+			Raw: map[string]interface{}{
+				"job_id": taskID, "engine": "inference-worker", "dispatch": DispatchUnknown,
+			},
 		}, nil
 	}
 	result := &agency.GeneratorResult{
@@ -446,6 +469,7 @@ func (g *DownloadedGenerator) GetStatus(taskID, apiKey, baseURL, endpoint string
 		Raw: map[string]interface{}{
 			"job_id":        taskID,
 			"engine":        "inference-worker",
+			"dispatch":      ts.Dispatch,
 			"stream_status": ts.StreamStatus,
 			"progress":      ts.Percent,
 		},
@@ -481,8 +505,15 @@ func (g *DownloadedGenerator) bridgeStatusFromJob(job *workerbridge.Job, taskID 
 		Raw: map[string]interface{}{
 			"job_id":        taskID,
 			"engine":        "inference-worker-bridge",
+			"dispatch":      DispatchBridge,
 			"stream_status": job.StreamStatus,
 			"progress":      job.Progress,
+			// Diagnóstico de la cola: a qué GPU está fijado el job y en qué
+			// estado está la fila. Un job fijado a una máquina que ya no
+			// reclama (o una fila que quedó 'running' sin ejecutor) se ve acá
+			// sin acceso a la DB del back.
+			"job_status":    job.Status,
+			"worker_pinned": shortWorker(job.WorkerID),
 		},
 	}
 	switch job.Status {
@@ -554,9 +585,23 @@ func (g *DownloadedGenerator) BuildPayload(req *agency.GeneratorRequest) map[str
 
 // ─── Task store ──────────────────────────────────────────────────
 
+// Valores de Dispatch: por dónde salió el job. "bridge" es una GPU del
+// tenant que lo reclama por HTTP; "central" es el gRPC directo a
+// BM_WORKER_ADDR. Se decide una sola vez en Generate y se publica en el
+// estado de la tarea, porque el progreso y el `engine` por sí solos no
+// distinguen "corrió en mi GPU" de "lo tomó el worker central".
+const (
+	DispatchBridge  = "bridge"
+	DispatchCentral = "central"
+	// DispatchUnknown: no hay registro del job (p.ej. tras un restart del
+	// back, que pierde el task store en memoria y sólo conserva el log).
+	DispatchUnknown = "unknown"
+)
+
 // downloadedTask is the live state of one job, filled by the stream consumer.
 type downloadedTask struct {
 	Model        string
+	Dispatch     string // bridge | central (decidido en Generate)
 	WorkerAddr   string // dirección del worker usada para este job (per-request o global)
 	Status       string // config.STATUS_RUNNING until terminal
 	StreamStatus string // worker-side: SUBMITTED | LOADING_MODEL | GENERATING | ...
@@ -580,10 +625,13 @@ func newDownloadedTaskStore() *downloadedTaskStore {
 	}
 }
 
-func (s *downloadedTaskStore) init(jobID, model, workerAddr string) {
+func (s *downloadedTaskStore) init(jobID, model, workerAddr, dispatch string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tasks[jobID] = &downloadedTask{Model: model, WorkerAddr: workerAddr, Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED"}
+	s.tasks[jobID] = &downloadedTask{
+		Model: model, Dispatch: dispatch, WorkerAddr: workerAddr,
+		Status: config.STATUS_RUNNING, StreamStatus: "SUBMITTED",
+	}
 }
 
 // workerAddr devuelve la dirección del worker registrada para un job (o "" si no hay).
@@ -607,17 +655,34 @@ func (s *downloadedTaskStore) progress(jobID string, pct float64, streamStatus s
 
 // complete marks success and stores the artifact; a failed store keeps the
 // task failed with an explanatory message (never silently successful).
+//
+// La recuperación del artefacto es I/O (copia de disco o descarga HTTP con
+// timeout de 120 s), así que corre FUERA del mutex: con el lock tomado cada
+// GET /status del front esperaba a que terminara la descarga y la toma se
+// quedaba clavada en 100 % sin responder (el front encuesta cada 3 s y no
+// vuelve a preguntar hasta que la anterior responde).
 func (s *downloadedTaskStore) complete(jobID, artifactPath string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	t, ok := s.tasks[jobID]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	t.StreamStatus = "COMPLETED"
 	t.Percent = 100
-	t.LocalURL = storeArtifact(artifactPath, jobID)
-	if t.LocalURL == "" {
+	workerAddr := t.WorkerAddr
+	s.mu.Unlock()
+
+	local := storeArtifact(artifactPath, jobID, workerAddr)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok = s.tasks[jobID]
+	if !ok { // el job desapareció mientras se bajaba el artefacto
+		return
+	}
+	t.LocalURL = local
+	if local == "" {
 		t.Status = config.STATUS_FAILED
 		t.ErrMsg = fmt.Sprintf("artifact %q could not be retrieved from the worker", filepath.Base(artifactPath))
 		return
@@ -670,9 +735,15 @@ func (s *downloadedTaskStore) get(jobID string) (downloadedTask, bool) {
 
 // storeArtifact re-hosts the worker-side artifact under Synapta's outputs.
 // The COMPLETED event reports the worker's local path; retrieval paths:
-//  1. shared disk (local dev): direct file copy,
-//  2. remote worker: the artifact server URL (BM_WORKER_ARTIFACT_BASE).
-func storeArtifact(workerPath, jobID string) string {
+//  1. shared disk (back y worker en el mismo host / volumen montado): copia
+//     directa si la ruta reportada es absoluta y visible desde el back,
+//  2. worker remoto: el artifact server del worker, en
+//     BM_WORKER_ARTIFACT_BASE/artifacts/<nombre> o, si esa variable no está
+//     configurada, en el puerto estándar 50052 del mismo host del worker.
+//
+// En el camino bridge esto no se usa: el worker sube el archivo al back
+// (POST /api/v1/internal/workers/artifacts) y el back es el dueño del output.
+func storeArtifact(workerPath, jobID, workerAddr string) string {
 	if workerPath == "" {
 		return ""
 	}
@@ -683,16 +754,33 @@ func storeArtifact(workerPath, jobID string) string {
 			return local
 		}
 	}
-	if base := strings.TrimRight(os.Getenv("BM_WORKER_ARTIFACT_BASE"), "/"); base != "" {
+	if base := artifactBase(workerAddr); base != "" {
 		if local, err := utils.SaveURLOutput(base+"/artifacts/"+name, name); err == nil {
 			log.Printf("[downloaded] job %s artifact downloaded from artifact server: %s", jobID, local)
 			return local
 		} else {
-			log.Printf("[downloaded] job %s artifact download failed: %v", jobID, err)
+			log.Printf("[downloaded] job %s artifact download failed from %s: %v", jobID, base, err)
 		}
 	}
-	log.Printf("[downloaded] job %s artifact %q not retrievable (no shared disk, no BM_WORKER_ARTIFACT_BASE)", jobID, name)
+	log.Printf("[downloaded] job %s artifact %q not retrievable (no shared disk, no artifact server: "+
+		"definí BM_WORKER_ARTIFACT_BASE o usá el camino bridge)", jobID, name)
 	return ""
+}
+
+// artifactBase resuelve la base del artifact server del worker remoto.
+// BM_WORKER_ARTIFACT_BASE manda cuando está configurada; si no, se asume el
+// puerto estándar del artifact server (50052) en el mismo host del worker:
+// así el camino gRPC directo cierra en success sin configurar nada extra.
+func artifactBase(workerAddr string) string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("BM_WORKER_ARTIFACT_BASE")), "/"); base != "" {
+		return base
+	}
+	addr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(workerAddr), "tls://"))
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return ""
+	}
+	return "http://" + net.JoinHostPort(host, "50052")
 }
 
 // clampInt keeps v inside [lo, hi].

@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"synapta/config"
+	"synapta/internal/looks"
 	"synapta/internal/modules/credential"
 	"synapta/internal/modules/file"
 	"synapta/internal/modules/model"
@@ -405,6 +406,19 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		APIKey:        creds.APIKey,
 		AuthKey:       creds.AuthKey(),
 		WorkerAddr:    req.WorkerAddr,
+	}
+	// Look (esquema de luz/color): se ensambla en el back con la plantilla
+	// base del modo y la intensidad elegida. Va solo al prompt que ve el
+	// proveedor, no al Content original: el request guardado conserva
+	// look/look_intensity y "Reusar" lo vuelve a ensamblar sin duplicarlo.
+	if strings.TrimSpace(req.Look) != "" {
+		mode, source, ref := lookContext(req.Content, m.Modality)
+		block, lookErr := looks.Assemble(mode, req.Look, looks.NormalizeLevel(req.LookIntensity), source, ref)
+		if lookErr != nil {
+			errLog = lookErr.Error()
+			return nil, lookErr
+		}
+		genReq.Content = append(genReq.Content, ContentItem{Type: "text", Text: block})
 	}
 	// Route resolution: per-tenant creds → model catalog route → provider
 	// default. Downloaded models have no HTTP route (gRPC to the worker).
@@ -886,6 +900,12 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 				resp.Progress = v
 				break
 			}
+		}
+		// Por dónde salió el job: el generator de modelos descargados lo
+		// publica en raw (bridge = GPU del tenant, central = BM_WORKER_ADDR).
+		// Se copia al nivel superior para que el front no abra raw.
+		if d, exists := rawMap["dispatch"].(string); exists {
+			resp.Dispatch = d
 		}
 	}
 	return resp, nil
@@ -1741,4 +1761,41 @@ func (s *Core) listGeneratedByModality(page, limit int, modality, eventID string
 		totalPages = 1
 	}
 	return &ListLogsResponse{Logs: logs, Total: total, Page: filter.Page, Limit: filter.Limit, TotalPages: totalPages}, nil
+}
+
+// lookContext elige la plantilla base y los tags de referencia que espera el
+// prompt del look. El tag de la fuente sigue la convención del app (@video1 /
+// @image1); la referencia de look es la primera imagen extra adjunta.
+func lookContext(items []ContentItem, modality model.Modality) (looks.Mode, string, string) {
+	images, videos := 0, 0
+	for _, item := range items {
+		switch item.Type {
+		case "image":
+			images++
+		case "video":
+			videos++
+		}
+	}
+	if modality == model.ModalityVideo {
+		if videos > 0 {
+			ref := ""
+			if images > 0 {
+				ref = "@image1"
+			}
+			return looks.ModeVideo, "@video1", ref
+		}
+		if images > 0 {
+			ref := ""
+			if images > 1 {
+				ref = "@image2"
+			}
+			return looks.ModeVideo, "@image1", ref
+		}
+		return looks.ModeVideo, "@video1", ""
+	}
+	ref := ""
+	if images > 1 {
+		ref = "@image2"
+	}
+	return looks.ModeImage, "@image1", ref
 }

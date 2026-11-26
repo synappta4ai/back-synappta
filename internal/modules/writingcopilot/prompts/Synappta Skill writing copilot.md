@@ -584,6 +584,7 @@ Use when `delivery` is `shot_pack` or the piece exceeds `max_clip_s`. Output one
 
 ```
 PROMPT [n] de [N] | [duración] s | [NOMBRE EN INGLÉS] ([glosa])
+TÍTULO: [QUIÉN HACE QUÉ en 4 a 8 palabras, derivado de Actuación, p. ej. "LA NIÑA ENCIENDE LA VELA"]
 BLOQUE DE CONTINUIDAD: [personaje/vestuario/props/locación/luz/hora/clima, 2 a 4 líneas, idéntico en todos los prompts]
 Aspecto y técnica: [una línea]
 Movimiento / Velocidad / Encuadre / Lente y foco / Luz y color / Exposición / Desenfoque / VFX / efectos / Actuación / Diálogo / Audio: [igual que 9.1, adaptados a un solo plano o fragmento]
@@ -591,6 +592,10 @@ Movimiento / Velocidad / Encuadre / Lente y foco / Luz y color / Exposición / D
 Continuidad al siguiente plano: [qué debe mantenerse idéntico y qué cambia]
 EVITAR: [lista breve]
 ```
+
+Rules for the shot pack:
+- **TÍTULO is mandatory in every prompt and goes on the line right after the `PROMPT n de N` header.** Write who does what (the action of the shot) in 4 to 8 words, in the output language, derived from `Actuación` — never the camera name: "LA NIÑA ENCIENDE LA VELA", not "MACRO INSERT".
+- **Actuación is mandatory in every prompt** (Section 9.1). If you skip it, the shot has no clear action.
 
 For image-to-video chaining, tell the user that the "Último fotograma" description can be used to produce the first frame of the next prompt.
 

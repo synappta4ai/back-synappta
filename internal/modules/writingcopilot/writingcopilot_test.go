@@ -128,7 +128,7 @@ func TestBuildUserMessageOrdersParamsReferencesAndMessage(t *testing.T) {
 		t.Errorf("el historial debe conservar el orden: %v", messages)
 	}
 	current, _ := messages[2]["content"].(string)
-	for _, want := range []string{"PARAMS:", "output_language: es", "delivery: shot_pack", "aspect_ratio: 9:16", "total_duration_s: 30", "audio_mode: with_dialogue", "shot_count: 4", "response_mode: prompt_only", "REFERENCES:", "cliente: joyeria", "una persona camina de noche"} {
+	for _, want := range []string{"PARAMS:", "output_language: es", "delivery: shot_pack", "aspect_ratio: 9:16", "total_duration_s: 30", "audio_mode: with_dialogue", "shot_count: 4", "shot_duration_s: 7.5", "response_mode: prompt_only", "REFERENCES:", "cliente: joyeria", "una persona camina de noche"} {
 		if !strings.Contains(current, want) {
 			t.Errorf("falta %q en el mensaje", want)
 		}
@@ -341,5 +341,82 @@ func TestSystemPromptIncludesActingEngine(t *testing.T) {
 		if !strings.Contains(prompt, "ACTING ENGINE") || !strings.Contains(prompt, "Weston step") {
 			t.Errorf("%q: el prompt no incluye el motor de actuacion", videoType)
 		}
+	}
+}
+
+func TestMaxTokensForShots(t *testing.T) {
+	t.Setenv(envMaxTokens, "")
+	cases := []struct {
+		model string
+		shots int
+		want  int
+	}{
+		{"google/gemini-3.8-flash", 15, maxTokensBase + 15*maxTokensPerShot},
+		{"anthropic/claude-sonnet-4.5", 15, maxTokensBase + 15*maxTokensPerShot},
+		{"openai/gpt-4o-mini", 15, 16000},
+		{"google/gemini-3.8-flash", 0, maxTokensBase},
+	}
+	for _, tc := range cases {
+		if got := maxTokensFor(tc.model, tc.shots); got != tc.want {
+			t.Errorf("maxTokensFor(%q, %d) = %d, want %d", tc.model, tc.shots, got, tc.want)
+		}
+	}
+}
+
+func TestChatClampsShotCount(t *testing.T) {
+	if maxShotsPerPiece != 15 {
+		t.Fatalf("maxShotsPerPiece = %d, want 15", maxShotsPerPiece)
+	}
+}
+
+func TestNormalizePromptFences(t *testing.T) {
+	plain := "Van los prompts:\n\nPROMPT 1 de 2 | 2 s | PLANO A\nContenido uno.\n\nPROMPT 2 de 2 | 3 s | PLANO B\nContenido dos."
+	got := normalizePromptFences(plain)
+	if prompts := extractPrompts(got); len(prompts) != 2 {
+		t.Fatalf("extractPrompts() = %d bloques, want 2 (%q)", len(prompts), got)
+	}
+	if !strings.HasPrefix(got, "Van los prompts:") {
+		t.Errorf("se perdio la prosa previa: %q", got)
+	}
+	fenced := "```\nPROMPT 1 de 1\nContenido.\n```"
+	if normalizePromptFences(fenced) != fenced {
+		t.Errorf("una respuesta ya delimitada no debe cambiar")
+	}
+}
+
+func TestRenderParamsDerivesShotTiming(t *testing.T) {
+	total := 30.0
+	shots := 6
+	cuts := 2
+	got := renderParams(&chatParams{TotalDurationS: &total, ShotCount: &shots, CutsPerShot: &cuts})
+	for _, want := range []string{
+		"shot_duration_s: 5",
+		"cut_interval_s: 2.5",
+		"shot_count: 6",
+		"cuts_per_shot: 2",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("renderParams() = %q, falta %q", got, want)
+		}
+	}
+}
+
+func TestFormatSeconds(t *testing.T) {
+	cases := map[float64]string{5: "5", 2.5: "2.5", 2.3333: "2.33", 0.25: "0.25"}
+	for in, want := range cases {
+		if got := formatSeconds(in); got != want {
+			t.Errorf("formatSeconds(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeSplitsFencedShotPack(t *testing.T) {
+	text := "Intro." + "\n\n```" + "\nPROMPT 1 de 2 | 4 s | A\nTITULO: UNO\nActuacion: uno." + "\n\nPROMPT 2 de 2 | 4 s | B\nTITULO: DOS\nActuacion: dos.\n```"
+	got := normalizePromptFences(text)
+	if n := strings.Count(got, "```"); n != 4 {
+		t.Fatalf("vallas = %d, want 4 (dos bloques): %q", n, got)
+	}
+	if prompts := extractPrompts(got); len(prompts) != 2 {
+		t.Fatalf("bloques = %d, want 2", len(prompts))
 	}
 }

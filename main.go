@@ -163,6 +163,14 @@ func main() {
 	masterPrefs := model.NewMasterPrefsStore(sysDB)
 	manager.SetModelMasterPrefs(masterPrefs)
 
+	// ─── Alertas de salud de las GPUs emparejadas ────────────
+	// Una GPU que deja de latir no se nota hasta que alguien abre el panel y el
+	// trabajo del equipo se encola contra una máquina que no está. El monitor
+	// avisa una vez por episodio (dejó de latir, actualización fallida, disco
+	// bajo, jobs fallando seguidos) por los canales del tenant y la
+	// campanita/push de sus admins.
+	gpuHealth := workerbridge.NewHealthMonitor(wbStore, manager)
+
 	// Object storage is per tenant (storage_config, managed over HTTP): there
 	// is no global bucket, so a tenant without one keeps using local disk.
 
@@ -403,6 +411,7 @@ func main() {
 	go agency.ReconcileLoop(manager.EachCore, stop) // recovers orphaned tasks per tenant
 	go workerbridge.ReconcileLoop(wbStore, stop)    // marca failed jobs de GPUs que murieron
 	go runtime.TrashPurgeLoop(reg, cfg, stop)       // borrado definitivo de la papelera a los 30 días
+	go gpuHealth.Run(stop, time.Minute)             // salud de las GPUs: una alerta por episodio
 	renderModule.ReconcileLoop(reg, stop)           // falla renders huérfanos (reinicio / sin progreso)
 
 	go func() {

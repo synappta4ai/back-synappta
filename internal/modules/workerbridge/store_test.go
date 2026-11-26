@@ -337,3 +337,301 @@ func TestStorePendingDownloadsRoundTrip(t *testing.T) {
 		t.Fatalf("pending after ack = %v, want none", pending)
 	}
 }
+
+// El borrado de pesos recorre el mismo camino que la descarga: el admin lo
+// encola, el heartbeat lo entrega y el agente lo confirma al ejecutarlo. Sin
+// esta cola una máquina emparejada no podía liberar disco desde el panel.
+func TestStorePendingDeletionsRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDeletion(ctx, tenant, w, "SDXL-Turbo"); err != nil {
+		t.Fatalf("request deletion: %v", err)
+	}
+	if err := st.RequestDeletion(ctx, tenant, w, "SDXL-Turbo"); err != nil {
+		t.Fatalf("re-request deletion: %v", err)
+	}
+	pending, err := st.PendingDeletions(ctx, w)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "SDXL-Turbo" {
+		t.Fatalf("pending = %v, want one SDXL-Turbo", pending)
+	}
+	if err := st.AckDeletions(ctx, w, pending); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if pending, _ := st.PendingDeletions(ctx, w); len(pending) != 0 {
+		t.Fatalf("pending after ack = %v, want none", pending)
+	}
+}
+
+// La VRAM total tiene que persistirse en cada heartbeat: el panel la usa para
+// «Memoria» y para la columna «En tu GPU», y antes sólo se guardaba al
+// emparejar, así que el registro quedaba en 0 y toda la columna salía «—».
+func TestStoreHeartbeatPersistsVRAMTotal(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if _, err := st.Heartbeat(ctx, w, "RTX 4090", "0.2.25", 24576, 20000, 0, 90_000, nil); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 {
+		t.Fatalf("list workers = %d (%v), want 1", len(workers), err)
+	}
+	if workers[0].VRAMTotalMB != 24576 {
+		t.Fatalf("vram_total_mb = %d, want 24576", workers[0].VRAMTotalMB)
+	}
+
+	// Un worker sin telemetría legible manda 0: se conserva el último valor
+	// conocido en vez de dejar la GPU sin memoria reportada otra vez.
+	if _, err := st.Heartbeat(ctx, w, "RTX 4090", "0.2.25", 0, 19000, 0, 89_000, nil); err != nil {
+		t.Fatalf("heartbeat sin total: %v", err)
+	}
+	workers, err = st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 {
+		t.Fatalf("list workers = %d (%v), want 1", len(workers), err)
+	}
+	if workers[0].VRAMTotalMB != 24576 {
+		t.Fatalf("un 0 borró la vram total: %d, want 24576", workers[0].VRAMTotalMB)
+	}
+}
+
+// Cancelar una descarga usa el mismo mecanismo: el admin lo encola, el
+// heartbeat lo entrega y el agente confirma. Además saca el pedido de la cola
+// de descargas: cancelar antes del heartbeat no debe arrancar la descarga.
+func TestStorePendingDownloadCancelsRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDownload(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("request download: %v", err)
+	}
+	if err := st.RequestDownloadCancel(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("request cancel: %v", err)
+	}
+	if err := st.RequestDownloadCancel(ctx, tenant, w, "FLUX.1-dev"); err != nil {
+		t.Fatalf("re-request cancel: %v", err)
+	}
+
+	downloads, _ := st.PendingDownloads(ctx, w)
+	if len(downloads) != 0 {
+		t.Fatalf("pending downloads = %v, want none after cancel", downloads)
+	}
+	pending, err := st.PendingDownloadCancels(ctx, w)
+	if err != nil {
+		t.Fatalf("pending cancels: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "FLUX.1-dev" {
+		t.Fatalf("pending cancels = %v, want one FLUX.1-dev", pending)
+	}
+	if err := st.AckDownloadCancels(ctx, w, pending); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if pending, _ := st.PendingDownloadCancels(ctx, w); len(pending) != 0 {
+		t.Fatalf("pending cancels after ack = %v, want none", pending)
+	}
+}
+
+// La actualización remota se guarda como un pedido con id: el panel ve el
+// pendiente en la lista, re-encolar lo reemplaza (reintento), un ack atrasado
+// no borra un pedido nuevo y el que confirma el worker reiniciado sí lo limpia.
+func TestStorePendingUpdateRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	first := "https://front.example/assets/worker/synapta-worker.zip"
+	hash := strings.Repeat("ab", 32)
+	if err := st.RequestUpdate(ctx, tenant, w, first, hash); err != nil {
+		t.Fatalf("request update: %v", err)
+	}
+	original, err := st.PendingUpdate(ctx, w)
+	if err != nil || original == nil || original.ID == "" || original.URL != first {
+		t.Fatalf("pending = %+v (%v), want the first request", original, err)
+	}
+	if original.SHA256 != hash {
+		t.Fatalf("pending sha256 = %q, want %q", original.SHA256, hash)
+	}
+
+	// Re-encolar es el reintento del panel: reemplaza el pedido pendiente (id y
+	// URL nuevos) para que un pedido que no se aplicó nunca lo deje trabado.
+	retry := "https://otro.example/x.zip"
+	if err := st.RequestUpdate(ctx, tenant, w, retry, ""); err != nil {
+		t.Fatalf("re-request update: %v", err)
+	}
+	pending, err := st.PendingUpdate(ctx, w)
+	if err != nil || pending == nil {
+		t.Fatalf("pending = %+v (%v), want one", pending, err)
+	}
+	if pending.URL != retry || pending.ID == original.ID {
+		t.Fatalf("pending = %+v, want the retried url and a new id", pending)
+	}
+
+	// El panel lo ve como «Actualizando…» en GET /gpu/workers.
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].RequestedUpdate == nil {
+		t.Fatalf("list workers = %+v (%v), want requested_update", workers, err)
+	}
+	if workers[0].RequestedUpdate.ID != pending.ID {
+		t.Fatalf("listed update id = %q, want %q", workers[0].RequestedUpdate.ID, pending.ID)
+	}
+
+	// Un ack con otro id (pedido reemplazado) no borra el actual.
+	if err := st.AckUpdate(ctx, w, original.ID); err != nil {
+		t.Fatalf("stale ack: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again == nil {
+		t.Fatalf("stale ack cleared the pending update")
+	}
+	if err := st.AckUpdate(ctx, w, pending.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again != nil {
+		t.Fatalf("pending after ack = %+v, want none", again)
+	}
+}
+
+// El resultado de la actualización también se persiste: el fallo reportado por
+// el worker saca el pedido de la cola, queda visible en la lista (con su
+// motivo) y lo borra el siguiente intento.
+func TestStoreUpdateOutcomeRoundTrip(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip", ""); err != nil {
+		t.Fatalf("request update: %v", err)
+	}
+	pending, err := st.PendingUpdate(ctx, w)
+	if err != nil || pending == nil {
+		t.Fatalf("pending = %+v (%v), want one", pending, err)
+	}
+	// El agente avisa que empezó a aplicarla: es la marca que usa el watchdog.
+	if err := st.StartUpdate(ctx, w, pending.ID); err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	started, _ := st.PendingUpdate(ctx, w)
+	if started == nil || started.StartedAt == nil {
+		t.Fatalf("pending after start = %+v, want started_at", started)
+	}
+
+	// Un fallo de otro pedido no toca el vigente.
+	if err := st.FailUpdate(ctx, w, "pedido-viejo", "no importa"); err != nil {
+		t.Fatalf("foreign fail: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again == nil {
+		t.Fatal("un fallo ajeno borró el pedido vigente")
+	}
+
+	if err := st.FailUpdate(ctx, w, pending.ID, "descarga falló: timeout"); err != nil {
+		t.Fatalf("fail update: %v", err)
+	}
+	if again, _ := st.PendingUpdate(ctx, w); again != nil {
+		t.Fatalf("pending after fail = %+v, want none", again)
+	}
+	workers, err := st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].UpdateFailure == nil {
+		t.Fatalf("list workers = %+v (%v), want update_failure", workers, err)
+	}
+	if got := workers[0].UpdateFailure.Error; got != "descarga falló: timeout" {
+		t.Fatalf("failure error = %q", got)
+	}
+
+	// Reintentar borra el fallo anterior: el panel deja de mostrar el viejo.
+	if err := st.RequestUpdate(ctx, tenant, w, "https://front/x.zip", ""); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	workers, err = st.ListWorkers(ctx, tenant)
+	if err != nil || len(workers) != 1 || workers[0].RequestedUpdate == nil {
+		t.Fatalf("list after retry = %+v (%v)", workers, err)
+	}
+	if workers[0].UpdateFailure != nil {
+		t.Fatalf("el reintento debe borrar el fallo anterior: %+v", workers[0].UpdateFailure)
+	}
+}
+
+// Las dos colas son independientes: pedir una descarga no borra el borrado
+// pendiente del mismo modelo ni al revés (el agente decide el orden).
+func TestStoreDownloadAndDeletionQueuesAreIndependent(t *testing.T) {
+	st, tenant := testStore(t)
+	w := addWorker(t, st, tenant, "PC-Casa", 0)
+	ctx := context.Background()
+
+	if err := st.RequestDownload(ctx, tenant, w, "SD-1.5"); err != nil {
+		t.Fatalf("request download: %v", err)
+	}
+	if err := st.RequestDeletion(ctx, tenant, w, "SD-1.5"); err != nil {
+		t.Fatalf("request deletion: %v", err)
+	}
+
+	downloads, _ := st.PendingDownloads(ctx, w)
+	deletions, _ := st.PendingDeletions(ctx, w)
+	if len(downloads) != 1 || len(deletions) != 1 {
+		t.Fatalf("downloads=%v deletions=%v, want one each", downloads, deletions)
+	}
+	// Confirmar el borrado no toca la descarga pendiente.
+	if err := st.AckDeletions(ctx, w, deletions); err != nil {
+		t.Fatalf("ack deletions: %v", err)
+	}
+	if downloads, _ := st.PendingDownloads(ctx, w); len(downloads) != 1 {
+		t.Fatalf("downloads after deletion ack = %v, want one", downloads)
+	}
+}
+
+// Un job reclamado por un worker al que se le perdió la respuesta (corte de
+// red, deploy del back a mitad del long-poll) queda 'running' sin ejecutor: ni
+// Claim ni FailOrphans lo tocaban y la toma se quedaba en 0 % para siempre. La
+// reconciliación lo devuelve a la cola y el mismo worker puede reclamarlo.
+func TestStoreRequeueStaleClaimedJob(t *testing.T) {
+	st, tenant := testStore(t)
+	worker := addWorker(t, st, tenant, "PC-Casa", 0)
+	enqueue(t, st, tenant, "task-lost", worker)
+
+	claimed, err := st.Claim(context.Background(), worker, tenant)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: job=%v err=%v", claimed, err)
+	}
+	// Recién reclamado: la gracia lo protege (el worker puede estar cargando
+	// los pesos y todavía no mandó el primer evento).
+	if n, err := st.RequeueStale(context.Background(), 2*time.Minute); err != nil || n != 0 {
+		t.Fatalf("requeue recién reclamado: n=%d err=%v (want 0)", n, err)
+	}
+	backdateJob(t, st, "task-lost", 3*time.Minute)
+	n, err := st.RequeueStale(context.Background(), 2*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("requeue vencido: n=%d err=%v (want 1)", n, err)
+	}
+	job := jobStatus(t, st, tenant, "task-lost")
+	if job.Status != "queued" || job.WorkerID != "" {
+		t.Fatalf("job después del requeue: status=%q worker=%q, want queued sin pin", job.Status, job.WorkerID)
+	}
+	if again, err := st.Claim(context.Background(), worker, tenant); err != nil || again == nil {
+		t.Fatalf("re-claim: job=%v err=%v", again, err)
+	}
+}
+
+// Con la máquina ocupada (jobs_active > 0) la fila no se toca: puede ser un
+// job en curso cuyo primer evento todavía no llegó.
+func TestStoreRequeueSkipsBusyWorker(t *testing.T) {
+	st, tenant := testStore(t)
+	worker := addWorker(t, st, tenant, "PC-Casa", 0)
+	enqueue(t, st, tenant, "task-busy", worker)
+	if claimed, err := st.Claim(context.Background(), worker, tenant); err != nil || claimed == nil {
+		t.Fatalf("claim: job=%v err=%v", claimed, err)
+	}
+	backdateJob(t, st, "task-busy", 5*time.Minute)
+	if _, err := st.db.Exec(`UPDATE worker_registry SET jobs_active = 1 WHERE id = $1`, worker); err != nil {
+		t.Fatalf("marcar worker ocupado: %v", err)
+	}
+	if n, err := st.RequeueStale(context.Background(), 2*time.Minute); err != nil || n != 0 {
+		t.Fatalf("requeue con worker ocupado: n=%d err=%v (want 0)", n, err)
+	}
+	if job := jobStatus(t, st, tenant, "task-busy"); job.Status != "running" {
+		t.Fatalf("status = %q, want running (no se toca)", job.Status)
+	}
+}

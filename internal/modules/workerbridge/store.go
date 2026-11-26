@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,19 @@ const onlineWindow = 75 * time.Second
 // pairingCodeTTL: vida del código de emparejamiento (el usuario tarda
 // segundos en pegarlo en la app; 10 min es holgado).
 const pairingCodeTTL = 10 * time.Minute
+
+// updateRestartTimeout: cuánto se espera al worker después de que el agente
+// avisó que empezó a aplicarlo (started_at). A partir de ahí el proceso se
+// reinicia —deja de latir— y si no vuelve en este lapso se da por fallido. No
+// depende del momento del pedido: un job largo puede demorar la aplicación sin
+// que haya nada roto.
+const updateRestartTimeout = 10 * time.Minute
+
+// minUpdateReportVersion: primera versión del agente que reporta cómo terminó
+// la actualización (started_update / failed_update). Un worker anterior ignora
+// `requested_update`: se le encolaba el pedido y el panel quedaba en
+// «Actualizando…» para siempre, sin forma de saber que nunca pasó nada.
+const minUpdateReportVersion = "0.2.27"
 
 // Errors del store, comparables con errors.Is.
 var (
@@ -50,7 +64,10 @@ type Worker struct {
 	ID          string `json:"id"`
 	TenantID    int64  `json:"-"`
 	Name        string `json:"name"`
-	GPUName     string `json:"gpu_name"`
+	// Label es el nombre libre que pone el admin en el panel («PC de Ana»,
+	// «Sala 2»); Name es el de la máquina, que ahora también se edita desde ahí.
+	Label   string `json:"label"`
+	GPUName string `json:"gpu_name"`
 	OS          string `json:"os"`
 	Version     string `json:"version"`
 	VRAMTotalMB int    `json:"vram_total_mb"`
@@ -63,8 +80,48 @@ type Worker struct {
 	Models        json.RawMessage `json:"models"`
 	LastHeartbeat time.Time       `json:"last_heartbeat"`
 	CreatedAt     time.Time       `json:"created_at"`
+	// RequestedUpdate es la actualización encolada desde el panel (nil si no
+	// hay ninguna pendiente). El panel la muestra como «Actualizando…» hasta
+	// que el worker reiniciado confirma con su versión nueva.
+	RequestedUpdate *UpdateRequest `json:"requested_update"`
+	// UpdateFailure es el último intento que falló, con el motivo que reportó
+	// el propio worker (o el watchdog si el reinicio no volvió). El panel lo
+	// muestra en lugar de deducir el fallo del reloj.
+	UpdateFailure *UpdateFailure `json:"update_failure"`
+	// Paused (drenaje): no reclama jobs nuevos, pero sigue latiendo y termina el
+	// que tenga en curso. Se reanuda desde el panel sin desemparejar.
+	Paused bool `json:"paused"`
+	// SelfUpdate dice si esa versión sabe aplicar una actualización remota
+	// (derivado de Version, nunca se persiste). Un agente anterior a
+	// minUpdateReportVersion ignora `requested_update`: el panel lo marca y sólo
+	// le ofrece el instalador, en vez de encolar algo que nunca va a pasar.
+	SelfUpdate bool `json:"self_update"`
 	// Online se deriva del último heartbeat (nunca se persiste).
 	Online bool `json:"online"`
+}
+
+// UpdateRequest es una actualización del worker encolada desde el panel: el
+// agente baja el payload, se reinicia y confirma con el id en su primer
+// heartbeat desde la versión nueva.
+type UpdateRequest struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
+	// SHA256 es el hash del .zip que sirve esa URL. Lo manda el panel y el
+	// agente lo verifica después de bajar el payload, antes de detener nada: un
+	// zip truncado o cambiado en el camino ya no deja la máquina sin worker.
+	SHA256      string    `json:"sha256,omitempty"`
+	RequestedAt time.Time `json:"requested_at"`
+	// StartedAt lo pone el back cuando el agente avisa que empezó a aplicarla:
+	// desde ese momento el worker se reinicia y el back puede esperar de verdad
+	// (sin rodear al job que estaba corriendo).
+	StartedAt *time.Time `json:"started_at,omitempty"`
+}
+
+// UpdateFailure es el resultado fallido de una actualización remota.
+type UpdateFailure struct {
+	ID    string    `json:"id"`
+	Error string    `json:"error"`
+	At    time.Time `json:"at"`
 }
 
 // Job es un trabajo encolado para los workers del tenant.
@@ -226,7 +283,21 @@ func (s *Store) RegisterWorker(ctx context.Context, tenantID int64, name, gpu, g
 		w.Models = json.RawMessage(*modelsJSON)
 	}
 	w.Online = true
+	w.SelfUpdate = versionAtLeast(w.Version, minUpdateReportVersion)
 	return w, token, nil
+}
+
+// WorkerVersion devuelve la versión que reportó esa GPU del tenant ("" si
+// todavía no latió). ErrWorkerAuth si el worker no es de ese tenant.
+func (s *Store) WorkerVersion(ctx context.Context, tenantID int64, workerID string) (string, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT version FROM worker_registry WHERE id = $1 AND tenant_id = $2`,
+		workerID, tenantID).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrWorkerAuth
+	}
+	return version, err
 }
 
 // WorkerByToken resuelve el worker autenticado por su token. El hash es el
@@ -256,6 +327,28 @@ func (s *Store) ListWorkers(ctx context.Context, tenantID int64) ([]Worker, erro
 	return out, rows.Err()
 }
 
+// UpdateWorkerSettings cambia lo que el admin administra de una GPU sin
+// desemparejarla: nombre, etiqueta y pausa. Un puntero nil deja el valor como
+// está, así el panel manda sólo lo que cambió.
+func (s *Store) UpdateWorkerSettings(ctx context.Context, tenantID int64, workerID string,
+	name, label *string, paused *bool,
+) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET name = COALESCE($3, name),
+		    label = COALESCE($4, label),
+		    paused = COALESCE($5, paused),
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, name, label, paused)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
 // DeleteWorker revoca la GPU (borra el registry row; la cola de jobs del
 // worker queda huérfana y el reconciler la marca failed).
 func (s *Store) DeleteWorker(ctx context.Context, tenantID int64, workerID string) error {
@@ -274,8 +367,14 @@ func (s *Store) DeleteWorker(ctx context.Context, tenantID int64, workerID strin
 // Heartbeat actualiza el estado vivo del worker y devuelve los ids de jobs
 // cancelados desde la última consulta, para que el agente local aborte su
 // generación en curso.
+//
+// La VRAM total viaja en cada latido: es lo que el panel usa para «Memoria» y
+// para la columna «En tu GPU». Antes sólo se guardaba al emparejar, así que un
+// worker cuyo registro no la traía dejaba el panel en «—» para siempre. Un 0
+// (telemetría ilegible: CPU, driver caído) conserva el último valor conocido
+// en vez de borrar el dato de la GPU.
 func (s *Store) Heartbeat(ctx context.Context, workerID string,
-	gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage,
+	gpu, version string, vramTotal, vramFree, jobsActive int, diskFree int64, models json.RawMessage,
 ) ([]string, error) {
 	var modelsText string
 	if len(models) == 0 {
@@ -286,10 +385,11 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE worker_registry
 		SET last_heartbeat = NOW(), gpu_name = $2, version = $3,
-		    vram_free_mb = $4, jobs_active = $5, disk_free_mb = $6,
-		    models = $7::jsonb
+		    vram_total_mb = CASE WHEN $4 > 0 THEN $4 ELSE vram_total_mb END,
+		    vram_free_mb = $5, jobs_active = $6, disk_free_mb = $7,
+		    models = $8::jsonb
 		WHERE id = $1`,
-		workerID, gpu, version, vramFree, jobsActive, diskFree, modelsText)
+		workerID, gpu, version, vramTotal, vramFree, jobsActive, diskFree, modelsText)
 	if err != nil {
 		return nil, err
 	}
@@ -312,26 +412,40 @@ func (s *Store) Heartbeat(ctx context.Context, workerID string,
 	return ids, rows.Err()
 }
 
-// ─── Descargas de modelos (panel → worker) ─────────────────────
+// ─── Gestión de pesos (panel → worker) ─────────────────────────
+//
+// Dos colas con el mismo mecanismo: el admin encola pedidos por clave, el
+// agente los recoge en el heartbeat y los confirma cuando ya los tomó.
+//   requested_downloads / completed_downloads → bajar pesos
+//   requested_download_cancels / completed_download_cancels → parar una descarga
+//   requested_deletions / completed_deletions → liberar disco
 
-// RequestDownload encola la descarga de un modelo para el worker: el admin
-// la pide y el agente la recoge en el próximo heartbeat. Idempotente por
-// clave (re-pedir no duplica) y siempre con scope de tenant.
-func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error {
+// Columnas válidas de las colas de pesos. Whitelist explícita: el nombre de la
+// columna se interpola en el SQL (Postgres no parametriza identificadores) y
+// nunca puede venir de un request.
+const (
+	colRequestedDownloads       = "requested_downloads"
+	colRequestedDownloadCancels = "requested_download_cancels"
+	colRequestedDeletions       = "requested_deletions"
+)
+
+// enqueueKey agrega una clave a la cola JSONB del worker. Idempotente: re-pedir
+// la misma clave no duplica la entrada.
+func (s *Store) enqueueKey(ctx context.Context, tenantID int64, workerID, key, column string) error {
 	key = strings.TrimSpace(key)
 	if key == "" || len(key) > 128 {
 		return fmt.Errorf("invalid model key %q", key)
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE worker_registry
-		SET requested_downloads = (
+		SET %[1]s = (
 			SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb)
 			FROM (
-				SELECT jsonb_array_elements_text(requested_downloads) AS v
+				SELECT jsonb_array_elements_text(%[1]s) AS v
 				UNION SELECT $3
 			) s
 		), updated_at = NOW()
-		WHERE id = $1 AND tenant_id = $2`,
+		WHERE id = $1 AND tenant_id = $2`, column),
 		workerID, tenantID, key)
 	if err != nil {
 		return err
@@ -342,11 +456,33 @@ func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, k
 	return nil
 }
 
-// PendingDownloads lista las descargas pedidas aún no confirmadas.
-func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string, error) {
+// removeKey saca una clave de la cola JSONB del worker (scope de tenant).
+// Se usa al cancelar una descarga: si el pedido todavía no se había entregado,
+// sacarlo evita que el agente arranque justo lo que el usuario canceló.
+func (s *Store) removeKey(ctx context.Context, tenantID int64, workerID, key, column string) error {
+	res, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE worker_registry
+		SET %[1]s = (
+			SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
+			FROM jsonb_array_elements_text(%[1]s) AS v
+			WHERE v <> $3
+		), updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, column),
+		workerID, tenantID, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
+// pendingKeys lista los pedidos aún no confirmados del worker.
+func (s *Store) pendingKeys(ctx context.Context, workerID, column string) ([]string, error) {
 	var raw string
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(requested_downloads, '[]'::jsonb)::text FROM worker_registry WHERE id = $1`,
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT COALESCE(%s, '[]'::jsonb)::text FROM worker_registry WHERE id = $1`, column),
 		workerID).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return []string{}, nil
@@ -360,8 +496,8 @@ func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string
 	return out, nil
 }
 
-// AckDownloads saca de la cola las descargas que el worker ya tomó.
-func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string) error {
+// ackKeys saca de la cola los pedidos que el worker ya tomó.
+func (s *Store) ackKeys(ctx context.Context, workerID string, keys []string, column string) error {
 	clean := []string{}
 	seen := map[string]bool{}
 	for _, k := range keys {
@@ -384,13 +520,206 @@ func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string
 	}
 	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE worker_registry
-		SET requested_downloads = (
+		SET %[1]s = (
 			SELECT COALESCE(jsonb_agg(v), '[]'::jsonb)
-			FROM jsonb_array_elements_text(requested_downloads) AS v
-			WHERE v NOT IN (%s)
+			FROM jsonb_array_elements_text(%[1]s) AS v
+			WHERE v NOT IN (%[2]s)
 		), updated_at = NOW()
-		WHERE id = $1`, strings.Join(holders, ",")), args...)
+		WHERE id = $1`, column, strings.Join(holders, ",")), args...)
 	return err
+}
+
+// RequestDownload encola la descarga de un modelo para el worker: el admin
+// la pide y el agente la recoge en el próximo heartbeat. Idempotente por
+// clave (re-pedir no duplica) y siempre con scope de tenant.
+func (s *Store) RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error {
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDownloads)
+}
+
+// RequestDeletion encola el BORRADO de los pesos de un modelo en esa GPU: el
+// agente lo ejecuta en el próximo heartbeat y libera el disco. Antes sólo se
+// podía pedir una descarga, así que una máquina emparejada nunca liberaba
+// espacio: el disco se llenaba y las descargas siguientes fallaban.
+//
+// Idempotente por clave y con scope de tenant, igual que la descarga.
+func (s *Store) RequestDeletion(ctx context.Context, tenantID int64, workerID, key string) error {
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDeletions)
+}
+
+// PendingDownloads lista las descargas pedidas aún no confirmadas.
+func (s *Store) PendingDownloads(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDownloads)
+}
+
+// PendingDeletions lista los borrados pedidos aún no confirmados.
+func (s *Store) PendingDeletions(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDeletions)
+}
+
+// AckDownloads saca de la cola las descargas que el worker ya tomó.
+func (s *Store) AckDownloads(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDownloads)
+}
+
+// AckDeletions saca de la cola los borrados que el worker ya ejecutó (o que ya
+// no tenían nada que borrar).
+func (s *Store) AckDeletions(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDeletions)
+}
+
+// RequestDownloadCancel encola la CANCELACIÓN de la descarga de un modelo en
+// esa GPU: el agente aborta la transferencia en el próximo heartbeat y descarta
+// los bytes parciales. Además saca la clave de la cola de descargas si todavía
+// no se había entregado — son dos pedidos contradictorios y lo que el usuario
+// pidió al final es parar.
+func (s *Store) RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error {
+	if err := s.removeKey(ctx, tenantID, workerID, key, colRequestedDownloads); err != nil {
+		return err
+	}
+	return s.enqueueKey(ctx, tenantID, workerID, key, colRequestedDownloadCancels)
+}
+
+// PendingDownloadCancels lista las cancelaciones pedidas aún no confirmadas.
+func (s *Store) PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error) {
+	return s.pendingKeys(ctx, workerID, colRequestedDownloadCancels)
+}
+
+// AckDownloadCancels saca de la cola las cancelaciones que el agente ya ejecutó
+// (o que no tenían nada que abortar).
+func (s *Store) AckDownloadCancels(ctx context.Context, workerID string, keys []string) error {
+	return s.ackKeys(ctx, workerID, keys, colRequestedDownloadCancels)
+}
+
+// ─── Actualización remota (panel → worker) ─────────────────────
+//
+// Una sola actualización pendiente por worker: no es una cola por clave como
+// las de pesos (reemplazar el código dos veces no tiene sentido). El objeto
+// guarda el id del pedido —para que un ack viejo no borre uno nuevo— y la URL
+// del payload que eligió el panel (el mismo .zip que sirve su front).
+
+// RequestUpdate encola la actualización del worker. Re-encolar REEMPLAZA el
+// pedido pendiente: es el camino de reintento del panel cuando el anterior no
+// se aplicó (el worker no volvió, el updater falló, la máquina es vieja y
+// ignora el pedido). El agente confirma por id, así que el ack del pedido
+// reemplazado no borra el nuevo.
+func (s *Store) RequestUpdate(ctx context.Context, tenantID int64, workerID, url, sha256 string) error {
+	req := UpdateRequest{
+		ID:          uuid.NewString(),
+		URL:         strings.TrimSpace(url),
+		SHA256:      strings.ToLower(strings.TrimSpace(sha256)),
+		RequestedAt: time.Now().UTC(),
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = $3::jsonb, update_failure = NULL, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2`, workerID, tenantID, string(raw))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrWorkerAuth
+	}
+	return nil
+}
+
+// PendingUpdate devuelve la actualización pedida aún no confirmada (nil si no
+// hay ninguna). Una columna corrupta no bloquea el heartbeat.
+func (s *Store) PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error) {
+	var raw *string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT requested_update::text FROM worker_registry WHERE id = $1`,
+		workerID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil || *raw == "" || *raw == "null" {
+		return nil, nil
+	}
+	var req UpdateRequest
+	if err := json.Unmarshal([]byte(*raw), &req); err != nil || req.ID == "" {
+		return nil, nil
+	}
+	return &req, nil
+}
+
+// AckUpdate limpia la actualización cuando el worker ya arrancó con la versión
+// nueva. El id evita que un ack atrasado borre un pedido posterior.
+func (s *Store) AckUpdate(ctx context.Context, workerID, id string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = NULL, update_failure = NULL, updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id)
+	return err
+}
+
+// StartUpdate marca que el agente empezó a aplicar la actualización. Desde acá
+// el worker se reinicia y deja de latir: es el único tramo en el que el back
+// puede esperar por reloj sin castigar a un job que todavía está corriendo.
+func (s *Store) StartUpdate(ctx context.Context, workerID, id string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = requested_update
+		        || jsonb_build_object('started_at', to_jsonb(NOW())),
+		    updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id)
+	return err
+}
+
+// FailUpdate registra el fallo que reportó el worker y saca el pedido de la
+// cola, así el panel muestra el motivo real en vez de seguir «Actualizando…».
+// Sólo aplica al pedido vigente: el de uno reemplazado se ignora.
+func (s *Store) FailUpdate(ctx context.Context, workerID, id, reason string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if runes := []rune(reason); len(runes) > 512 {
+		reason = string(runes[:512])
+	}
+	if reason == "" {
+		reason = "la actualización no se aplicó"
+	}
+	raw, err := json.Marshal(UpdateFailure{ID: id, Error: reason, At: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET requested_update = NULL, update_failure = $3::jsonb, updated_at = NOW()
+		WHERE id = $1 AND requested_update->>'id' = $2`, workerID, id, string(raw))
+	return err
+}
+
+// ExpireUpdates da por fallida la actualización cuyo reinicio nunca terminó: el
+// agente avisó que empezó y el worker no volvió. Se evalúa al listar (el panel
+// pollea) porque una máquina caída no late y nadie más se enteraría.
+func (s *Store) ExpireUpdates(ctx context.Context, tenantID int64, timeout time.Duration) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_registry
+		SET update_failure = jsonb_build_object(
+		        'id', requested_update->>'id',
+		        'error', 'el worker no volvió después de reiniciarse; revisá la máquina',
+		        'at', to_jsonb(NOW())),
+		    requested_update = NULL, updated_at = NOW()
+		WHERE tenant_id = $1
+		  AND requested_update->>'started_at' IS NOT NULL
+		  AND (requested_update->>'started_at')::timestamptz < $2`, tenantID, time.Now().Add(-timeout))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ─── Cola de jobs ──────────────────────────────────────────────
@@ -429,6 +758,9 @@ func (s *Store) Claim(ctx context.Context, workerID string, tenantID int64) (*Jo
 			SELECT id FROM worker_jobs
 			WHERE tenant_id = $2 AND status = 'queued'
 			  AND (worker_id IS NULL OR worker_id = $1::uuid)
+			  -- En pausa no se reclama nada: el drenaje termina el job en curso.
+			  AND NOT EXISTS (SELECT 1 FROM worker_registry p
+			                  WHERE p.id = $1::uuid AND p.paused)
 			ORDER BY created_at
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -665,12 +997,49 @@ func (s *Store) FailOrphans(ctx context.Context) (int64, error) {
 	return total + n, nil
 }
 
+// RequeueStale devuelve a la cola los jobs que un worker reclamó y nunca
+// empezó a ejecutar.
+//
+// Claim marca la fila 'running' en la misma sentencia que la entrega: si la
+// respuesta se pierde en el camino (corte de red, deploy del back a mitad del
+// long-poll, timeout del cliente), el job queda 'running' sin nadie que lo
+// ejecute. Claim ya no lo mira (exige 'queued') y FailOrphans tampoco (el
+// worker sigue online), así que la toma se queda en 0 % para siempre.
+//
+// La ventana es segura: un job que sí se está ejecutando cambia
+// stream_status/progress en cada evento —y eso actualiza updated_at—, y el
+// dueño publica jobs_active en su heartbeat: con la máquina ocupada no se
+// re-encola nada.
+func (s *Store) RequeueStale(ctx context.Context, stale time.Duration) (int64, error) {
+	secs := int64(stale.Seconds())
+	if secs <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE worker_jobs SET status = 'queued', worker_id = NULL,
+		       stream_status = 'SUBMITTED', cancel_requested = FALSE,
+		       updated_at = NOW()
+		WHERE status = 'running'
+		  AND stream_status = 'SUBMITTED'
+		  AND progress = 0
+		  AND updated_at < NOW() - ($1 * INTERVAL '1 second')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM worker_registry w
+		      WHERE w.id = worker_jobs.worker_id AND w.jobs_active > 0)`, secs)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // ─── Scan helpers ──────────────────────────────────────────────
 
 const workerSelect = `
-	SELECT id, tenant_id, name, gpu_name, os, version,
+	SELECT id, tenant_id, name, label, gpu_name, os, version,
 	       vram_total_mb, vram_free_mb, disk_free_mb, jobs_active, models::text,
-	       last_heartbeat, created_at
+	       last_heartbeat, created_at, requested_update::text, update_failure::text,
+	       paused
 	FROM worker_registry `
 
 const jobColumns = `
@@ -691,16 +1060,32 @@ func (s *Store) scanWorker(row rowScanner) (*Worker, error) {
 func scanWorkerRow(row rowScanner) (*Worker, error) {
 	w := &Worker{}
 	var modelsJSON *string // models::text → string del driver (ver RegisterWorker)
-	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.GPUName, &w.OS, &w.Version,
+	var updateJSON *string
+	var failureJSON *string
+	err := row.Scan(&w.ID, &w.TenantID, &w.Name, &w.Label, &w.GPUName, &w.OS, &w.Version,
 		&w.VRAMTotalMB, &w.VRAMFreeMB, &w.DiskFreeMB, &w.JobsActive, &modelsJSON,
-		&w.LastHeartbeat, &w.CreatedAt)
+		&w.LastHeartbeat, &w.CreatedAt, &updateJSON, &failureJSON, &w.Paused)
 	if err != nil {
 		return nil, err
 	}
 	if modelsJSON != nil {
 		w.Models = json.RawMessage(*modelsJSON)
 	}
+	if updateJSON != nil && *updateJSON != "null" {
+		var req UpdateRequest
+		if json.Unmarshal([]byte(*updateJSON), &req) == nil && req.ID != "" {
+			w.RequestedUpdate = &req
+		}
+	}
+	if failureJSON != nil && *failureJSON != "null" {
+		var failure UpdateFailure
+		if json.Unmarshal([]byte(*failureJSON), &failure) == nil && failure.ID != "" {
+			w.UpdateFailure = &failure
+		}
+	}
 	w.Online = time.Since(w.LastHeartbeat) < onlineWindow
+	// Derivado: el panel no tiene que conocer el corte de versiones.
+	w.SelfUpdate = versionAtLeast(w.Version, minUpdateReportVersion)
 	return w, nil
 }
 
@@ -731,6 +1116,53 @@ func nullableInt64(id int64) interface{} {
 		return nil
 	}
 	return id
+}
+
+// isSHA256Hex valida un hash SHA-256 en hex minúsculas (64 caracteres), el
+// formato con el que el panel manda el hash de su payload.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// versionAtLeast compara versiones "x.y.z" numéricamente (no alfabéticamente:
+// 0.2.9 < 0.2.27). Un valor vacío o ilegible cuenta como anterior: no hay
+// garantía de que esa máquina soporte el protocolo.
+func versionAtLeast(current, min string) bool {
+	cur, ok := parseVersion(current)
+	if !ok {
+		return false
+	}
+	want, _ := parseVersion(min)
+	for i := 0; i < 3; i++ {
+		if cur[i] != want[i] {
+			return cur[i] > want[i]
+		}
+	}
+	return true
+}
+
+func parseVersion(raw string) ([3]int, bool) {
+	var out [3]int
+	parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(raw, "v")), ".")
+	if len(parts) < 2 {
+		return out, false
+	}
+	for i := 0; i < 3 && i < len(parts); i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
 }
 
 // uuidHasFormat sanity check para ids que llegan por URL.

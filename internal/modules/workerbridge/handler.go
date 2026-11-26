@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -29,15 +30,30 @@ type BridgeStore interface {
 	ListWorkers(ctx context.Context, tenantID int64) ([]Worker, error)
 	CreatePairingCode(ctx context.Context, tenantID, createdBy int64) (string, time.Time, error)
 	DeleteWorker(ctx context.Context, tenantID int64, workerID string) error
+	UpdateWorkerSettings(ctx context.Context, tenantID int64, workerID string,
+		name, label *string, paused *bool) error
 	RequestDownload(ctx context.Context, tenantID int64, workerID, key string) error
 	PendingDownloads(ctx context.Context, workerID string) ([]string, error)
 	AckDownloads(ctx context.Context, workerID string, keys []string) error
+	RequestDeletion(ctx context.Context, tenantID int64, workerID, key string) error
+	PendingDeletions(ctx context.Context, workerID string) ([]string, error)
+	AckDeletions(ctx context.Context, workerID string, keys []string) error
+	RequestDownloadCancel(ctx context.Context, tenantID int64, workerID, key string) error
+	PendingDownloadCancels(ctx context.Context, workerID string) ([]string, error)
+	AckDownloadCancels(ctx context.Context, workerID string, keys []string) error
+	RequestUpdate(ctx context.Context, tenantID int64, workerID, url, sha256 string) error
+	PendingUpdate(ctx context.Context, workerID string) (*UpdateRequest, error)
+	AckUpdate(ctx context.Context, workerID, id string) error
+	StartUpdate(ctx context.Context, workerID, id string) error
+	FailUpdate(ctx context.Context, workerID, id, reason string) error
+	ExpireUpdates(ctx context.Context, tenantID int64, timeout time.Duration) (int64, error)
+	WorkerVersion(ctx context.Context, tenantID int64, workerID string) (string, error)
 	ConsumePairingCode(ctx context.Context, code string) (int64, error)
 	RegisterWorker(ctx context.Context, tenantID int64, name, gpu, goos, version string,
 		vramTotal, vramFree int, diskFree int64, models json.RawMessage) (*Worker, string, error)
 	WorkerByToken(ctx context.Context, token string) (*Worker, error)
 	Heartbeat(ctx context.Context, workerID string,
-		gpu, version string, vramFree, jobsActive int, diskFree int64, models json.RawMessage) ([]string, error)
+		gpu, version string, vramTotal, vramFree, jobsActive int, diskFree int64, models json.RawMessage) ([]string, error)
 	Claim(ctx context.Context, workerID string, tenantID int64) (*Job, error)
 	ReportProgress(ctx context.Context, workerID, taskID, status string,
 		progress float64, streamStatus, errMsg string) error
@@ -65,8 +81,21 @@ func (m *Module) Register(rg *gin.RouterGroup, authMw, tenantMw, adminMw gin.Han
 	{
 		admin.GET("/workers", m.AdminListWorkers)
 		admin.POST("/pairing-code", m.AdminPairingCode)
+		// Nombre/etiqueta editables y pausa (drenaje) sin desemparejar: antes,
+		// sacar una máquina de servicio obligaba a revocarla y repetir el
+		// emparejamiento en esa máquina.
+		admin.PATCH("/workers/:id", m.AdminUpdateWorker)
 		admin.DELETE("/workers/:id", m.AdminRevokeWorker)
 		admin.POST("/workers/:id/models/:key/download", m.AdminRequestDownload)
+		// Parar una descarga en curso (o todavía en cola) en esa GPU: sin esto,
+		// elegir el modelo equivocado obligaba a esperar la descarga entera.
+		admin.DELETE("/workers/:id/models/:key/download", m.AdminCancelDownload)
+		// Borrar los pesos de una GPU emparejada: sin esto el disco de esa
+		// máquina nunca se liberaba desde el panel.
+		admin.DELETE("/workers/:id/models/:key", m.AdminRequestDeletion)
+		// Actualizar el worker de esa máquina: el agente baja el payload, se
+		// reinicia y vuelve solo, sin que el usuario abra su instalador.
+		admin.POST("/workers/:id/update", m.AdminRequestUpdate)
 	}
 
 	w := rg.Group("/internal/workers")
@@ -90,6 +119,14 @@ func (m *Module) AdminListWorkers(c *gin.Context) {
 	t, ok := tenancy.RequireTenant(c)
 	if !ok {
 		return
+	}
+	// Watchdog del reinicio: una actualización que el agente marcó como
+	// iniciada y cuyo worker no volvió no puede quedar «Actualizando…» para
+	// siempre. Se evalúa al listar porque una máquina caída no late.
+	if n, eerr := m.store.ExpireUpdates(c.Request.Context(), t.ID, updateRestartTimeout); eerr != nil {
+		log.Printf("[workerbridge] expirar actualizaciones de tenant %d: %v", t.ID, eerr)
+	} else if n > 0 {
+		log.Printf("[workerbridge] %d actualización(es) sin volver del reinicio", n)
 	}
 	workers, err := m.store.ListWorkers(c.Request.Context(), t.ID)
 	if err != nil {
@@ -241,14 +278,38 @@ func (m *Module) WorkerRegister(c *gin.Context) {
 
 // heartbeatRequest mantiene vivo el estado del worker.
 type heartbeatRequest struct {
-	GPUName    string          `json:"gpu_name"`
-	Version    string          `json:"version"`
-	VRAMFreeMB int             `json:"vram_free_mb"`
-	DiskFreeMB int64           `json:"disk_free_mb"`
-	JobsActive int             `json:"jobs_active"`
-	Models     json.RawMessage `json:"models"`
+	GPUName string `json:"gpu_name"`
+	Version string `json:"version"`
+	// VRAMTotalMB es la VRAM de la placa. Antes sólo se mandaba al emparejar y
+	// el panel quedaba en «Memoria —» / «En tu GPU —» cuando ese registro no la
+	// traía (o la GPU se emparejó con una versión vieja del agente).
+	VRAMTotalMB int             `json:"vram_total_mb"`
+	VRAMFreeMB  int             `json:"vram_free_mb"`
+	DiskFreeMB  int64           `json:"disk_free_mb"`
+	JobsActive  int             `json:"jobs_active"`
+	Models      json.RawMessage `json:"models"`
 	// Descargas que el agente ya tomó: el back las saca de la cola.
 	CompletedDownloads []string `json:"completed_downloads"`
+	// Borrados que el agente ya ejecutó (liberó el disco).
+	CompletedDeletions []string `json:"completed_deletions"`
+	// Cancelaciones de descarga que el agente ya aplicó (abortó o no había nada).
+	CompletedDownloadCancels []string `json:"completed_download_cancels"`
+	// Id de la actualización que el agente aplicó: viaja recién desde el
+	// proceso nuevo, así el panel no da por actualizado algo que no arrancó.
+	CompletedUpdate string `json:"completed_update"`
+	// Id de la actualización que este proceso empezó a aplicar (se manda justo
+	// antes de reiniciarse). Desde acá el back espera al worker nuevo sin
+	// confundir la espera con un fallo.
+	StartedUpdate string `json:"started_update"`
+	// Fallo explícito de la actualización: lo escribe el updater y el agente lo
+	// manda en el primer heartbeat que puede, con el motivo real.
+	FailedUpdate *failedUpdate `json:"failed_update"`
+}
+
+// failedUpdate es el fallo de una actualización reportado por el propio worker.
+type failedUpdate struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
 }
 
 // WorkerHeartbeat handles POST /api/v1/internal/workers/heartbeat — refresh
@@ -259,7 +320,8 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 	var req heartbeatRequest
 	_ = c.ShouldBindJSON(&req) // body opcional
 	cancelIDs, err := m.store.Heartbeat(c.Request.Context(), w.ID,
-		req.GPUName, req.Version, req.VRAMFreeMB, req.JobsActive, req.DiskFreeMB, req.Models)
+		req.GPUName, req.Version, req.VRAMTotalMB, req.VRAMFreeMB, req.JobsActive,
+		req.DiskFreeMB, req.Models)
 	if err != nil {
 		utils.InternalError(c, err.Error())
 		return
@@ -272,12 +334,123 @@ func (m *Module) WorkerHeartbeat(c *gin.Context) {
 			log.Printf("[workerbridge] ack downloads %s: %v", shortID(w.ID), aerr)
 		}
 	}
+	if len(req.CompletedDeletions) > 0 {
+		if aerr := m.store.AckDeletions(c.Request.Context(), w.ID, req.CompletedDeletions); aerr != nil {
+			log.Printf("[workerbridge] ack deletions %s: %v", shortID(w.ID), aerr)
+		}
+	}
+	if len(req.CompletedDownloadCancels) > 0 {
+		if aerr := m.store.AckDownloadCancels(c.Request.Context(), w.ID, req.CompletedDownloadCancels); aerr != nil {
+			log.Printf("[workerbridge] ack download cancels %s: %v", shortID(w.ID), aerr)
+		}
+	}
+	if id := strings.TrimSpace(req.CompletedUpdate); id != "" {
+		if aerr := m.store.AckUpdate(c.Request.Context(), w.ID, id); aerr != nil {
+			log.Printf("[workerbridge] ack update %s: %v", shortID(w.ID), aerr)
+		}
+	}
+	if id := strings.TrimSpace(req.StartedUpdate); id != "" {
+		if serr := m.store.StartUpdate(c.Request.Context(), w.ID, id); serr != nil {
+			log.Printf("[workerbridge] start update %s: %v", shortID(w.ID), serr)
+		}
+	}
+	if req.FailedUpdate != nil && strings.TrimSpace(req.FailedUpdate.ID) != "" {
+		if ferr := m.store.FailUpdate(c.Request.Context(), w.ID,
+			req.FailedUpdate.ID, req.FailedUpdate.Error); ferr != nil {
+			log.Printf("[workerbridge] fail update %s: %v", shortID(w.ID), ferr)
+		}
+	}
 	pending, perr := m.store.PendingDownloads(c.Request.Context(), w.ID)
 	if perr != nil {
 		log.Printf("[workerbridge] pending downloads %s: %v", shortID(w.ID), perr)
 		pending = []string{}
 	}
-	utils.Success(c, gin.H{"cancel_task_ids": cancelIDs, "requested_models": pending})
+	pendingDeletes, derr := m.store.PendingDeletions(c.Request.Context(), w.ID)
+	if derr != nil {
+		log.Printf("[workerbridge] pending deletions %s: %v", shortID(w.ID), derr)
+		pendingDeletes = []string{}
+	}
+	pendingCancels, cerr := m.store.PendingDownloadCancels(c.Request.Context(), w.ID)
+	if cerr != nil {
+		log.Printf("[workerbridge] pending download cancels %s: %v", shortID(w.ID), cerr)
+		pendingCancels = []string{}
+	}
+	pendingUpdate, uerr := m.store.PendingUpdate(c.Request.Context(), w.ID)
+	if uerr != nil {
+		log.Printf("[workerbridge] pending update %s: %v", shortID(w.ID), uerr)
+	}
+	utils.Success(c, gin.H{
+		"cancel_task_ids":            cancelIDs,
+		"requested_models":           pending,
+		"requested_deletions":        pendingDeletes,
+		"requested_download_cancels": pendingCancels,
+		"requested_update":           pendingUpdate,
+	})
+}
+
+// adminWorkerPatch es el PATCH parcial de una GPU: los campos ausentes no se
+// tocan (el panel manda sólo lo que cambió).
+type adminWorkerPatch struct {
+	Name   *string `json:"name"`
+	Label  *string `json:"label"`
+	Paused *bool   `json:"paused"`
+}
+
+// AdminUpdateWorker handles PATCH /api/v1/gpu/workers/:id — nombre y etiqueta
+// editables, y pausa/drenaje: la GPU termina el job en curso y no reclama
+// nuevos hasta reanudarla, sin perder el emparejamiento.
+func (m *Module) AdminUpdateWorker(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	var req adminWorkerPatch
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.BadRequest(c, "invalid body")
+		return
+	}
+	if req.Name == nil && req.Label == nil && req.Paused == nil {
+		utils.BadRequest(c, "nothing to update")
+		return
+	}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			utils.BadRequest(c, "worker name is required")
+			return
+		}
+		if len([]rune(name)) > 127 {
+			utils.BadRequest(c, "worker name is too long")
+			return
+		}
+		req.Name = &name
+	}
+	if req.Label != nil {
+		label := strings.TrimSpace(*req.Label)
+		if len([]rune(label)) > 63 {
+			utils.BadRequest(c, "worker label is too long")
+			return
+		}
+		req.Label = &label
+	}
+	if err := m.store.UpdateWorkerSettings(c.Request.Context(), t.ID, id,
+		req.Name, req.Label, req.Paused); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	if req.Paused != nil {
+		log.Printf("[workerbridge] worker %s paused=%v", shortID(id), *req.Paused)
+	}
+	utils.Success(c, gin.H{"worker_id": id})
 }
 
 // AdminRequestDownload handles POST /api/v1/gpu/workers/:id/models/:key/download —
@@ -309,6 +482,144 @@ func (m *Module) AdminRequestDownload(c *gin.Context) {
 	utils.Created(c, gin.H{"worker_id": id, "model_key": key})
 }
 
+// AdminRequestDeletion handles DELETE /api/v1/gpu/workers/:id/models/:key —
+// el admin pide liberar el disco de esa GPU borrando los pesos del modelo. El
+// agente lo ejecuta en el próximo heartbeat y lo confirma con
+// completed_deletions; el snapshot siguiente ya lo muestra sin pesos.
+func (m *Module) AdminRequestDeletion(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" || len(key) > 128 {
+		utils.BadRequest(c, "invalid model key")
+		return
+	}
+	if err := m.store.RequestDeletion(c.Request.Context(), t.ID, id, key); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "model_key": key, "status": "queued"})
+}
+
+// AdminCancelDownload handles DELETE /api/v1/gpu/workers/:id/models/:key/download —
+// el admin pide parar la descarga de un modelo en esa GPU. Si el pedido todavía
+// estaba en la cola de descargas se saca (nunca arranca) y, si ya estaba
+// bajando, el agente aborta la transferencia en el próximo heartbeat y la
+// confirma con completed_download_cancels.
+func (m *Module) AdminCancelDownload(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	key := strings.TrimSpace(c.Param("key"))
+	if key == "" || len(key) > 128 {
+		utils.BadRequest(c, "invalid model key")
+		return
+	}
+	if err := m.store.RequestDownloadCancel(c.Request.Context(), t.ID, id, key); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "model_key": key, "status": "queued"})
+}
+
+// AdminRequestUpdate handles POST /api/v1/gpu/workers/:id/update — el admin
+// encola la actualización del worker de esa GPU. El body puede traer `url`
+// (el payload .zip que sirve el front); sin URL el agente usa el publicado por
+// defecto. El agente baja el payload, se reinicia y confirma con
+// completed_update en su primer heartbeat desde la versión nueva.
+func (m *Module) AdminRequestUpdate(c *gin.Context) {
+	t, ok := tenancy.RequireTenant(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	if !uuidHasFormat(id) {
+		utils.BadRequest(c, "invalid worker id")
+		return
+	}
+	var req struct {
+		URL    string `json:"url"`
+		SHA256 string `json:"sha256"`
+	}
+	_ = c.ShouldBindJSON(&req) // body opcional: sin URL se usa la publicada
+	payloadURL := strings.TrimSpace(req.URL)
+	if len(payloadURL) > 2048 {
+		utils.BadRequest(c, "invalid payload url")
+		return
+	}
+	if payloadURL != "" {
+		parsed, err := url.Parse(payloadURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			utils.BadRequest(c, "invalid payload url")
+			return
+		}
+	}
+	// El hash viaja con la URL: el agente verifica lo que bajó antes de detener
+	// el worker, así un .zip truncado o cambiado no deja la máquina sin código.
+	// Sin URL no hay hash (el agente usa su payload publicado, que no conocemos).
+	payloadSHA := strings.ToLower(strings.TrimSpace(req.SHA256))
+	if payloadSHA != "" && !isSHA256Hex(payloadSHA) {
+		utils.BadRequest(c, "invalid payload sha256")
+		return
+	}
+	if payloadSHA != "" && payloadURL == "" {
+		utils.BadRequest(c, "sha256 requires a payload url")
+		return
+	}
+	// Un worker anterior a minUpdateReportVersion ignora el pedido: encolarlo
+	// dejaba el panel en «Actualizando…» sin forma de saber que no pasó nada.
+	// Se le pide una pasada manual del instalador, que es la única salida real.
+	version, verr := m.store.WorkerVersion(c.Request.Context(), t.ID, id)
+	if verr != nil {
+		if errors.Is(verr, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, verr.Error())
+		return
+	}
+	if !versionAtLeast(version, minUpdateReportVersion) {
+		reported := version
+		if reported == "" {
+			reported = "sin versión reportada"
+		}
+		utils.Conflict(c, "el worker de esa GPU ("+reported+") no reporta el resultado de una "+
+			"actualización remota: ejecutá el instalador una vez en esa máquina y desde ahí se "+
+			"actualiza sola")
+		return
+	}
+	if err := m.store.RequestUpdate(c.Request.Context(), t.ID, id, payloadURL, payloadSHA); err != nil {
+		if errors.Is(err, ErrWorkerAuth) {
+			utils.NotFound(c, "worker not found")
+			return
+		}
+		utils.InternalError(c, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"worker_id": id, "status": "queued"})
+}
+
 // WorkerClaim handles POST /api/v1/internal/workers/claim — long-poll de la
 // cola: responde apenas hay un job (o al agotarse el wait, con job=null).
 // El worker reintenta en bucle: sin jobs, la conexión casi no consume.
@@ -320,6 +631,17 @@ func (m *Module) WorkerClaim(c *gin.Context) {
 			wait = time.Duration(secs) * time.Second
 		}
 	}
+	// Drenaje: una GPU en pausa termina el job en curso y no reclama nuevos. Se
+	// espera el long-poll igual que sin trabajo, así el agente no golpetea el
+	// back en bucle; al reanudarla vuelve a reclamar en el latido siguiente.
+	if w.Paused {
+		select {
+		case <-c.Request.Context().Done():
+		case <-time.After(wait):
+			utils.Success(c, gin.H{"job": nil, "paused": true})
+		}
+		return
+	}
 	deadline := time.Now().Add(wait)
 	for {
 		job, err := m.store.Claim(c.Request.Context(), w.ID, w.TenantID)
@@ -328,7 +650,11 @@ func (m *Module) WorkerClaim(c *gin.Context) {
 			return
 		}
 		if job != nil {
-			utils.Success(c, job)
+			// El contrato es `{"job": {...}}`, igual que la respuesta vacía
+			// (`{"job": null}`): el agente lee `data.job` y antes descartaba el
+			// job pelado en silencio — el back lo marcaba 'running' y nadie lo
+			// ejecutaba nunca.
+			utils.Success(c, gin.H{"job": job})
 			return
 		}
 		if time.Now().After(deadline) {
@@ -435,6 +761,10 @@ func (m *Module) WorkerArtifact(c *gin.Context) {
 // channel del shutdown.
 func ReconcileLoop(store *Store, stop <-chan struct{}) {
 	ticker := time.NewTicker(2 * time.Minute)
+	// Gracia para dar por perdido un claim: un job en ejecución reporta su
+	// primer evento en segundos, y el worker publica jobs_active en el
+	// heartbeat (RequeueStale no toca filas de una máquina ocupada).
+	const unclaimedGrace = 2 * time.Minute
 	defer ticker.Stop()
 	for {
 		select {
@@ -443,12 +773,19 @@ func ReconcileLoop(store *Store, stop <-chan struct{}) {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			n, err := store.FailOrphans(ctx)
-			cancel()
 			if err != nil {
 				log.Printf("[workerbridge] reconcile: %v", err)
 			} else if n > 0 {
 				log.Printf("[workerbridge] reconcile: %d orphaned job(s) marked failed", n)
 			}
+			// Reclamos cuya respuesta se perdió: la fila quedó 'running' sin
+			// ejecutor y sin esto no la recupera nadie.
+			if r, rerr := store.RequeueStale(ctx, unclaimedGrace); rerr != nil {
+				log.Printf("[workerbridge] reconcile requeue: %v", rerr)
+			} else if r > 0 {
+				log.Printf("[workerbridge] reconcile: %d claimed-but-unstarted job(s) requeued", r)
+			}
+			cancel()
 		}
 	}
 }

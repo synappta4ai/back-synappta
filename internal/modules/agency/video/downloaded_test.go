@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -383,7 +385,150 @@ func TestDownloadedGenerateBridgeLeavesJobOpenWithoutWorkerIdentity(t *testing.T
 func TestStoreArtifactRemoteFallback(t *testing.T) {
 	t.Setenv("BM_WORKER_ARTIFACT_BASE", "")
 	// No shared disk + no artifact base → "" (task fails, never fake success).
-	if got := storeArtifact(filepath.Join(t.TempDir(), "missing.mp4"), "job1"); got != "" {
+	if got := storeArtifact(filepath.Join(t.TempDir(), "missing.mp4"), "job1", ""); got != "" {
 		t.Fatalf("storeArtifact = %q, want \"\"", got)
 	}
+}
+
+// TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact cubre el cuelgue
+// de la toma en 100 %: recuperar el artefacto es I/O (copia de disco o HTTP con
+// timeout de 120 s). Con el mutex tomado durante esa espera, cada GET /status
+// del front queda esperando y la UI se congela en "Generando 100 %".
+func TestCompleteDoesNotHoldTheStoreLockWhileFetchingTheArtifact(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release // simula un worker lento/inaccesible
+		_, _ = w.Write([]byte("png"))
+	}))
+	defer srv.Close()
+	t.Setenv("BM_WORKER_ARTIFACT_BASE", srv.URL)
+
+	store := newDownloadedTaskStore()
+	store.init("syn_lock", "SD-Tiny-Test", "", DispatchCentral)
+	go store.complete("syn_lock", filepath.Join(t.TempDir(), "syn_lock.png"))
+
+	// Mientras la descarga sigue colgada, el status tiene que responder y
+	// complete ya tiene que haber publicado 100 %/COMPLETED.
+	deadline := time.Now().Add(2 * time.Second)
+	var task downloadedTask
+	for {
+		read := make(chan downloadedTask, 1)
+		go func() {
+			if tk, ok := store.get("syn_lock"); ok {
+				read <- tk
+			}
+		}()
+		select {
+		case task = <-read:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("GetStatus quedó bloqueado por la descarga del artefacto (mutex tomado durante I/O)")
+		}
+		if task.Percent == 100 && task.StreamStatus == "COMPLETED" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("complete no publicó 100/COMPLETED antes de bajar el artefacto: %v/%q",
+				task.Percent, task.StreamStatus)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if task.Status != config.STATUS_RUNNING {
+		t.Fatalf("el job no debería estar terminado antes del artefacto: %q", task.Status)
+	}
+
+	close(release) // la descarga termina: el job sale del estado intermedio
+
+	final := time.Now().Add(3 * time.Second)
+	for time.Now().Before(final) {
+		if tk, ok := store.get("syn_lock"); ok && tk.Status != config.STATUS_RUNNING {
+			return // success o failed explícito, nunca colgado en 100 %
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("el job quedó en running tras liberar la descarga del artefacto")
+}
+
+// TestArtifactBaseResolution fija de dónde baja el back el artefacto de un
+// worker remoto: BM_WORKER_ARTIFACT_BASE si está configurada y, si no, el
+// artifact server estándar (50052) del mismo host del worker. Sin ninguno de
+// los dos la toma termina en error explícito en vez de quedarse en 100 %.
+func TestArtifactBaseResolution(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    string
+		addr   string
+		expect string
+	}{
+		{"env manda", "http://worker.interno:9999", "10.0.0.5:50051", "http://worker.interno:9999"},
+		{"env con barra final", "http://worker.interno:9999/", "10.0.0.5:50051", "http://worker.interno:9999"},
+		{"deriva del addr", "", "10.0.0.5:50051", "http://10.0.0.5:50052"},
+		{"addr con tls://", "", "tls://worker.example.com:8443", "http://worker.example.com:50052"},
+		{"sin nada", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BM_WORKER_ARTIFACT_BASE", tc.env)
+			if got := artifactBase(tc.addr); got != tc.expect {
+				t.Fatalf("artifactBase(%q) = %q, want %q", tc.addr, got, tc.expect)
+			}
+		})
+	}
+}
+
+// El estado de la tarea publica por dónde salió el job: el despacho se decide
+// una sola vez en Generate (no se vuelve a llamar a useBridgeFor sólo para el
+// log) y queda en el task, así cada poll lo devuelve sin tocar el bridge.
+func TestDownloadedStatusReportsDispatch(t *testing.T) {
+	t.Run("bridge", func(t *testing.T) {
+		g := bridgeGenerator(t, fakeBridgeQueue{online: true, models: []workerbridge.WorkerModel{
+			{Key: "SD-Tiny-Test", Mode: "image", Available: true, WorkerID: "worker-a"},
+		}})
+		req := genRequest("SD-Tiny-Test")
+		req.Modality = model.ModalityImage
+		res, err := g.Generate(req)
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		if raw, _ := res.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("generate dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+		st, err := g.GetStatus(res.TaskID, "", "", "")
+		if err != nil {
+			t.Fatalf("GetStatus: %v", err)
+		}
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("status dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+	})
+
+	t.Run("central", func(t *testing.T) {
+		// Sin bridge configurado el job sale por gRPC al worker central: la
+		// respuesta lo dice aunque el stream todavía no haya fallado.
+		g := NewDownloadedGenerator(worker.NewClient(), "127.0.0.1:1", t.TempDir())
+		res, err := g.Generate(genRequest("SD-Tiny-Test"))
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		if raw, _ := res.Raw.(map[string]interface{}); raw["dispatch"] != DispatchCentral {
+			t.Fatalf("generate dispatch = %v, want %q", raw["dispatch"], DispatchCentral)
+		}
+		st, err := g.GetStatus(res.TaskID, "", "", "")
+		if err != nil {
+			t.Fatalf("GetStatus: %v", err)
+		}
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchCentral {
+			t.Fatalf("status dispatch = %v, want %q", raw["dispatch"], DispatchCentral)
+		}
+	})
+
+	t.Run("worker_jobs", func(t *testing.T) {
+		// Un job leído de worker_jobs es, por definición, del camino bridge.
+		g := bridgeGenerator(t, fakeBridgeQueue{})
+		st := g.bridgeStatusFromJob(&workerbridge.Job{
+			Status: "running", StreamStatus: "GENERATING", Progress: 42,
+		}, "syn_job")
+		if raw, _ := st.Raw.(map[string]interface{}); raw["dispatch"] != DispatchBridge {
+			t.Fatalf("job status dispatch = %v, want %q", raw["dispatch"], DispatchBridge)
+		}
+	})
 }
