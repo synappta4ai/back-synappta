@@ -73,6 +73,11 @@ type OutputResource struct {
 	URL      string `json:"url"`
 	LocalURL string `json:"localUrl,omitempty"`
 	Type     string `json:"type"` // "video", "image", "audio", "text"
+	// ThumbnailURL/PreviewURL son derivados de las imágenes generadas, solo
+	// para mostrar en grillas y visor. Nunca reemplazan a URL/LocalURL: el
+	// original sigue siendo lo que se descarga y lo que consume la generación.
+	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	PreviewURL   string `json:"previewUrl,omitempty"`
 }
 
 // GenerateResponse is returned by POST /agency/*/generate.
@@ -110,8 +115,11 @@ type StatusResult struct {
 	VideoURL string      `json:"videoUrl,omitempty"`
 	LocalURL string      `json:"localUrl,omitempty"`
 	ImageURL string      `json:"imageUrl,omitempty"`
-	Raw      interface{} `json:"raw,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	// Derivados de salidas de imagen (ver OutputResource).
+	ThumbnailURL string      `json:"thumbnailUrl,omitempty"`
+	PreviewURL   string      `json:"previewUrl,omitempty"`
+	Raw          interface{} `json:"raw,omitempty"`
+	Error        string      `json:"error,omitempty"`
 }
 
 // PreviewPayloadResponse returns the AI API payload without sending it.

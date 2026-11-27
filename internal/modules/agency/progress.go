@@ -183,7 +183,14 @@ func (s *Core) ensureLocalVideo(taskID string, result *GeneratorResult) {
 // route, and the local copy is removed to free disk. Without a bucket — or if
 // an upload fails — the output stays exactly as before (local /outputs URL).
 func (s *Core) publishLocalOutputs(result *GeneratorResult) {
-	if result == nil || s.outputPublisher == nil || s.outputsDir == "" {
+	if result == nil || s.outputsDir == "" {
+		return
+	}
+	// Derivados de display (miniatura/preview) de las imágenes generadas: se
+	// crean siempre, haya o no bucket, sin tocar el original que consumen los
+	// modelos. El front los usa en grillas; el original queda intacto.
+	s.ensureOutputDerivatives(result)
+	if s.outputPublisher == nil {
 		return
 	}
 	prefix := config.OutPutUrl() + "/"
@@ -215,6 +222,35 @@ func (s *Core) publishLocalOutputs(result *GeneratorResult) {
 		}
 		log.Printf("[outputs] %s stored in the tenant bucket", rel)
 	}
+	// Los derivados siguen el mismo camino que el original cuando hay bucket.
+	for i := range result.Outputs {
+		s.publishOutputDerivative(&result.Outputs[i].ThumbnailURL)
+		s.publishOutputDerivative(&result.Outputs[i].PreviewURL)
+	}
+}
+
+// publishOutputDerivative pushes a local /outputs derivative to the tenant
+// bucket and swaps the URL. Without bucket, the local URL stays valid.
+func (s *Core) publishOutputDerivative(url *string) {
+	if url == nil || *url == "" {
+		return
+	}
+	prefix := config.OutPutUrl() + "/"
+	if !strings.HasPrefix(*url, prefix) {
+		return
+	}
+	rel := strings.TrimPrefix(*url, prefix)
+	path := filepath.Join(s.outputsDir, filepath.FromSlash(rel))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	stored, ok := s.outputPublisher.StoreOutput(rel, data, utils.MimeForFilename(rel))
+	if !ok {
+		return
+	}
+	*url = s.absoluteOutputURL(stored)
+	_ = os.Remove(path)
 }
 
 // mediaKindForOutput classifies an output as image/audio/video from its

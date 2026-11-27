@@ -636,6 +636,8 @@ func (s *Core) GenerateUnified(req *GenerateRequest) (*GenerateResponse, error) 
 		storedResult.VideoURL = outputs[0].URL
 		storedResult.LocalURL = outputs[0].LocalURL
 		storedResult.ImageURL = outputs[0].URL
+		storedResult.ThumbnailURL = outputs[0].ThumbnailURL
+		storedResult.PreviewURL = outputs[0].PreviewURL
 	}
 	s.mu.Lock()
 	s.tasks[result.TaskID] = &TaskRecord{
@@ -819,6 +821,8 @@ func (s *Core) GetStatus(taskID string) (*StatusResult, error) {
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
+			statusResult.ThumbnailURL = result.Outputs[0].ThumbnailURL
+			statusResult.PreviewURL = result.Outputs[0].PreviewURL
 		}
 		s.mu.Lock()
 		notify := !record.PushNotified
@@ -869,11 +873,15 @@ func (s *Core) GetStatusUnified(taskID string) (*StatusResponse, error) {
 		localURL = providerURL
 	}
 	if localURL != "" {
-		resp.Outputs = append(resp.Outputs, OutputResource{
-			URL:      s.absoluteOutputURL(localURL),
-			LocalURL: localURL,
-			Type:     mediaKindForURL(localURL),
-		})
+		output := OutputResource{
+			URL:          s.absoluteOutputURL(localURL),
+			LocalURL:     localURL,
+			Type:         mediaKindForURL(localURL),
+			ThumbnailURL: s.absoluteOutputURL(sr.ThumbnailURL),
+			PreviewURL:   s.absoluteOutputURL(sr.PreviewURL),
+		}
+		s.decorateOutput(&output)
+		resp.Outputs = append(resp.Outputs, output)
 	}
 	if sr.ImageURL != "" && sr.ImageURL != sr.VideoURL && sr.ImageURL != localURL {
 		resp.Outputs = append(resp.Outputs, OutputResource{URL: sr.ImageURL, Type: "image"})
@@ -1085,6 +1093,8 @@ func (s *Core) statusFromLog(logEntry *GenerationLog) (*StatusResult, error) {
 		if len(result.Outputs) > 0 {
 			statusResult.VideoURL = result.Outputs[0].URL
 			statusResult.LocalURL = result.Outputs[0].LocalURL
+			statusResult.ThumbnailURL = result.Outputs[0].ThumbnailURL
+			statusResult.PreviewURL = result.Outputs[0].PreviewURL
 		}
 		s.updateLogWithFinalStatus(logEntry.TaskID, result)
 		if result.Status == config.STATUS_SUCCESS {
@@ -1186,7 +1196,25 @@ func (s *Core) saveToGeneration(taskID, videoURL, localURL string) {
 		fmt.Printf("failed to save generation output for task %s: %v\n", taskID, err)
 		return
 	}
-	outputs := []OutputResource{{URL: s.absoluteOutputURL(localURL), LocalURL: localURL, Type: "video"}}
+	targetURL := videoURL
+	if targetURL == "" {
+		targetURL = s.absoluteOutputURL(localURL)
+	}
+	// Conserva los derivados y el tipo real que ya escribió updateLogWithFinalStatus;
+	// solo actualiza la ubicación del primer output.
+	var outputs []OutputResource
+	if len(logEntry.Outputs) > 0 {
+		outputs = make([]OutputResource, len(logEntry.Outputs))
+		copy(outputs, logEntry.Outputs)
+		outputs[0].URL = targetURL
+		outputs[0].LocalURL = localURL
+	} else {
+		outputs = []OutputResource{{
+			URL:      targetURL,
+			LocalURL: localURL,
+			Type:     mediaKindForURL(targetURL),
+		}}
+	}
 	if err := s.logStore.UpdateByTaskID(taskID, outputs, logEntry.Status, logEntry.ErrorMessage); err != nil {
 		fmt.Printf("failed to update generation log outputs for task %s: %v\n", taskID, err)
 	}
@@ -1522,6 +1550,7 @@ func (s *Core) ListLogs(f ListLogsFilter) (*ListLogsResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.decorateLogs(logs)
 	totalPages := (total + f.Limit - 1) / f.Limit
 	if totalPages < 1 {
 		totalPages = 1
@@ -1535,7 +1564,12 @@ func (s *Core) RecentTasksForUser(userID int64, limit int) ([]GenerationLog, err
 	if s.logStore == nil {
 		return nil, fmt.Errorf("log store not available")
 	}
-	return s.logStore.ListRecentByUser(userID, limit)
+	logs, err := s.logStore.ListRecentByUser(userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	s.decorateLogs(logs)
+	return logs, nil
 }
 
 // UserHistoryForUser returns the caller's generations inside an optional
@@ -1544,7 +1578,12 @@ func (s *Core) UserHistoryForUser(userID int64, f UserHistoryFilter) ([]Generati
 	if s.logStore == nil {
 		return nil, fmt.Errorf("log store not available")
 	}
-	return s.logStore.ListHistoryByUser(userID, f)
+	logs, err := s.logStore.ListHistoryByUser(userID, f)
+	if err != nil {
+		return nil, err
+	}
+	s.decorateLogs(logs)
+	return logs, nil
 }
 
 // UpdateLogRating sets the two-check rating ("Buena toma"/"Elegida final")
@@ -1664,6 +1703,7 @@ func (s *Core) ListTrash(page, limit int, resourceType string) (*ListLogsRespons
 	if err != nil {
 		return nil, err
 	}
+	s.decorateLogs(logs)
 	if logs == nil {
 		logs = []GenerationLog{}
 	}
@@ -1756,6 +1796,7 @@ func (s *Core) listGeneratedByModality(page, limit int, modality, eventID string
 	if err != nil {
 		return nil, err
 	}
+	s.decorateLogs(logs)
 	totalPages := (total + filter.Limit - 1) / filter.Limit
 	if totalPages < 1 {
 		totalPages = 1

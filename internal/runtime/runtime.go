@@ -412,6 +412,8 @@ func (m *Manager) build(t *tenancy.Tenant) (*Bundle, error) {
 
 	// Agency orchestration core (per-tenant task tracking + logs).
 	core := agency.NewCore(m.cfg, fileSvc, credStore, m.cfg.BaseURL, t.Slug)
+	// Miniaturas/previews de salidas ya existentes (una vez por proceso).
+	core.BackfillOutputDerivatives()
 	// Curaduría maestro + tenant también en generación directa por nombre:
 	// el listado oculta, pero el veto real vive aquí.
 	master := m.modelMaster
