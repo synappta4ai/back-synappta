@@ -1403,12 +1403,15 @@ func serveOrRedirect(c *gin.Context, path, redirect string, err error) {
 		return
 	}
 	if redirect != "" {
-		// El destino es una URL firmada de 15 min: cachear el redirect un rato
-		// corto evita que cada vista de una miniatura vuelva a golpear la API.
-		c.Header("Cache-Control", "private, max-age=300")
+		// El destino es una URL firmada de 15 min: cachear el redirect casi
+		// hasta la firma evita que cada vista de la misma imagen vuelva a la API.
+		c.Header("Cache-Control", "private, max-age=840")
 		c.Redirect(http.StatusFound, redirect)
 		return
 	}
+	// El id del archivo es estable y sus bytes no cambian: el navegador puede
+	// cachear la respuesta sin revalidar (antes cada visita pedía todo de nuevo).
+	c.Header("Cache-Control", "private, max-age=31536000, immutable")
 	c.File(path)
 }
 

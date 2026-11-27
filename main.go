@@ -389,6 +389,14 @@ func main() {
 	// ─── Generated outputs (own server URL) ───────────────────
 	// Locally stored generation outputs are served here; the front plays them
 	// from our domain instead of the expiring signed provider URLs.
+	// Los archivos de outputs tienen nombre único y no mutan: se cachean de
+	// forma inmutable para que el navegador no los vuelva a pedir.
+	router.Use(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, config.OutPutUrl()+"/") {
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		}
+		c.Next()
+	})
 	router.Static(config.OutPutUrl(), cfg.OutputsDir)
 
 	// ─── Swagger UI (docs) ────────────────────────────────────
